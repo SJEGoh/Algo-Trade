@@ -1,0 +1,9 @@
+# data
+yfinance
+
+# data manipulation
+pandas
+numpy
+
+# graph
+matplotlib
