@@ -21,13 +21,13 @@ import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
 
-tickers = ["KO", "PEP"]
+tickers = ["BTC-USD", "ETH-USD"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '5y')[["Close"]]
-S2_data = S2_ticker.history(period = '5y')[["Close"]]
+S1_data = S1_ticker.history(period = '1y')[["Close"]]
+S2_data = S2_ticker.history(period = '1y')[["Close"]]
 
 def loglikelihood(spread, alpha, beta, kappa, mu):
     nu = 2.0 * alpha
@@ -53,8 +53,8 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
 
     kappa0, alpha0, beta0 = 1.0, 2.0, (sd0**2)*1.0
     mu, kappa, alpha, beta = mu0, kappa0, alpha0, beta0
-
     prior = np.log((1-h)/h)
+
     L = 0.0
     count = 0
     last_10 = param_set.tail(5)
@@ -80,13 +80,13 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
             mu, kappa, alpha, beta = mu0, kappa0, alpha0, beta0
             L = 0.0
             plt.axvline(i)
+            count += 1
             continue
-        
-        kappa += 1.0
-        beta += 0.5 * ((kappa-1)*(spread-mu)**2)/kappa
-        mu = ((kappa-1.0) * mu + spread)/kappa
-        alpha += 0.5
-        print(mu)
+        new_kappa = kappa + 1.0
+        new_beta = beta + 0.5 * (kappa*(spread-mu)**2)/new_kappa
+        new_mu = ((kappa) * mu + spread)/new_kappa
+        new_alpha = alpha + 0.5
+        kappa, beta, mu, alpha = new_kappa, new_beta, new_mu, new_alpha
 
     plt.show()
     print(count)
@@ -94,6 +94,6 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
     plt.axhline(0, color = 'black')
     plt.show()
 
-hypothesis_test(S1_data, S2_data, 10, 0.5, 10)
+hypothesis_test(S1_data, S2_data, 10, 0.2, 10)
 
 # Tail length changes a lot of stuff, make sure to play with it
