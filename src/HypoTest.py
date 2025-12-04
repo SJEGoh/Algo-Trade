@@ -46,6 +46,7 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
     bs.plot()
     plt.axhline(mu0, color = "black")
 
+  # Don't really like these being hardcoded
     nu0 = 5
     nu1 = 3
     mu1 = mu0

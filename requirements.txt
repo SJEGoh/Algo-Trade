@@ -7,3 +7,5 @@ numpy
 
 # graph
 matplotlib
+
+statsmodels
