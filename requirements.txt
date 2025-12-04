@@ -9,3 +9,5 @@ numpy
 matplotlib
 
 statsmodels
+
+ipykernel
