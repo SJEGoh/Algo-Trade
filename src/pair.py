@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+import numpy as np
 
 class PairTrader:
     def __init__(self, entry_z, exit_z, mu, sd):
@@ -14,7 +15,7 @@ class PairTrader:
     def calc_zscore(self, spread):
         return (spread-self.mu)/self.sd
     
-    def generate(self, spread, rg):
+    def generate(self, spread, rg, L = 0.0, K = 5):
         if rg:
             z = self.calc_zscore(spread)
             if self.position == 1 and z < -self.exit_z:
@@ -31,7 +32,11 @@ class PairTrader:
             self.position = 1
         if abs(z) < self.exit_z:
             self.position = 0
-        return self.position
+        z_conf = min(1.0, abs(z)/self.entry_z)
+        L_conf = min(max(0.0, (L+K)/K), 1.0)
+        k_conf = 1
+        print(self.position * z_conf * L_conf * k_conf)
+        return self.position * z_conf * L_conf * k_conf
     
     def set_params(self, tup):
         self.mu = tup[0]

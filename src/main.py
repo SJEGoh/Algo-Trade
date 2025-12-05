@@ -47,10 +47,8 @@ def backtest(df1, df2, h, K):
             detector.reset_baseline(last_k_spread["Spread"])
             new_params = detector.get_params()
             strategy.set_params(new_params)
-        position = strategy.generate(spread, rg)
+        position = strategy.generate(spread, rg, detector.L, K)
         prices = {"S1": row["S1"], "S2": row["S2"]}
-        if detector.L < 0:
-            print("L =", detector.L)
         portfolio.update_position(i, prices, position, pair_model.b)
 
     d = pd.DataFrame(portfolio.history)
@@ -75,8 +73,8 @@ tickers = ["BTC-USD", "ETH-USD"]
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '1y')[["Close"]]
-S2_data = S2_ticker.history(period = '1y')[["Close"]]
+S1_data = S1_ticker.history(period = '10y')[["Close"]]
+S2_data = S2_ticker.history(period = '10y')[["Close"]]
 
 
 print(backtest(S1_data, S2_data, h = 0.05, K = 10))
