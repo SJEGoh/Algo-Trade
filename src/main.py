@@ -69,16 +69,16 @@ def backtest(df1, df2, h, K):
 
 
 
-tickers = ["MSFT", "ADBE"]
+tickers = ["KO", "PEP"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '10y')[["Close"]]
-S2_data = S2_ticker.history(period = '10y')[["Close"]]
+S1_data = S1_ticker.history(period = '15y')[["Close"]]
+S2_data = S2_ticker.history(period = '15y')[["Close"]]
 
 
-print(backtest(S1_data, S2_data, h = 0.005, K = 2))
+print(backtest(S1_data, S2_data, h = 0.001, K = 2))
 
 # MSFT + ADBE, 0.004, 5, 10 years, 10 lmao
 # KO + PEP, 0.001, 2, 15 years, 2.454, z-entry = 2, z-exit = 0.75
