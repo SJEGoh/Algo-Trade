@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
 
-tickers = ["MSFT", "ADBE"]
+tickers = ["CL=F", "NG=F"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
@@ -41,7 +41,7 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
 
     L = 0.0
     count = 0
-    last_10 = param_set.tail(5)
+    last_10 = param_set.tail(10)
     for i, row in test_set.iterrows():
         last_10 = last_10.iloc[1:]   
         last_10.loc[i] = row   
@@ -52,7 +52,6 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
         L1 = loglikelihood(spread, alpha0, beta0, kappa0, mu0)
         L += (L1 - L0 + prior)
         if L < -K:
-            count += 1
             x = sm.add_constant(last_10["Close_S1"])
             results = sm.OLS(last_10["Close_S2"], x).fit()
             b = results.params["Close_S1"]
@@ -78,4 +77,4 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
     plt.axhline(0, color = 'black')
     plt.show()
 
-hypothesis_test(S1_data, S2_data, 10, 0.04, 5)
+hypothesis_test(S1_data, S2_data, 10, 0.1, 5)

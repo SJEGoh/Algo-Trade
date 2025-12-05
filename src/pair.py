@@ -32,11 +32,10 @@ class PairTrader:
             self.position = 1
         if abs(z) < self.exit_z:
             self.position = 0
-        z_conf = min(1.0, abs(z)/self.entry_z)
-        L_conf = min(max(0.0, (L+K)/K), 1.0)
+        z_conf = 1# min(1.0, 1 - np.exp(-abs(z)/self.entry_z))
+        L_conf = 1 # min(max(0.0, 1 - np.exp(-abs(z) / self.entry_z)), 1.0)
         k_conf = 1
-        print(self.position * z_conf * L_conf * k_conf)
-        return self.position * z_conf * L_conf * k_conf
+        return self.position * (0.3 * z_conf + 0.7 * L_conf) * k_conf
     
     def set_params(self, tup):
         self.mu = tup[0]
@@ -76,10 +75,11 @@ class Portfolio:
         elif self.position["S2"] or self.position["S1"]:
             pass
         else:
+            cap = self.cash * 0.10
             tot = b * p_s1 + p_s2
-            self.position["S1"] += b * pos * 100/tot
-            self.position["S2"] -= pos * 100/tot
-            self.cash += (pos * p_s2 - b * pos * p_s1) * 100/tot
+            self.position["S1"] += b * pos * cap/tot
+            self.position["S2"] -= pos * cap/tot
+            self.cash += (pos * p_s2 - b * pos * p_s1) * cap/tot
         self.history.append((date, self.get_value(prices)))
     
     def get_value(self, prices):
