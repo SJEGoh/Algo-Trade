@@ -5,20 +5,20 @@ import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
 
-tickers = ["CL=F", "NG=F"]
+tickers = ["KO", "PEP"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '10y')[["Close"]]
-S2_data = S2_ticker.history(period = '10y')[["Close"]]
+S1_data = S1_ticker.history(period = '15y')[["Close"]]
+S2_data = S2_ticker.history(period = '15y')[["Close"]]
 
 def loglikelihood(spread, alpha, beta, kappa, mu):
     nu = 2.0 * alpha
     scale = np.sqrt(beta * (kappa + 1.0) / (alpha * kappa))
     return t.logpdf(spread, df=nu, loc=mu, scale=scale)
 
-def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
+def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.99):
     S1 = S1.reset_index().merge(S2.reset_index(), on = "Date", how = "inner", suffixes = ["_S1", "_S2"]).set_index("Date")
     param_set = S1.iloc[:train_i]
     test_set = S1.iloc[train_i:]
@@ -65,6 +65,10 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
             plt.axvline(i)
             count += 1
             continue
+
+        kappa = 1.0 + lam * (kappa - 1.0)
+        alpha = alpha0 + lam * (alpha - alpha0)
+        beta  = beta0  + lam * (beta  - beta0)
         new_kappa = kappa + 1.0
         new_beta = beta + 0.5 * (kappa*(spread-mu)**2)/new_kappa
         new_mu = ((kappa) * mu + spread)/new_kappa
@@ -77,4 +81,4 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
     plt.axhline(0, color = 'black')
     plt.show()
 
-hypothesis_test(S1_data, S2_data, 10, 0.1, 5)
+hypothesis_test(S1_data, S2_data, 10, 0.004, 3)

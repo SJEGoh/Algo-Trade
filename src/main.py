@@ -29,7 +29,7 @@ def backtest(df1, df2, h, K):
     detector = RegimeDetector(h = h, K = K)
     detector.initialize(train_spread["Spread"])
     strategy = PairTrader(2, 0.75, train_spread["Spread"].mean(), train_spread["Spread"].std())
-    last_k = train_set.tail(10)
+    last_k = train_set.tail(5)
     r = 0
     new_params = (0, 0)
     for i, row in test_set.iterrows():
@@ -71,18 +71,17 @@ def backtest(df1, df2, h, K):
 
 
 
-tickers = ["CL=F", "NG=F"]
+tickers = ["KO", "PEP"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '10y')[["Close"]]
-S2_data = S2_ticker.history(period = '10y')[["Close"]]
+S1_data = S1_ticker.history(period = '15y')[["Close"]]
+S2_data = S2_ticker.history(period = '15y')[["Close"]]
 
 
-print(backtest(S1_data, S2_data, h = 0.1, K = 5))
+print(backtest(S1_data, S2_data, h = 0.004, K = 3))
 
-# CL=F + NG=F, 0.1, 5, 10 years, 2.75, z-entry = 2, z-exit = 0.75, tail = 10
-# MSFT + ADBE, 0.04, 5, 10 years, 2.94, z-entry = 2, z-exit = 0.75, tail: 5
-# KO + PEP, 0.004, 3, 15 years, 2.40, z-entry = 2, z-exit = 0.75, tail: 5
-# BTC, ETH, 0.05, 5, 5 year, 3.14, z-entry = 2, z-exit = 0.75, tail: 5
+# MSFT + ADBE, 0.04, 5, 10 years, 3.77, z-entry = 2, z-exit = 0.75, tail: 5
+# KO + PEP, 0.004, 3, 15 years, 3.14, z-entry = 2, z-exit = 0.75, tail: 5
+# BTC, ETH, 0.05, 5, 5 year, 3.03, z-entry = 2, z-exit = 0.75, tail: 5

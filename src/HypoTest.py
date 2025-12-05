@@ -117,6 +117,8 @@ class RegimeDetector:
 
         self.L = 0.0
         self.initialized = False
+
+        self.lam = 0.99
     
     def initialize(self, initial_spread):
         self.mu0 = initial_spread.mean()
@@ -157,6 +159,9 @@ class RegimeDetector:
         if self.L < -self.K:
             return True
 
+        self.kappa = 1.0 + self.lam * (self.kappa - 1.0)
+        self.alpha = self.alpha0 + self.lam * (self.alpha - self.alpha0)
+        self.beta  = self.beta0  + self.lam * (self.beta  - self.beta0)
         new_kappa = self.kappa + 1.0
         new_beta = self.beta + 0.5 * (self.kappa * (spread - self.mu) ** 2) / new_kappa
         new_mu = (self.kappa * self.mu + spread) / new_kappa
