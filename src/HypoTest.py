@@ -20,7 +20,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
-
+'''
 tickers = ["BTC-USD", "ETH-USD"]
 
 S1_ticker = yf.Ticker(tickers[0])
@@ -95,5 +95,75 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
     plt.show()
 
 hypothesis_test(S1_data, S2_data, 10, 0.2, 10)
-
+'''
 # Tail length changes a lot of stuff, make sure to play with it
+# Ok cool it works, now how to make it into an object
+
+class RegimeDetector:
+    def __init__(self, h: float = 0.1, K: int = 5):
+        self.prior = np.log((1-h)/h)
+        self.K = K
+
+        self.mu0 = None
+        self.sd0 = None
+        self.kappa0 = 1.0
+        self.alpha0 = 2.0
+        self.beta0 = None
+
+        self.mu = None
+        self.kappa = None
+        self.alpha = None
+        self.beta = None
+
+        self.L = 0.0
+        self.initialized = False
+    
+    def initialize(self, initial_spread):
+        self.mu0 = initial_spread.mean()
+        self.sd0 = initial_spread.std()
+        self.L = 0.0
+
+        self.beta0 = self.sd0 ** 2
+        self.mu = self.mu0
+        self.kappa = self.kappa0
+        self.alpha = self.alpha0
+        self.beta = self.beta0
+        self.initialized = True
+    
+    def _loglikelihood(self, spread, alpha, beta, kappa, mu):
+        nu = 2.0 * alpha
+        scale = np.sqrt(beta * (kappa + 1.0) / (alpha * kappa))
+        return t.logpdf(spread, df=nu, loc=mu, scale=scale)
+    
+    def reset_baseline(self, last_k: pd.Series):
+
+        self.mu0 = last_k.mean()
+        self.sd0 = last_k.std()
+        self.beta0 = (self.sd0 ** 2) * 1.0
+        self.mu = self.mu0
+        self.kappa = self.kappa0
+        self.alpha = self.alpha0
+        self.beta = self.beta0
+        self.L = 0.0
+
+    def update(self, spread: float):
+        if not self.initialized:
+            raise ValueError("Not initialized")
+
+        L0 = self._loglikelihood(spread, self.alpha, self.beta, self.kappa, self.mu)
+        L1 = self._loglikelihood(spread, self.alpha0, self.beta0, self.kappa0, self.mu0)
+        self.L += L1 - L0 + self.prior
+
+        if self.L < -self.K:
+            return True
+
+        new_kappa = self.kappa + 1.0
+        new_beta = self.beta + 0.5 * (self.kappa * (spread - self.mu) ** 2) / new_kappa
+        new_mu = (self.kappa * self.mu + spread) / new_kappa
+        new_alpha = self.alpha + 0.5
+
+        self.kappa, self.beta, self.mu, self.alpha = new_kappa, new_beta, new_mu, new_alpha
+        return False
+    
+    def get_params(self):
+        return (self.mu, self.sd0)
