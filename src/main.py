@@ -28,14 +28,14 @@ def backtest(df1, df2, h, K):
     
     detector = RegimeDetector(h = h, K = K)
     detector.initialize(train_spread["Spread"])
-    strategy = PairTrader(2, 0.5, train_spread["Spread"].mean(), train_spread["Spread"].std())
+    strategy = PairTrader(2, 0.75, train_spread["Spread"].mean(), train_spread["Spread"].std())
     last_k = train_set.tail(5)
     r = 0
+    new_params = (0, 0)
     for i, row in test_set.iterrows():
         spread = pair_model.compute_spread(row["S1"], row["S2"])
         last_k = last_k.iloc[1:]
         last_k.loc[i] = row
-
         last_k_spread = []
         if rg := detector.update(spread):
             r += 1
@@ -45,7 +45,8 @@ def backtest(df1, df2, h, K):
                 last_k_spread.append((j, spread))
             last_k_spread = pd.DataFrame(last_k_spread, columns=["Date", "Spread"]).set_index("Date")
             detector.reset_baseline(last_k_spread["Spread"])
-            strategy.set_params(detector.get_params())
+            new_params = detector.get_params()
+            strategy.set_params(new_params)
         position = strategy.generate(spread, rg)
         prices = {"S1": row["S1"], "S2": row["S2"]}
         if detector.L < 0:
@@ -69,17 +70,17 @@ def backtest(df1, df2, h, K):
 
 
 
-tickers = ["KO", "PEP"]
+tickers = ["BTC-USD", "ETH-USD"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '15y')[["Close"]]
-S2_data = S2_ticker.history(period = '15y')[["Close"]]
+S1_data = S1_ticker.history(period = '1y')[["Close"]]
+S2_data = S2_ticker.history(period = '1y')[["Close"]]
 
 
-print(backtest(S1_data, S2_data, h = 0.001, K = 2))
+print(backtest(S1_data, S2_data, h = 0.05, K = 10))
 
-# MSFT + ADBE, 0.004, 5, 10 years, 10 lmao
-# KO + PEP, 0.001, 2, 15 years, 2.454, z-entry = 2, z-exit = 0.75
-# BTC, ETH, 0.05, 10, 1 year, 2.05, z-entry = 2, z-exit = 0.75
+# MSFT + ADBE, 0.04, 5, 10 years, 2.94, z-entry = 2, z-exit = 0.75, tail: 5
+# KO + PEP, 0.004, 2, 15 years, 2.41, z-entry = 2, z-exit = 0.75, tail: 5
+# BTC, ETH, 0.05, 10, 1 year, 2.05, z-entry = 2, z-exit = 0.75, tail: 10

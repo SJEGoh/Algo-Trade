@@ -16,9 +16,13 @@ class PairTrader:
     
     def generate(self, spread, rg):
         if rg:
-            self.position = 0
+            z = self.calc_zscore(spread)
+            if self.position == 1 and z < -self.exit_z:
+                return 1
+            if self.position == -1 and z > self.exit_z:
+                return -1
             return 0
-        z = float(self.calc_zscore(spread).iloc[0]) if not isinstance(self.calc_zscore(spread), float) else self.calc_zscore(spread)
+        z = self.calc_zscore(spread)
         if self.position:
             pass
         if z >= self.entry_z:

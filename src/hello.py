@@ -5,13 +5,13 @@ import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
 
-tickers = ["KO", "PEP"]
+tickers = ["MSFT", "ADBE"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '15y')[["Close"]]
-S2_data = S2_ticker.history(period = '15y')[["Close"]]
+S1_data = S1_ticker.history(period = '10y')[["Close"]]
+S2_data = S2_ticker.history(period = '10y')[["Close"]]
 
 def loglikelihood(spread, alpha, beta, kappa, mu):
     nu = 2.0 * alpha
@@ -78,4 +78,4 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2):
     plt.axhline(0, color = 'black')
     plt.show()
 
-hypothesis_test(S1_data, S2_data, 10, 0.001, 2)
+hypothesis_test(S1_data, S2_data, 10, 0.04, 5)
