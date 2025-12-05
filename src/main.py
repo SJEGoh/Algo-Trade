@@ -56,13 +56,15 @@ def backtest(df1, df2, h, K):
     d = pd.DataFrame(portfolio.history)
     d.columns = ["Date", "Value"]
     d = d.set_index("Date")
-    daily_return = d.copy().pct_change()
-    mean = daily_return.mean()
-    sd = daily_return.std()
-    cumu_return = d.iloc[-1]/d.iloc[0] - 1
-    sd = sd * np.sqrt(252)
+    daily_returns = d.pct_change().dropna()
+    mean_daily = daily_returns.mean()
+    std_daily = daily_returns.std()
+    cumu_return = (d["Value"][-1]/d["Value"][0]) - 1
+    std = std_daily * np.sqrt(252 * 10)
+
     rfr = 0.02
-    sharpe = (cumu_return-rfr)/sd
+
+    sharpe = (cumu_return - rfr/100)/ std
     print(sharpe)
     print(r)
     d.plot()
@@ -71,17 +73,17 @@ def backtest(df1, df2, h, K):
 
 
 
-tickers = ["KO", "PEP"]
+tickers = ["GLD", "SLV"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '15y')[["Close"]]
-S2_data = S2_ticker.history(period = '15y')[["Close"]]
+S1_data = S1_ticker.history(period = '10y')[["Close"]]
+S2_data = S2_ticker.history(period = '10y')[["Close"]]
 
 
-print(backtest(S1_data, S2_data, h = 0.004, K = 3))
+print(backtest(S1_data, S2_data, h = 0.005, K = 1))
 
-# MSFT + ADBE, 0.04, 5, 10 years, 3.77, z-entry = 2, z-exit = 0.75, tail: 5
-# KO + PEP, 0.004, 3, 15 years, 3.14, z-entry = 2, z-exit = 0.75, tail: 5
-# BTC, ETH, 0.05, 5, 5 year, 3.03, z-entry = 2, z-exit = 0.75, tail: 5
+# MSFT + ADBE, 0.04, 5, 15 years, 2.29, z-entry = 2, z-exit = 0.75, tail: 5
+# GLD + SLV, 0.005, 1, 10 year, 3.93
+# BTC, ETH, 0.05, 5, 5 year, 2.08, z-entry = 2, z-exit = 0.75, tail: 5

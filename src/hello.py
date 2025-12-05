@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
 
-tickers = ["KO", "PEP"]
+tickers = ["GLD", "SLV"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
@@ -81,4 +81,4 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.99):
     plt.axhline(0, color = 'black')
     plt.show()
 
-hypothesis_test(S1_data, S2_data, 10, 0.004, 3)
+hypothesis_test(S1_data, S2_data, 10, 0.005, 1)

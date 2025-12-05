@@ -75,7 +75,7 @@ class Portfolio:
         elif self.position["S2"] or self.position["S1"]:
             pass
         else:
-            cap = self.cash * 0.10
+            cap = self.cash
             tot = b * p_s1 + p_s2
             self.position["S1"] += b * pos * cap/tot
             self.position["S2"] -= pos * cap/tot
