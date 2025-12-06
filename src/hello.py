@@ -10,15 +10,15 @@ tickers = ["GLD", "SLV"]
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '15y')[["Close"]]
-S2_data = S2_ticker.history(period = '15y')[["Close"]]
+S1_data = S1_ticker.history(period = '10y')[["Close"]]
+S2_data = S2_ticker.history(period = '10y')[["Close"]]
 
 def loglikelihood(spread, alpha, beta, kappa, mu):
     nu = 2.0 * alpha
     scale = np.sqrt(beta * (kappa + 1.0) / (alpha * kappa))
     return t.logpdf(spread, df=nu, loc=mu, scale=scale)
 
-def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.99):
+def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.95):
     S1 = S1.reset_index().merge(S2.reset_index(), on = "Date", how = "inner", suffixes = ["_S1", "_S2"]).set_index("Date")
     param_set = S1.iloc[:train_i]
     test_set = S1.iloc[train_i:]
@@ -41,16 +41,17 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.99):
 
     L = 0.0
     count = 0
-    last_10 = param_set.tail(10)
+    last_10 = param_set.tail(5)
     for i, row in test_set.iterrows():
         last_10 = last_10.iloc[1:]   
         last_10.loc[i] = row   
         
         spread = row["Close_S2"] - b * row["Close_S1"] - const
-        track = pd.concat([track, pd.Series(spread, index = [i])])
+        norm = (spread-mu0)/sd0
+        track = pd.concat([track, pd.Series(norm, index = [i])])
         L0 = loglikelihood(spread, alpha, beta, kappa, mu)
         L1 = loglikelihood(spread, alpha0, beta0, kappa0, mu0)
-        L += (L1 - L0 + prior)
+        L += L1 - L0 + prior
         if L < -K:
             x = sm.add_constant(last_10["Close_S1"])
             results = sm.OLS(last_10["Close_S2"], x).fit()

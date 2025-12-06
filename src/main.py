@@ -15,7 +15,7 @@ def backtest(df1, df2, h, K):
     train_i = 10
     train_set = prices.iloc[:train_i]
     test_set = prices.iloc[train_i:]
-    train_rows = []   # collect rows here
+    train_rows = []  
 
     pair_model = PairModel()
     pair_model.fit_hedge(train_set)
@@ -38,7 +38,7 @@ def backtest(df1, df2, h, K):
         last_k.loc[i] = row
         
         if rg := detector.update(spread):
-            r += 1
+            
             pair_model.fit_hedge(last_k)
             last_k_spread = []
             for j, row_k in last_k.iterrows():
@@ -48,10 +48,12 @@ def backtest(df1, df2, h, K):
             detector.reset_baseline(last_k_spread["Spread"])
             new_params = detector.get_params()
             strategy.set_params(new_params)
+            r = 0
+        r += 1
         position = strategy.generate(spread, rg, detector.L, K)
         prices = {"S1": row["S1"], "S2": row["S2"]}
 
-        portfolio.update_position(i, prices, position, pair_model.b)
+        portfolio.update_position(i, prices, position, pair_model.b, r)
 
     d = pd.DataFrame(portfolio.history)
     d.columns = ["Date", "Value"]
@@ -60,11 +62,11 @@ def backtest(df1, df2, h, K):
     mean_daily = daily_returns.mean()
     std_daily = daily_returns.std()
     cumu_return = (d["Value"][-1]/d["Value"][0]) - 1
-    std = std_daily * np.sqrt(252 * 10)
+    std = std_daily * np.sqrt(252 * 5)
 
     rfr = 0.02
 
-    sharpe = (cumu_return - rfr/100)/ std
+    sharpe = (cumu_return - rfr)/ std
     print(sharpe)
     print(r)
     d.plot()
@@ -73,17 +75,33 @@ def backtest(df1, df2, h, K):
 
 
 
-tickers = ["GLD", "SLV"]
+tickers = ["BTC-USD", "ETH-USD"]
 
 S1_ticker = yf.Ticker(tickers[0])
 S2_ticker = yf.Ticker(tickers[1])
 
-S1_data = S1_ticker.history(period = '10y')[["Close"]]
-S2_data = S2_ticker.history(period = '10y')[["Close"]]
+S1_data = S1_ticker.history(period = '5y')[["Close"]]
+S2_data = S2_ticker.history(period = '5y')[["Close"]]
 
 
-print(backtest(S1_data, S2_data, h = 0.005, K = 1))
+print(backtest(S1_data, S2_data, h = 0.05, K = 5))
 
-# MSFT + ADBE, 0.04, 5, 15 years, 2.29, z-entry = 2, z-exit = 0.75, tail: 5
-# GLD + SLV, 0.005, 1, 10 year, 3.93
-# BTC, ETH, 0.05, 5, 5 year, 2.08, z-entry = 2, z-exit = 0.75, tail: 5
+# MSFT + ADBE, 0.0004, 3, 15 years, 2.93, z-entry = 2, z-exit = 0.75, tail: 5
+# GLD + SLV, 0.005, 1, 10 year, 2.23
+# BTC, ETH, 0.05, 5, 5 year, 2.02, z-entry = 2, z-exit = 0.75, tail: 5
+# CVX, XOM, 0.1, 3, 10 year, 2.41
+# NG=F, CL=F, 0.05, 2, 10 year, 2.45
+# NVDA, AMD, 0.003, 25, 10 year, 2.87
+
+
+# GLD + TSLA, 0.01, 10, 10 y, 3.20, lam = 0.90
+
+'''
+Hyperparameters to be set:
+- h
+- K
+- lam
+- z_entry / z_exit
+- tail length
+- cool down
+'''
