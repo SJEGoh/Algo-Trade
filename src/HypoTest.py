@@ -100,7 +100,7 @@ hypothesis_test(S1_data, S2_data, 10, 0.2, 10)
 # Ok cool it works, now how to make it into an object
 
 class RegimeDetector:
-    def __init__(self, h: float = 0.1, K: int = 5):
+    def __init__(self, h: float = 0.1, K: int = 5, lam = 0.95):
         self.prior = np.log((1-h)/h)
         self.K = K
 
@@ -118,7 +118,7 @@ class RegimeDetector:
         self.L = 0.0
         self.initialized = False
 
-        self.lam = 0.99
+        self.lam = lam
     
     def initialize(self, initial_spread):
         self.mu0 = initial_spread.mean()

@@ -73,8 +73,6 @@ class Portfolio:
         tot = b * p_s1 + p_s2
         if not pos:
             self.cash += self.position["S1"] * p_s1 + self.position["S2"] * p_s2
-            if self.position["S1"] or self.position["S2"]:
-                print("Sell", self.position["S1"] * p_s1 + self.position["S2"] * p_s2)
             self.position["S1"] = 0
             self.position["S2"] = 0
             self.pos_state = 0
@@ -94,7 +92,6 @@ class Portfolio:
             self.position["S1"] += b * pos * cap/tot
             self.position["S2"] -= pos * cap/tot
             self.cash += (pos * p_s2 - b * pos * p_s1) * cap/tot
-            print("Buy", (pos * p_s2 - b * pos * p_s1) * cap/tot)
         self.history.append((date, self.get_value(prices)))
     
     def get_value(self, prices):

@@ -5,20 +5,18 @@ import matplotlib.pyplot as plt
 from scipy.stats import t
 import statsmodels.api as sm
 
-tickers = ["GLD", "SLV"]
 
-S1_ticker = yf.Ticker(tickers[0])
-S2_ticker = yf.Ticker(tickers[1])
-
-S1_data = S1_ticker.history(period = '10y')[["Close"]]
-S2_data = S2_ticker.history(period = '10y')[["Close"]]
 
 def loglikelihood(spread, alpha, beta, kappa, mu):
     nu = 2.0 * alpha
     scale = np.sqrt(beta * (kappa + 1.0) / (alpha * kappa))
     return t.logpdf(spread, df=nu, loc=mu, scale=scale)
 
-def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.95):
+def hypothesis_test(tickers, years, train_i, h = 0.01, K = 2, lam = 0.95):
+    S1_ticker = yf.Ticker(tickers[0])
+    S2_ticker = yf.Ticker(tickers[1])
+    S1 = S1_ticker.history(period = str(years) + "y")[["Close"]]
+    S2 = S2_ticker.history(period = str(years) + "y")[["Close"]]
     S1 = S1.reset_index().merge(S2.reset_index(), on = "Date", how = "inner", suffixes = ["_S1", "_S2"]).set_index("Date")
     param_set = S1.iloc[:train_i]
     test_set = S1.iloc[train_i:]
@@ -31,9 +29,7 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.95):
     track = initial_spread
     mu0 = initial_spread.mean()
     sd0 = initial_spread.std()
-    bs = S1["Close_S2"] - b * S1["Close_S1"] - const
-    bs.plot()
-    plt.axhline(mu0, color = "black")
+    plt.axhline(0, color = "black")
 
     kappa0, alpha0, beta0 = 1.0, 2.0, (sd0**2)*1.0
     mu, kappa, alpha, beta = mu0, kappa0, alpha0, beta0
@@ -63,7 +59,7 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.95):
             beta0 = (sd0**2)*1.0
             mu, kappa, alpha, beta = mu0, kappa0, alpha0, beta0
             L = 0.0
-            plt.axvline(i)
+            plt.axvline(i, alpha = 0.1, color = 'red')
             count += 1
             continue
 
@@ -76,10 +72,14 @@ def hypothesis_test(S1, S2, train_i, h = 0.01, K = 2, lam = 0.95):
         new_alpha = alpha + 0.5
         kappa, beta, mu, alpha = new_kappa, new_beta, new_mu, new_alpha
 
-    plt.show()
-    print(count)
-    track.plot()
-    plt.axhline(0, color = 'black')
+    print(f"Regime Changes: {count}")
+    return track
+
+def main():
+    d = hypothesis_test(("GLD", "SLV"), 10, 10, 0.005, 1)
+    d.plot()
     plt.show()
 
-hypothesis_test(S1_data, S2_data, 10, 0.005, 1)
+if __name__ == "__main__":
+    main()
+

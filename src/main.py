@@ -7,7 +7,11 @@ import statsmodels.api as sm
 import numpy as np
 
 
-def backtest(df1, df2, h, K):
+def backtest(tickers,years, h, K, z_entry, z_exit, lam):
+    S1_ticker = yf.Ticker(tickers[0])
+    S2_ticker = yf.Ticker(tickers[1])
+    df1 = S1_ticker.history(period = str(years) + "y")[["Close"]]
+    df2 = S2_ticker.history(period = str(years) + "y")[["Close"]]
     prices = pd.concat([df1,df2], axis = 1).dropna()
     prices.columns = ["S1", "S2"]
     portfolio = Portfolio(100)
@@ -26,9 +30,9 @@ def backtest(df1, df2, h, K):
 
     train_spread = pd.DataFrame(train_rows, columns=["Date", "Spread"]).set_index("Date")
     
-    detector = RegimeDetector(h = h, K = K)
+    detector = RegimeDetector(h = h, K = K, lam = lam)
     detector.initialize(train_spread["Spread"])
-    strategy = PairTrader(2, 0.75, train_spread["Spread"].mean(), train_spread["Spread"].std())
+    strategy = PairTrader(z_entry, z_exit, train_spread["Spread"].mean(), train_spread["Spread"].std())
     last_k = train_set.tail(5)
     r = 0
     new_params = (0, 0)
@@ -61,30 +65,23 @@ def backtest(df1, df2, h, K):
     daily_returns = d.pct_change().dropna()
     mean_daily = daily_returns.mean()
     std_daily = daily_returns.std()
-    cumu_return = (d["Value"][-1]/d["Value"][0]) - 1
-    std = std_daily * np.sqrt(252 * 5)
+    cumu_return = (d["Value"].iloc[-1]/d["Value"].iloc[0]) - 1
+    std = std_daily * np.sqrt(252 * years)
 
     rfr = 0.02
 
     sharpe = (cumu_return - rfr)/ std
-    print(sharpe)
-    print(r)
-    d.plot()
+    print(f"Sharpe Ratio: {sharpe["Value"]}")
+    return d
+
+def main():
+    data = backtest(["BTC-USD", "ETH-USD"],years = 5, h = 0.05, K = 5, z_entry = 10, z_exit = 0.75, lam = 0.99)
+    data.plot()
     plt.show()
 
+if __name__ == "__main__":
+    main()
 
-
-
-tickers = ["BTC-USD", "ETH-USD"]
-
-S1_ticker = yf.Ticker(tickers[0])
-S2_ticker = yf.Ticker(tickers[1])
-
-S1_data = S1_ticker.history(period = '5y')[["Close"]]
-S2_data = S2_ticker.history(period = '5y')[["Close"]]
-
-
-print(backtest(S1_data, S2_data, h = 0.05, K = 5))
 
 # MSFT + ADBE, 0.0004, 3, 15 years, 2.93, z-entry = 2, z-exit = 0.75, tail: 5
 # GLD + SLV, 0.005, 1, 10 year, 2.23
