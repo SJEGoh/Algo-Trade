@@ -8,22 +8,22 @@ Pairs trading depends on multiple assumptions:
 - The standard deviation of the spread is equal across time
 - Spread residuals behave like IID Gaussian noise
 
-Unfortunately, in actual market conditions these rarely hold up. My model handles these assumptions by readjusting parameters to fit a new market regime, rather than assuming it remains constant. I employ a Bayesian CUSUM algorithm to achieve this, with a recalculation of hedge ratio, standard deviation, and mean everytime a regime change is detected. This model will be a proof of concept until I do actually get around to making the one that can choose cointegrated stocks. 
+Unfortunately, in actual market conditions these rarely hold up. My model handles these assumptions by readjusting parameters to fit a new market regime, rather than assuming it remains constant. My model performs online changepoint detection using a Bayesian CUSUM like algorithm. A regime shift causes a recalculation of hedge ratio, standard deviation, and mean everytime a regime change is detected. 
 
-Pairs that are cointegrated but experience major and violent shifts in regimes perform best with this bot. Stable pairs such as KO and PEP, while cointegrated, have regimes that evolve slowly, which may not trigger a regime change by the regime detector. In contrast, violent pairs such a NVDA and AMD, which are volatile and experience many regime changes perform better. While I could make this model handle evolving regimes, that would greatly increase complexity and perhaps affect the ability it currently has. As such, I will not do this for my own sanity, and because on the off chance that I want to convert this to C++ to compete with actual hedge funds, this change would slow down my bot significantly. 
+Pairs with abrupt structural changes perform best with this model. Slowly evolving pairs such as KO and PEP experience more of a regime drift and don't trigger clear changepoints, while more volatile pairs such as NVDA and AMD produce sharper structural breaks that are picked up by the detector.
 
-Other problems with the current model:
-- Very, very, very sensitive to changes in parameters. A weakness observed on most similar, BOCD style models. This would likely not make this viable for a actual markets, but a similar, more robust model could be adapted. But the great returns observed on backtests does show the potential of this type of regime shift pair trader.
+Limitations of current model:
+- Highly sensitive to hyperparameters:
+This is a common issue in BOCD style models due to the use of likelihood ratios and hazard functions. While currently this model may be too sensitive for real markets, backtests show strong potential for more robust models of this type. 
+- Performs best with distinct regimes
+Current model struggles with picking up drifting regimes. However, rather than altering this model to handle those as well, it may be more efficient to develop a different model to handle slow moving regimes, and make a meta-layer that sorts pairs into one or the other. 
 
-Overall, very fun build. I foresee this being part of a bigger build, with another model handling slower moving regimes, and a meta-sorter that sorts pairs into one or the other. 
-
-
-## 'main.py'
+## `main.py`
 
 #### Description
 This code runs the backtesting strategy using the parameters passed in, returning a dataframe of the account value over time as well as printing the sharpe ratio (using a risk-free rate of 2%).
 
-### 'backtest(tickers: tuple[str,str], years: int, h: float, K: float, z_entry: float, z_exit: float, lam: float) -> DataFrame'
+### `backtest(tickers: tuple[str,str], years: int, h: float, K: float, z_entry: float, z_exit: float, lam: float) -> DataFrame`
 
 #### Params
 - tickers: tuple container tickers of pair
@@ -34,81 +34,79 @@ This code runs the backtesting strategy using the parameters passed in, returnin
 - z_exit: deviation from mean before order is closed
 - lam: forgetting factor (prevents overweighting of past data)
 
-## 'HypoTest.py'
+## `HypoTest.py`
 
 #### Description
 The coup-de-grace of this project. 
 
-### 'class RegimeDetector'
+### `class RegimeDetector`
 
-#### '__init__(self, h: float = 0.1, K: int = 5, lam: float = 0.95):'
+#### `__init__(self, h: float = 0.1, K: int = 5, lam: float = 0.95):`
 Sets all the greeks, hazard function, lambda, and threshold. 
 
-#### 'initialize(self, initial_spread: pd.DataFrame)'
+#### `initialize(self, initial_spread: pd.DataFrame)`
 Takes in dataframe of spreads to initialize values on. Sets mu0 and sd0, and uses those values to set the rest of the greeks. 
 
-#### '_loglikelihood(self, spread: float, alpha: float, beta: float, kappa: float, mu: float)'
+#### `_loglikelihood(self, spread: float, alpha: float, beta: float, kappa: float, mu: float)`
 Helper function to calculate loglikelihood based on t distribution
 
-#### 'reset_baseline(self, last_k: pd.Series)'
+#### `reset_baseline(self, last_k: pd.Series)`
 Rests baseline when a regime change is detected. Uses last_k spreads. 
 
-#### 'update(self, spread: float)'
+#### `update(self, spread: float)`
 Takes in current spread, and updates the cumulative loglikelihood. If loglikelihood goes below threshold, function returns 'True'. If not, parameters are updated and function returns False. 
 
-#### 'get_params(self)'
+#### `get_params(self)`
 Returns current mean and standard deviation in a tuple
 
-## 'pair.py'
+## `pair.py`
 Contains strategy, trader, and portfolio objects. 
 
-### 'class PairTrader'
+### `class PairTrader`
 Used to calculate the z score, and confidence for trades. 
 
-#### '__init__(self, entry_z: float, exit_z: float, mu: float, sd: float)'
+#### `__init__(self, entry_z: float, exit_z: float, mu: float, sd: float)`
 Sets entry and exit z scores, current mean and standard deviation. 
 
-#### 'def calc_zscore(self, spread: float/series)'
+#### `def calc_zscore(self, spread: float/series)`
 Helper to calculate zscore
 
-#### 'generate(self, spread: float, rg: bool, L: float = 0.0, K: float = 5)'
+#### `generate(self, spread: float, rg: bool, L: float = 0.0, K: float = 5)`
 This function takes in the current spread, whether a regime change has happened, the current cumulative likelihood, and the threshold. If a regime change has happened, the function re-evaluates whether the current position still fits, and re-balances based on new confidence.
 
 If a regime change has not happened, the z value is calculated. This z value is used to evaluate the type of position the model should take, or if the trader should close out the position. After this, the confidence of the position is evaluated through the difference between z-score and z_exit (how over/under sold the pair is) and likehlihood (confidence in current regime). These are used to adjust the confidence of the position. 
 
-#### 'set_params(self, tup: tuple)'
+#### `set_params(self, tup: tuple)`
 Takes in tuple of new mean and standard deviation, and updates the object. 
 
-### 'class PairModel'
+### `class PairModel`
 Computes the hedge ratio using OLS and computes spread.
 
-#### '__init__(self)'
+#### `__init__(self)`
 Stores hedge ratio as 'b' and constant as 'const'.
 
-#### 'fit_hedge(self, df: pd.DataFrame)'
+#### `fit_hedge(self, df: pd.DataFrame)`
 Takes in dataframe with most current prices of both stocks, and updates hedgea ratio and constant through OLS. 
 
-#### 'compute_spread(self, s1_price: float, s2_price: float)'
+#### `compute_spread(self, s1_price: float, s2_price: float)`
 Computes instantaneous spread.
 
-### 'class Portfolio'
+### `class Portfolio`
 Contains starting cash, current position, the position state, and history. 
 
-#### 'update_position(self, date: np.datetime64, prices: dict, pos: float, b: float, r: int)'
+#### `update_position(self, date: np.datetime64, prices: dict, pos: float, b: float, r: int)`
 Takes in signal (pos) and depending on that, rebalances, closes out, or buys into a position. Date and current value is then appended into history. 
 
-#### 'get_value(self, prices: dict)'
+#### `get_value(self, prices: dict)`
 Returns value of current portfolio
 
-### 'hello.py'
+### `hello.py`
 
-#### 'hypothesis_test(tickers, years, train_i, h = 0.01, K = 2, lam = 0.95)'
+#### `hypothesis_test(tickers, years, train_i, h = 0.01, K = 2, lam = 0.95)`
 Takes in parameters and returns normalised spread in a dataframe, and plots time of changepoint detection. 
 
 References:
+Adams, R. P., & MacKay, D. J. C. (2007). Bayesian online changepoint detection. arXiv. https://arxiv.org/abs/0710.3742
 
-
-
-
-https://www.reddit.com/r/algotrading/comments/v7pchq/bayesian_hierarchical_models_for_algorithmic
+Murphy, K. P. (2007). Conjugate Bayesian analysis of the Gaussian distribution. University of British Columbia. https://www.cs.ubc.ca/~murphyk/Papers/bayesGaussians.pdf
 
