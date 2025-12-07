@@ -3,7 +3,6 @@ from HypoTest import RegimeDetector
 import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
-import statsmodels.api as sm
 import numpy as np
 
 
