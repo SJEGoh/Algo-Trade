@@ -1,8 +1,6 @@
 import numpy as np
 import pandas as pd
 from scipy.stats import t
-# Tail length changes a lot of stuff, make sure to play with it
-# Ok cool it works, now how to make it into an object
 
 class RegimeDetector:
     def __init__(self, h: float = 0.1, K: int = 5, lam: float = 0.95):

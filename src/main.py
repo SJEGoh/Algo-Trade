@@ -82,17 +82,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-# MSFT + ADBE, 0.0004, 3, 15 years, 2.93, z-entry = 2, z-exit = 0.75, tail: 5
-# GLD + SLV, 0.005, 1, 10 year, 2.23
-# BTC, ETH, 0.05, 5, 5 year, 2.02, z-entry = 2, z-exit = 0.75, tail: 5
-# CVX, XOM, 0.1, 3, 10 year, 2.41
-# NG=F, CL=F, 0.05, 2, 10 year, 2.45
-# NVDA, AMD, 0.003, 25, 10 year, 2.87
-
-
-# GLD + TSLA, 0.01, 10, 10 y, 3.20, lam = 0.90
-
 '''
 Hyperparameters to be set:
 - h
