@@ -7,7 +7,7 @@ import statsmodels.api as sm
 import numpy as np
 
 
-def backtest(tickers,years, h, K, z_entry, z_exit, lam):
+def backtest(tickers: tuple[str, str], years: int, h: float, K: float, z_entry: float, z_exit: float, lam: float) -> pd.DataFrame:
     S1_ticker = yf.Ticker(tickers[0])
     S2_ticker = yf.Ticker(tickers[1])
     df1 = S1_ticker.history(period = str(years) + "y")[["Close"]]
@@ -71,11 +71,12 @@ def backtest(tickers,years, h, K, z_entry, z_exit, lam):
     rfr = 0.02
 
     sharpe = (cumu_return - rfr)/ std
+    sharpe = mean_daily/std_daily * np.sqrt(252 * years)
     print(f"Sharpe Ratio: {sharpe["Value"]}")
     return d
 
 def main():
-    data = backtest(["BTC-USD", "ETH-USD"],years = 5, h = 0.05, K = 5, z_entry = 10, z_exit = 0.75, lam = 0.99)
+    data = backtest(["BTC-USD", "ETH-USD"],years = 5, h = 0.06, K = 5, z_entry = 3, z_exit = 0.75, lam = 0.99)
     data.plot()
     plt.show()
 
