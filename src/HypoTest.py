@@ -100,7 +100,7 @@ hypothesis_test(S1_data, S2_data, 10, 0.2, 10)
 # Ok cool it works, now how to make it into an object
 
 class RegimeDetector:
-    def __init__(self, h: float = 0.1, K: int = 5, lam = 0.95):
+    def __init__(self, h: float = 0.1, K: int = 5, lam: float = 0.95):
         self.prior = np.log((1-h)/h)
         self.K = K
 
@@ -120,7 +120,7 @@ class RegimeDetector:
 
         self.lam = lam
     
-    def initialize(self, initial_spread):
+    def initialize(self, initial_spread: pd.DataFrame):
         self.mu0 = initial_spread.mean()
         self.sd0 = initial_spread.std()
         self.L = 0.0
@@ -132,7 +132,7 @@ class RegimeDetector:
         self.beta = self.beta0
         self.initialized = True
     
-    def _loglikelihood(self, spread, alpha, beta, kappa, mu):
+    def _loglikelihood(self, spread: float, alpha: float, beta: float, kappa: float, mu: float):
         nu = 2.0 * alpha
         scale = np.sqrt(beta * (kappa + 1.0) / (alpha * kappa))
         return t.logpdf(spread, df=nu, loc=mu, scale=scale)
@@ -152,9 +152,9 @@ class RegimeDetector:
         if not self.initialized:
             raise ValueError("Not initialized")
 
-        L0 = self._loglikelihood(spread, self.alpha, self.beta, self.kappa, self.mu)
-        L1 = self._loglikelihood(spread, self.alpha0, self.beta0, self.kappa0, self.mu0)
-        self.L += L1 - L0 + self.prior
+        L1 = self._loglikelihood(spread, self.alpha, self.beta, self.kappa, self.mu)
+        L0 = self._loglikelihood(spread, self.alpha0, self.beta0, self.kappa0, self.mu0)
+        self.L += L0 - L1 + self.prior
 
         if self.L < -self.K:
             return True
