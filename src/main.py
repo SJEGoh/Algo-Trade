@@ -1,136 +1,20 @@
-from pair import PairModel, PairTrader, Portfolio
-from HypoTest import RegimeDetector
+from helper import run_one_window, kmeans_cluster, backtest
 import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-import random
 
-
-def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: float) -> pd.DataFrame:
-    portfolio = Portfolio(100)
-
-    train_i = 20
-    train_set = prices.iloc[:train_i]
-    test_set = prices.iloc[train_i:]
-    train_rows = []  
-
-    pair_model = PairModel()
-    pair_model.fit_hedge(train_set)
-
-    for i, row in train_set.iterrows():
-        spread = pair_model.compute_spread(row["S1"], row["S2"])
-        train_rows.append((i, spread))
-
-    train_spread = pd.DataFrame(train_rows, columns=["Date", "Spread"]).set_index("Date")
-    
-    detector = RegimeDetector(h = h, K = K, lam = lam)
-    detector.initialize(train_spread["Spread"])
-    strategy = PairTrader(z_entry, z_exit, train_spread["Spread"].mean(), train_spread["Spread"].std())
-    last_k = train_set.tail(5)
-    r = 0
-    rg_count = 0
-    new_params = (0, 0)
-    for i, row in test_set.iterrows():
-        rg = False
-        spread = pair_model.compute_spread(row["S1"], row["S2"])
-        last_k = last_k.iloc[1:]
-        last_k.loc[i] = row
-        
-        if rg := detector.update(spread):
-            pair_model.fit_hedge(last_k)
-            last_k_spread = []
-            for j, row_k in last_k.iterrows():
-                spread = pair_model.compute_spread(row_k["S1"], row_k["S2"])
-                last_k_spread.append((j, spread))
-            last_k_spread = pd.DataFrame(last_k_spread, columns=["Date", "Spread"]).set_index("Date")
-            detector.reset_baseline(last_k_spread["Spread"])
-            new_params = detector.get_params()
-            strategy.set_params(new_params)
-            r = 0
-        r += 1
-        position = strategy.generate(spread, rg, detector.L, K)
-        px = {"S1": row["S1"], "S2": row["S2"]}
-
-        portfolio.update_position(i, px, position, pair_model.b, r)
-
-    d = pd.DataFrame(portfolio.history)
-    d.columns = ["Date", "Value"]
-    d = d.set_index("Date")
-    daily_returns = d.pct_change().dropna()
-    std_daily = daily_returns.std()
-    cumu_return = (d["Value"].iloc[-1]/d["Value"].iloc[0]) - 1
-    std = std_daily * np.sqrt(252)
-
-    rfr = 0.02
-
-    daily_ret = d["Value"].pct_change().dropna()
-    excess = daily_ret
-    sharpe = float(excess.mean()/(1e-9 + excess.std())*np.sqrt(252))
-    return d, sharpe, portfolio.max_drawdown
-
-def test(prices):
-    z_exit = [0.1, 0.5, 1, 1.5]
-    best_train_sharpe = float('-inf')
-    results = []
-    for _ in range(200):  # 200 trials
-        h = random.uniform(0.1, 0.5)
-        K = random.randint(1, 5)
-        lam = random.choice([0.9, 0.93, 0.96, 0.99])
-        z_exit = random.choice([0.1, 0.5, 1.0, 1.5])
-        z_entry = z_exit * random.choice([2,3,4,5])
-
-        _, sharpe, max_dd = backtest(prices = prices, h = h, K = K, lam = lam, z_exit = z_exit, z_entry = z_entry)
-        if sharpe > best_train_sharpe:
-            best_params = [h, K, lam, z_exit, z_entry]
-            best_train_sharpe = sharpe
-        results.append({
-              "h": h, "K": K, "lam": lam,
-              "z_exit": z_exit, "z_entry": z_entry,
-              "sharpe": sharpe,
-              "max_dd": max_dd})
-    return results
-
-def run_one_window(window, split):
-    split = int(split * len(window))
-    train = window.iloc[:split]
-    test_set = window.iloc[split:]
-
-    results = test(train)
-    df = pd.DataFrame(results).sort_values("sharpe", ascending=False)
-    top_10 = df.head(10)
-
-    best = df.iloc[0]
-    best_params = [float(best["h"]), int(best["K"]), float(best["lam"]),
-                   float(best["z_exit"]), float(best["z_entry"])]
-
-    # evaluate top_10 on test
-    test_rows = []
-    for _, row in top_10.iterrows():
-        _, test_sharpe, test_max_dd = backtest(
-            test_set,
-            h=float(row["h"]),
-            K=int(row["K"]),
-            z_entry=float(row["z_entry"]),
-            z_exit=float(row["z_exit"]),
-            lam=float(row["lam"]),
-        )
-        test_rows.append({
-            "h": float(row["h"]),
-            "K": int(row["K"]),
-            "lam": float(row["lam"]),
-            "z_exit": float(row["z_exit"]),
-            "z_entry": float(row["z_entry"]),
-            "train_sharpe": float(row["sharpe"]),
-            "test_sharpe": float(test_sharpe),
-            "test_max_dd": float(test_max_dd)
-        })
-
-    out = pd.DataFrame(test_rows).sort_values("test_sharpe", ascending=False)
-    return best_params, out
+# ChatGPT idea, might keep cause I find it funny lol. Will remove if I actually deploy
+def sample_q(n, a=3, b=3, qmin=0.00001, qmax=0.8, explore_p=0.05, rng=None):
+    rng = np.random.default_rng(rng)
+    qs = []
+    for _ in range(n):
+        q = rng.beta(a, b)
+        qs.append(float(q))
+    return qs
 
 def main():
-    tickers = ["AMD", "NVDA"]
+    tickers = ["MSFT", "ADBE"]
     S1_ticker = yf.download(tickers=tickers[0], period="60d", interval="15m", auto_adjust=True)
     S2_ticker = yf.download(tickers=tickers[1], period="60d", interval="15m", auto_adjust=True)
 
@@ -140,13 +24,65 @@ def main():
     all_windows = []
     for i in range(0, l//2, l//12):
         window = prices.iloc[i:i + l//2]
-        best_params, result_df = run_one_window(window, 0.8)
+        best_params, result_df = run_one_window(window, 0.7)
         print("best_params (train):", best_params)
         print(result_df.head(10))
         all_windows.append(result_df)
     wf = pd.concat(all_windows, ignore_index=True)
-    print(wf.groupby(["h","K","lam","z_exit","z_entry"])["test_sharpe"].median().sort_values(ascending=False).head(10))
-    return wf
+    print(wf)
+    print(wf.groupby(["h","K","lam","z_exit","z_entry"])[["test_sharpe", "test_max_dd"]].median().sort_values(by = "test_sharpe", ascending=False).head(10))
+    clustered_df, cluster_summary, best_k, sil = kmeans_cluster(wf)
+    print("best_k =", best_k, "silhouette =", sil)
+    print(cluster_summary)
+
+    cs = clustered_df.groupby("cluster").agg(
+    sharpe_med=("test_sharpe","median"),
+    dd_med=("test_max_dd","median"),
+    n=("test_sharpe","size"),
+    )
+
+    cs["score"] = cs["sharpe_med"] - 5*cs["dd_med"]
+    best_cluster = cs.sort_values("score", ascending=False).index[0]
+    print(cs.sort_values("score", ascending=False).head(5))
+
+    best = clustered_df[clustered_df["cluster"] == best_cluster]
+    med = best[["h","K","lam","z_exit","z_entry"]].median(numeric_only=True)
+    param_cols = ["h","K","lam","z_exit","z_entry"]
+    print("======= BEST ========")
+    print(best[param_cols].describe(percentiles=[0.1,0.25,0.5,0.75,0.9]))
+    
+    safe_clusters = cs[(cs["sharpe_med"] > 0.5) & (cs["dd_med"] < 0.005)].index
+
+    print("\n\n\n\n")
+    safe = clustered_df[clustered_df["cluster"].isin(safe_clusters)].copy()
+    q = safe[param_cols].quantile([0.10, 0.25, 0.50, 0.75, 0.90]).T
+    q.columns = ["q10","q25","q50","q75","q90"]
+    print(q)
+
+    n_draws = 20  
+    qs = sample_q(n_draws, a=4, b=4, qmin=0.2, qmax=0.8, explore_p=0.05, rng=42)
+
+    compiled = pd.DataFrame(columns=["Date", "Value"])
+
+    for q in qs:
+        med = best[["h","K","lam","z_exit","z_entry"]].quantile(q=q, numeric_only=True)
+
+        d, sharpe, max_drawdown, trade_count = backtest(
+            prices,
+            h=float(med["h"]),
+            K=int(round(med["K"])),         
+            z_entry=float(med["z_entry"]),
+            z_exit=float(med["z_exit"]),
+            lam=float(med["lam"]),
+            train_i=20
+        )
+
+        print(f"q={q:.3f} sharpe={sharpe:.3f} dd={max_drawdown:.4f} trades={trade_count}")
+        compiled = pd.concat([compiled, d.reset_index()], axis=0)
+
+    compiled_mean = compiled.groupby("Date", as_index=False)["Value"].mean().set_index("Date")
+    compiled_mean.plot()
+    plt.show()
 
 if __name__ == "__main__":
     main()

@@ -3,6 +3,7 @@ import pandas as pd
 import statsmodels.api as sm
 import numpy as np
 
+
 class PairTrader:
     def __init__(self, entry_z: float, exit_z: float, mu: float, sd: float):
         self.entry_z = entry_z
@@ -20,9 +21,11 @@ class PairTrader:
             L_conf = max(0.0, min(1.0, 1 + L / K))
             k_conf = 1
             if self.position >= 0 and z < -self.exit_z:
-                return self.position * (0.2 * z_conf + 0.8 * L_conf) * k_conf
+                self.position *= (0.2 * z_conf + 0.8 * L_conf) * k_conf
+                return self.position 
             if self.position <= 0 and z > self.exit_z:
-                return self.position * (0.2 * z_conf + 0.8 * L_conf) * k_conf
+                self.position *= (0.2 * z_conf + 0.8 * L_conf) * k_conf
+                return self.position
             return 0
         z = self.calc_zscore(spread)
         if z >= self.entry_z:
@@ -34,7 +37,7 @@ class PairTrader:
         z_conf = min(1.0, 1 - np.exp(-abs(z)/(2*self.entry_z)))
         L_conf = max(0.0, min(1.0, 1 + (L + K) / (2*K)))
         k_conf = 1
-        return self.position * (0.2 * z_conf + 0.8 * L_conf) * k_conf
+        return self.position * (0.3 * z_conf + 0.7 * L_conf) * k_conf
     
     def set_params(self, tup: tuple):
         self.mu = tup[0]
@@ -64,17 +67,18 @@ class Portfolio:
         self.position = {"S1":0, "S2": 0}
         self.pos_state = 0
         self.history = []
-        self.stop_loss = float(stop_loss)          # e.g. 0.05 = 5% drawdown from peak since entry
+        self.stop_loss = float(stop_loss)         
         self.cooldown_bars = int(cooldown_bars)
         self.cooldown_left = 0
         self.entry_value = None
         self.peak_value = 0.0
         self.entry_peak_dd = 0.0
         self.max_drawdown = 0.0
+        self.trade_count = 0
 
-        self.fee_bps = float(fee_bps)      # e.g. 1.0 = 1 bp = 0.01%
-        self.slip_bps = float(slip_bps)    # e.g. 2.0 = 2 bps
-        self.fixed_fee = float(fixed_fee)  # per rebalance/transaction event
+        self.fee_bps = float(fee_bps)    
+        self.slip_bps = float(slip_bps)  
+        self.fixed_fee = float(fixed_fee) 
 
 
     def update_drawdown(self, value):
@@ -98,7 +102,7 @@ class Portfolio:
         self.entry_peak = None
         self.entry_peak_dd = 0.0
 
-    def update_position(self, date: np.datetime64, prices: dict, pos: float, b: float, r: int):
+    def update_position(self, date: np.datetime64, prices: dict, pos: float, b: float, r: int, L, K):
         p_s1, p_s2 = prices["S1"], prices["S2"]
         if self.cooldown_left > 0:
             self.cooldown_left -= 1
@@ -109,7 +113,7 @@ class Portfolio:
         curr_val = self.get_value(prices)
         self.entry_peak = curr_val
         self.entry_peak_dd = 0.0
-        cap = 20
+        cap = self.cash * 0.2
         tot = b * p_s1 + p_s2
         if self.pos_state != 0:
             if self.entry_value is None:
@@ -120,10 +124,11 @@ class Portfolio:
             dd = (self.peak_value - curr_val) / max(1e-9, self.peak_value)
             self.entry_peak_dd = max(self.entry_peak_dd, dd)
 
-            if dd >= self.stop_loss:
+            if dd >= self.stop_loss or L < (-K + K/4):
                 traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
                 if traded_notional:    
                     self._charge_costs(traded_notional)
+                    self.trade_count += 1
                 self.close_all(prices)
                 self.cooldown_left = self.cooldown_bars
                 self.history.append((date, self.get_value(prices)))
@@ -132,8 +137,9 @@ class Portfolio:
             traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
             if traded_notional:
                 self._charge_costs(traded_notional)
+                self.trade_count += 1
             self.close_all(prices)
-        elif r <= 5:
+        elif r <= 10 or L < -K + K/4:
             pass
         elif self.pos_state:
             change = pos - self.pos_state
@@ -142,6 +148,7 @@ class Portfolio:
             traded_notional = abs(dS1) * p_s1 + abs(dS2) * p_s2
             if traded_notional:
                 self._charge_costs(traded_notional)
+                self.trade_count += 1
             self.position["S1"] += dS1
             self.position["S2"] -= dS2
             self.cash += (dS2 * p_s2 - dS1 * p_s1)
@@ -151,10 +158,10 @@ class Portfolio:
             self.pos_state = pos
             dS1 = b * pos * cap/tot
             dS2 = pos * cap/tot
-
             traded_notional = abs(dS1) * p_s1 + abs(dS2) * p_s2
             if traded_notional:
                 self._charge_costs(traded_notional)
+                self.trade_count += 1
             self.position["S1"] += dS1
             self.position["S2"] -= dS2
             self.cash += (dS2 * p_s2 - dS1* p_s1) 
