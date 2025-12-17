@@ -14,7 +14,7 @@ def sample_q(n, a=3, b=3, qmin=0.00001, qmax=0.8, explore_p=0.05, rng=None):
     return qs
 
 def main():
-    tickers = ["MSFT", "ADBE"]
+    tickers = ["KO", "PEP"]
     S1_ticker = yf.download(tickers=tickers[0], period="60d", interval="15m", auto_adjust=True)
     S2_ticker = yf.download(tickers=tickers[1], period="60d", interval="15m", auto_adjust=True)
 
@@ -24,7 +24,7 @@ def main():
     all_windows = []
     for i in range(0, l//2, l//12):
         window = prices.iloc[i:i + l//2]
-        best_params, result_df = run_one_window(window, 0.7)
+        best_params, result_df = run_one_window(window, 0.5)
         print("best_params (train):", best_params)
         print(result_df.head(10))
         all_windows.append(result_df)

@@ -11,7 +11,7 @@ import numpy as np
 def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: float, train_i = 20) -> pd.DataFrame:
     portfolio = Portfolio(100)
 
-    train_i = 20
+    train_i = 30
     train_set = prices.iloc[:train_i]
     test_set = prices.iloc[train_i:]
     train_rows = []  
@@ -28,7 +28,7 @@ def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: flo
     detector = RegimeDetector(h = h, K = K, lam = lam)
     detector.initialize(train_spread["Spread"])
     strategy = PairTrader(z_entry, z_exit, train_spread["Spread"].mean(), train_spread["Spread"].std())
-    last_k = train_set.tail(10)
+    last_k = train_set.tail(30)
     r = 0
     rg_count = 0
     new_params = (0, 0)
@@ -71,21 +71,22 @@ def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: flo
     return d, sharpe, portfolio.max_drawdown, portfolio.trade_count
 
 def sample_h(iteration, explore_every=20):
-    if iteration % explore_every == 0:
+    if iteration % explore_every <= 5:
         return np.random.uniform(0.03, 0.07)
-    if iteration % explore_every == 5:
+    if iteration % explore_every <= 10:
         return np.random.uniform(0.003, 0.007)
     else:
         return np.random.uniform(0.15, 0.30)
+    
 def test(prices):
     best_train_sharpe = float('-inf')
     results = []
-    for _ in range(200):  # 200 trials
+    for _ in range(200): 
         h = sample_h(_)
-        K = random.randint(1, 10)
-        lam = random.choice([0.9, 0.93, 0.96, 0.99])
-        z_exit = random.choice([0.1, 0.5, 1.0, 1.5])
-        z_entry = z_exit * random.choice([2,3,4,5])
+        K = 5
+        lam = 0.98 # fix for training, see how to actually get these some other time
+        z_exit = 0.5 
+        z_entry = z_exit * random.choice([4,8,12,16])
 
         _, sharpe, max_dd, trade_count = backtest(prices = prices, h = h, K = K, lam = lam, z_exit = z_exit, z_entry = z_entry)
         if sharpe > best_train_sharpe:
@@ -143,7 +144,6 @@ def kmeans_cluster(bf):
 
     df = bf.copy()
 
-    # keep a "valid rows" mask so we don't lose params
     df = df.replace([np.inf, -np.inf], np.nan)
     valid = df[feats].notna().all(axis=1)
 

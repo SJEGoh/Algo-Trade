@@ -18,7 +18,7 @@ class PairTrader:
         if rg:
             z = self.calc_zscore(spread)
             z_conf = min(1.0, 1 - np.exp(-abs(z)/self.entry_z))
-            L_conf = max(0.0, min(1.0, 1 + L / K))
+            L_conf = max(0.0, min(1.0, 1 + 2 * L / K))
             k_conf = 1
             if self.position >= 0 and z < -self.exit_z:
                 self.position *= (0.2 * z_conf + 0.8 * L_conf) * k_conf
@@ -62,7 +62,7 @@ class PairModel:
     
 
 class Portfolio:
-    def __init__(self, cash, stop_loss = 0.05, cooldown_bars = 5, fee_bps = 1, slip_bps = 2, fixed_fee = 0.0):
+    def __init__(self, cash, stop_loss = 0.05, cooldown_bars = 5, fee_bps = 3, slip_bps = 10, fixed_fee = 0.0):
         self.cash = cash
         self.position = {"S1":0, "S2": 0}
         self.pos_state = 0
@@ -115,7 +115,16 @@ class Portfolio:
         self.entry_peak_dd = 0.0
         cap = self.cash * 0.2
         tot = b * p_s1 + p_s2
-        if self.pos_state != 0:
+        
+        if not pos:
+            traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
+            if traded_notional:
+                self._charge_costs(traded_notional)
+                self.trade_count += 1
+            self.close_all(prices)
+        elif r <= 30:
+            pass
+        elif self.pos_state:
             if self.entry_value is None:
                 self.entry_value = curr_val
                 self.peak_value = curr_val
@@ -133,15 +142,6 @@ class Portfolio:
                 self.cooldown_left = self.cooldown_bars
                 self.history.append((date, self.get_value(prices)))
                 return
-        if not pos:
-            traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
-            if traded_notional:
-                self._charge_costs(traded_notional)
-                self.trade_count += 1
-            self.close_all(prices)
-        elif r <= 10 or L < -K + K/4:
-            pass
-        elif self.pos_state:
             change = pos - self.pos_state
             dS1 = b * change * cap / tot
             dS2 = change * cap / tot
