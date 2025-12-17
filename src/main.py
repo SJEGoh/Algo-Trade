@@ -67,7 +67,7 @@ def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: flo
     daily_ret = d["Value"].pct_change().dropna()
     excess = daily_ret
     sharpe = float(excess.mean()/(1e-9 + excess.std())*np.sqrt(252))
-    return d, sharpe
+    return d, sharpe, portfolio.max_drawdown
 
 def test(prices):
     z_exit = [0.1, 0.5, 1, 1.5]
@@ -80,14 +80,15 @@ def test(prices):
         z_exit = random.choice([0.1, 0.5, 1.0, 1.5])
         z_entry = z_exit * random.choice([2,3,4,5])
 
-        _, sharpe = backtest(prices = prices, h = h, K = K, lam = lam, z_exit = z_exit, z_entry = z_entry)
+        _, sharpe, max_dd = backtest(prices = prices, h = h, K = K, lam = lam, z_exit = z_exit, z_entry = z_entry)
         if sharpe > best_train_sharpe:
             best_params = [h, K, lam, z_exit, z_entry]
             best_train_sharpe = sharpe
         results.append({
               "h": h, "K": K, "lam": lam,
               "z_exit": z_exit, "z_entry": z_entry,
-              "sharpe": sharpe})
+              "sharpe": sharpe,
+              "max_dd": max_dd})
     return results
 
 def run_one_window(window, split):
@@ -106,7 +107,7 @@ def run_one_window(window, split):
     # evaluate top_10 on test
     test_rows = []
     for _, row in top_10.iterrows():
-        _, test_sharpe = backtest(
+        _, test_sharpe, test_max_dd = backtest(
             test_set,
             h=float(row["h"]),
             K=int(row["K"]),
@@ -122,13 +123,14 @@ def run_one_window(window, split):
             "z_entry": float(row["z_entry"]),
             "train_sharpe": float(row["sharpe"]),
             "test_sharpe": float(test_sharpe),
+            "test_max_dd": float(test_max_dd)
         })
 
     out = pd.DataFrame(test_rows).sort_values("test_sharpe", ascending=False)
     return best_params, out
 
 def main():
-    tickers = ["NVDA", "AMD"]
+    tickers = ["AMD", "NVDA"]
     S1_ticker = yf.download(tickers=tickers[0], period="60d", interval="15m", auto_adjust=True)
     S2_ticker = yf.download(tickers=tickers[1], period="60d", interval="15m", auto_adjust=True)
 
