@@ -13,7 +13,6 @@ class PairTrader:
     
     def calc_zscore(self, spread: float):
         return (spread-self.mu)/self.sd
-    
     def generate(self, spread: float, rg: bool, L: float = 0.0, K: float = 5):
         if rg:
             z = self.calc_zscore(spread)
