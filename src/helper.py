@@ -86,7 +86,7 @@ def test(prices):
         K = 5
         lam = 0.98 # fix for training, see how to actually get these some other time
         z_exit = 0.5 
-        z_entry = z_exit * random.choice([4,8,12,16])
+        z_entry = z_exit * random.choice([4,8,16,32])
 
         _, sharpe, max_dd, trade_count = backtest(prices = prices, h = h, K = K, lam = lam, z_exit = z_exit, z_entry = z_entry)
         if sharpe > best_train_sharpe:
@@ -170,4 +170,18 @@ def kmeans_cluster(bf):
 
     return df_valid, summary, best_k, best_score
 
+def get_safe_range(best, safe):
+    params = ["h","K","lam","z_exit","z_entry"]
 
+    compiled_ranges = {}
+    for p in params:
+        ranges = [best[p].quantile(0.25), best[p].quantile(0.75)]
+        for c in safe["cluster"].unique():
+            curr = safe[safe["cluster"] == c][p]
+            curr_range = [curr.quantile(0.25), curr.quantile(0.75)]
+            if curr_range[0] > ranges[1] or curr_range[1] < ranges[0]:
+                continue
+            ranges[0] = max(ranges[0], curr_range[0])
+            ranges[1] = min(ranges[1], curr_range[1])
+        compiled_ranges[p] = ranges
+    return compiled_ranges

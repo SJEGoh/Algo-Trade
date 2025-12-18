@@ -62,7 +62,7 @@ class PairModel:
     
 
 class Portfolio:
-    def __init__(self, cash, stop_loss = 0.05, cooldown_bars = 5, fee_bps = 3, slip_bps = 10, fixed_fee = 0.0):
+    def __init__(self, cash, stop_loss = 0.1, cooldown_bars = 3, fee_bps = 3, slip_bps = 10, fixed_fee = 0.0):
         self.cash = cash
         self.position = {"S1":0, "S2": 0}
         self.pos_state = 0
@@ -103,14 +103,28 @@ class Portfolio:
         self.entry_peak_dd = 0.0
 
     def update_position(self, date: np.datetime64, prices: dict, pos: float, b: float, r: int, L, K):
+        
         p_s1, p_s2 = prices["S1"], prices["S2"]
+        curr_val = self.get_value(prices)
+        self.peak_value = max(self.peak_value, curr_val)
+        dd = (self.peak_value - curr_val) / max(1e-9, self.peak_value)
+        if dd >= self.stop_loss or L < (-K + K/5):
+            traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
+            if traded_notional: 
+                self.cooldown_left = self.cooldown_bars   
+                self._charge_costs(traded_notional)
+                self.trade_count += 1
+            self.close_all(prices)
+            self.cooldown_left = self.cooldown_bars
+            self.history.append((date, self.get_value(prices)))
+            return
+        # Cooldown ok, but probably want stop loss logic first
         if self.cooldown_left > 0:
             self.cooldown_left -= 1
             val = self.get_value(prices)
             self.history.append((date, val))
             self.update_drawdown(val)
             return
-        curr_val = self.get_value(prices)
         self.entry_peak = curr_val
         self.entry_peak_dd = 0.0
         cap = self.cash * 0.2
@@ -119,6 +133,7 @@ class Portfolio:
         if not pos:
             traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
             if traded_notional:
+                self.cooldown_left = self.cooldown_bars
                 self._charge_costs(traded_notional)
                 self.trade_count += 1
             self.close_all(prices)
@@ -128,25 +143,13 @@ class Portfolio:
             if self.entry_value is None:
                 self.entry_value = curr_val
                 self.peak_value = curr_val
-
-            self.peak_value = max(self.peak_value, curr_val)
-            dd = (self.peak_value - curr_val) / max(1e-9, self.peak_value)
             self.entry_peak_dd = max(self.entry_peak_dd, dd)
-
-            if dd >= self.stop_loss or L < (-K + K/4):
-                traded_notional = abs(self.position["S1"]) * p_s1 + abs(self.position["S2"]) * p_s2
-                if traded_notional:    
-                    self._charge_costs(traded_notional)
-                    self.trade_count += 1
-                self.close_all(prices)
-                self.cooldown_left = self.cooldown_bars
-                self.history.append((date, self.get_value(prices)))
-                return
             change = pos - self.pos_state
             dS1 = b * change * cap / tot
             dS2 = change * cap / tot
             traded_notional = abs(dS1) * p_s1 + abs(dS2) * p_s2
             if traded_notional:
+                self.cooldown_left = self.cooldown_bars
                 self._charge_costs(traded_notional)
                 self.trade_count += 1
             self.position["S1"] += dS1
@@ -160,11 +163,13 @@ class Portfolio:
             dS2 = pos * cap/tot
             traded_notional = abs(dS1) * p_s1 + abs(dS2) * p_s2
             if traded_notional:
+                self.cooldown_left = self.cooldown_bars
                 self._charge_costs(traded_notional)
                 self.trade_count += 1
             self.position["S1"] += dS1
             self.position["S2"] -= dS2
             self.cash += (dS2 * p_s2 - dS1* p_s1) 
+
         val = self.get_value(prices)
         if val > self.peak_value:
             self.peak_value = val
