@@ -11,7 +11,7 @@ import numpy as np
 def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: float, train_i = 20) -> pd.DataFrame:
     portfolio = Portfolio(100)
 
-    train_i = 30
+    train_i = 20
     train_set = prices.iloc[:train_i]
     test_set = prices.iloc[train_i:]
     train_rows = []  
@@ -28,7 +28,7 @@ def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: flo
     detector = RegimeDetector(h = h, K = K, lam = lam)
     detector.initialize(train_spread["Spread"])
     strategy = PairTrader(z_entry, z_exit, train_spread["Spread"].mean(), train_spread["Spread"].std())
-    last_k = train_set.tail(30)
+    last_k = train_set.tail(20)
     r = 0
     rg_count = 0
     new_params = (0, 0)
@@ -178,7 +178,7 @@ def get_safe_range(best, safe):
         ranges = [best[p].quantile(0.25), best[p].quantile(0.75)]
         for c in safe["cluster"].unique():
             curr = safe[safe["cluster"] == c][p]
-            curr_range = [curr.quantile(0.25), curr.quantile(0.75)]
+            curr_range = [curr.quantile(0.35), curr.quantile(0.65)]
             if curr_range[0] > ranges[1] or curr_range[1] < ranges[0]:
                 continue
             ranges[0] = max(ranges[0], curr_range[0])
