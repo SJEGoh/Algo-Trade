@@ -1,5 +1,5 @@
-from pair import PairModel, PairTrader, Portfolio
-from HypoTest import RegimeDetector
+from pairs.pair import PairModel, PairTrader, Portfolio
+from pairs.HypoTest import RegimeDetector
 import pandas as pd
 import random
 from sklearn.cluster import KMeans
@@ -9,7 +9,7 @@ import numpy as np
 
 
 def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: float, train_i = 20) -> pd.DataFrame:
-    portfolio = Portfolio(100)
+    portfolio = Portfolio(100, cooldown_bars = 30)
 
     train_i = 20
     train_set = prices.iloc[:train_i]
@@ -28,7 +28,7 @@ def backtest(prices, h: float, K: float, z_entry: float, z_exit: float, lam: flo
     detector = RegimeDetector(h = h, K = K, lam = lam)
     detector.initialize(train_spread["Spread"])
     strategy = PairTrader(z_entry, z_exit, train_spread["Spread"].mean(), train_spread["Spread"].std())
-    last_k = train_set.tail(20)
+    last_k = train_set.tail(30)
     r = 0
     rg_count = 0
     new_params = (0, 0)
@@ -84,7 +84,7 @@ def test(prices):
     for _ in range(200): 
         h = sample_h(_)
         K = 5
-        lam = 0.98 # fix for training, see how to actually get these some other time
+        lam = 0.998 # fix for training, see how to actually get these some other time
         z_exit = 0.5 
         z_entry = z_exit * random.choice([4,8,16,32])
 

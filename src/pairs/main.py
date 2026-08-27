@@ -1,4 +1,4 @@
-from helper import run_one_window, kmeans_cluster, backtest, get_safe_range
+from pairs.helper import run_one_window, kmeans_cluster, backtest, get_safe_range
 import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -14,9 +14,9 @@ def sample_q(n, a=3, b=3, qmin=0.00001, qmax=0.8, explore_p=0.05, rng=None):
     return qs
 
 def main():
-    tickers = ["NVDA", "AMD"]
-    S1_ticker = yf.download(tickers=tickers[0], period="60d", interval="15m", auto_adjust=True)
-    S2_ticker = yf.download(tickers=tickers[1], period="60d", interval="15m", auto_adjust=True)
+    tickers = ["AEE", "LNT"]
+    S1_ticker = yf.download(tickers=tickers[0], period="180d", interval="1d", auto_adjust=True)
+    S2_ticker = yf.download(tickers=tickers[1], period="180d", interval="1d", auto_adjust=True)
 
     prices = pd.concat([S1_ticker[["Close"]], S2_ticker[["Close"]]], axis = 1).dropna()
     prices.columns = ["S1", "S2"]

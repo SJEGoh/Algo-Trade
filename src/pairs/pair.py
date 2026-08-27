@@ -63,7 +63,7 @@ class PairModel:
     
 
 class Portfolio:
-    def __init__(self, cash, stop_loss = 0.15, cooldown_bars = 5, fee_bps = 3, slip_bps = 10, fixed_fee = 0.0):
+    def __init__(self, cash, stop_loss = 0.8, cooldown_bars = 5, fee_bps = 1, slip_bps = 5, fixed_fee = 0.0):
         self.cash = cash
         self.position = {"S1":0, "S2": 0}
         self.pos_state = 0
