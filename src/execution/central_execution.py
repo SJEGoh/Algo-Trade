@@ -6,14 +6,21 @@ from ibapi.common import BarData
 from ibapi.order_state import OrderState
 from ibapi.execution import Execution
 import threading
+import signal
+import sys
+
+from position_ledger import PositionLedger
+from risk_manager import RiskManager
 
 from typing import Dict, Optional, Literal
 import pandas as pd
 import time
 
-from test_orders import test_orders, get_test_order, list_test_case_ids, get_burst_test_orders
+from orders import test_orders, get_test_order, list_test_case_ids, get_burst_test_orders
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, Literal
+
+from config import CONFIG
 
 class Instrument(BaseModel):
     symbol: str
@@ -21,6 +28,7 @@ class Instrument(BaseModel):
     exchange: str = "SMART"
 
 class OrderIntent(BaseModel):
+    expected_price: Optional[float] = None
     strategy_id: str
     client_order_id: str
     timestamp: str
@@ -64,20 +72,28 @@ class OrderIntent(BaseModel):
 class CentralExecutor(EClient, EWrapper):
     def __init__(self):
         EClient.__init__(self, self)
+
+        # --- order-flow state (owned by the executor) ---
         self._next_order_id: Optional[int] = None
         self._order_id_ready = threading.Event()
         self._order_id_lock = threading.Lock()
         self.order_status: Dict[int, dict] = {}
-        self._seen_client_order_ids: Dict[str, int] = {}  # client_order_id -> order_id
+        self._seen_client_order_ids: Dict[str, Optional[int]] = {}
         self._dedup_lock = threading.Lock()
-        self.current_positions: Dict[str, float] = {}
-        self.pending_deltas: Dict[str, float] = {} 
-        self.broker_positions: Dict[str, float] = {}
-        self._positions_ready = threading.Event()
+        self._killed = False  # kill-switch flag (Phase 4)
 
+        # --- position/risk state (owned by their components, NOT duplicated here) ---
+        self.ledger = PositionLedger(self)
+        self.risk_manager = RiskManager(self.ledger, CONFIG)
+        self._pending_price_reqs: Dict[int, threading.Event] = {}   # reqId -> event fired when price arrives
+        self._price_results: Dict[int, float] = {}                   # reqId -> price received
+        self._price_req_lock = threading.Lock()
+        self._mkt_data_req_id = 9000                                  # base, kept away from order IDs
+    # ------------------------------------------------------------------
+    # Contract builders
+    # ------------------------------------------------------------------
     @staticmethod
     def get_contract(symbol: str, sec_type: str, exchange: str, currency: str, **kwargs) -> Contract:
-        """Generic contract builder — holds the shared fields, nothing asset-specific."""
         contract = Contract()
         contract.symbol = symbol
         contract.secType = sec_type
@@ -93,13 +109,13 @@ class CentralExecutor(EClient, EWrapper):
 
     @staticmethod
     def get_forex_contract(pair: str, exchange: str = "IDEALPRO", currency: str = "USD") -> Contract:
-        # forex contracts use symbol = base currency, currency = quote currency
-        # e.g. EUR.USD -> symbol="EUR", currency="USD"
         base, quote = pair.split(".")
         return CentralExecutor.get_contract(base, sec_type="CASH", exchange=exchange, currency=quote)
 
+    # ------------------------------------------------------------------
+    # Order ID management
+    # ------------------------------------------------------------------
     def nextValidId(self, orderId: int) -> None:
-        """Called automatically by ibapi once, right after connect()."""
         self._next_order_id = orderId
         self._order_id_ready.set()
         print(f"Next valid order ID: {orderId}")
@@ -111,11 +127,14 @@ class CentralExecutor(EClient, EWrapper):
             order_id = self._next_order_id
             self._next_order_id += 1
         return order_id
-    
+
+    # ------------------------------------------------------------------
+    # Order construction & placement
+    # ------------------------------------------------------------------
     @staticmethod
     def build_order(intent: dict) -> Order:
         order = Order()
-        order.action = intent["side"].upper()          # "buy" -> "BUY", "sell" -> "SELL"
+        order.action = intent["side"].upper()
         order.totalQuantity = intent["quantity"]
 
         if intent["order_type"] == "market":
@@ -128,77 +147,75 @@ class CentralExecutor(EClient, EWrapper):
 
         tif_map = {"day": "DAY", "gtc": "GTC"}
         order.tif = tif_map.get(intent.get("time_in_force", "day"), "DAY")
-
-        # required on newer ibapi versions or the order gets rejected
         order.eTradeOnly = False
         order.firmQuoteOnly = False
-
         return order
-    
+
     def place_order(self, intent: dict) -> int:
         instrument = intent["instrument"]
-        contract = self.get_stock_contract(
-            instrument["symbol"],
-            exchange=instrument.get("exchange", "SMART")
-        )
+        contract = self.get_stock_contract(instrument["symbol"], exchange=instrument.get("exchange", "SMART"))
         order = self.build_order(intent)
 
         order_id = self.get_next_order_id()
         self.placeOrder(order_id, contract, order)
 
         signed_qty = intent["quantity"] if intent["side"] == "buy" else -intent["quantity"]
-        symbol = intent["instrument"]["symbol"]
-        self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) + signed_qty
-        # track what you submitted before any callback fires
+        symbol = instrument["symbol"]
+
+        # route pending exposure through the ledger, not a local dict
+        self.ledger.record_pending(symbol, signed_qty)
+
         self.order_status[order_id] = {
             "client_order_id": intent["client_order_id"],
             "strategy_id": intent["strategy_id"],
-            "symbol": instrument["symbol"],
-            "status": "Submitted",   # local placeholder until IB's own status arrives
+            "symbol": symbol,
+            "status": "Submitted",
             "filled": 0,
             "remaining": intent["quantity"],
-            "pending_qty": signed_qty,   # add this
+            "pending_qty": signed_qty,
         }
         return order_id
 
     def orderStatus(self, orderId: int, status: str, filled: float, remaining: float,
-                 avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float,
-                 clientId: int, whyHeld: str, mktCapPrice: float) -> None:
+                    avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float,
+                    clientId: int, whyHeld: str, mktCapPrice: float) -> None:
         if orderId in self.order_status:
             self.order_status[orderId].update({
-                "status": status,
-                "filled": filled,
-                "remaining": remaining,
-                "avg_fill_price": avgFillPrice,
+                "status": status, "filled": filled,
+                "remaining": remaining, "avg_fill_price": avgFillPrice,
             })
         print(f"OrderStatus - id:{orderId} status:{status} filled:{filled} remaining:{remaining}")
 
-    # Phase 2
+    # ------------------------------------------------------------------
+    # Intent processing (Phase 2 + Phase 4 risk check)
+    # ------------------------------------------------------------------
     def process_intent(self, raw_intent: dict) -> dict:
-        # 1. schema validation
+        if self._killed:
+            return {"accepted": False, "reason": "executor is in kill-switch state"}
+
         try:
             intent = OrderIntent(**raw_intent)
         except Exception as e:
             return {"accepted": False, "reason": f"schema validation failed: {e}"}
 
         with self._dedup_lock:
-            # 2. dedup check
             if intent.client_order_id in self._seen_client_order_ids:
                 existing_order_id = self._seen_client_order_ids[intent.client_order_id]
-                return {
-                    "accepted": True,
-                    "order_id": existing_order_id,
-                    "note": "duplicate client_order_id — returning existing order, not resubmitting"
-                }
-            # reserve the client_order_id immediately, before placing the order,
-            # so a second identical request arriving mid-flight still sees it
+                return {"accepted": True, "order_id": existing_order_id,
+                        "note": "duplicate client_order_id — returning existing order, not resubmitting"}
             self._seen_client_order_ids[intent.client_order_id] = None
 
-            # 3. target_position translation + 4. place the order — both inside the same
-            # lock and the same try/except, so any failure in either step releases
-            # the reservation cleanly rather than leaving it stuck on None forever
             try:
                 resolved_intent = self._resolve_intent_type(intent)
+                resolved_delta = resolved_intent["quantity"] * (1 if resolved_intent["side"] == "buy" else -1)
+
+                # --- Phase 4: risk check, after resolution, before placing ---
+                reference_price = self._reference_price(resolved_intent)
+                risk_result = self.risk_manager.check_order(resolved_intent, resolved_delta, reference_price)
+                if not risk_result["approved"]:
+                    del self._seen_client_order_ids[intent.client_order_id]
+                    return {"accepted": False, "reason": risk_result["reason"]}
+
                 order_id = self.place_order(resolved_intent)
             except Exception as e:
                 del self._seen_client_order_ids[intent.client_order_id]
@@ -207,23 +224,70 @@ class CentralExecutor(EClient, EWrapper):
             self._seen_client_order_ids[intent.client_order_id] = order_id
 
         return {"accepted": True, "order_id": order_id}
+    
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib) -> None:
+        # 4 = last, 68 = delayed-last, 9 = close (fallbacks in preference order)
+        RELEVANT_TICKS = {4, 68, 9}
+        if tickType not in RELEVANT_TICKS or price is None or price <= 0:
+            return  # IB sends -1 when no data available; ignore
+        with self._price_req_lock:
+            if reqId in self._pending_price_reqs and reqId not in self._price_results:
+                self._price_results[reqId] = price
+                self._pending_price_reqs[reqId].set()   # unblock the waiting pull
 
+    def fetch_price(self, symbol: str, exchange: str = "SMART", timeout: float = 3.0) -> Optional[float]:
+        contract = self.get_stock_contract(symbol, exchange=exchange)
+
+        with self._order_id_lock:  # reuse a lock to hand out unique market-data reqIds
+            self._mkt_data_req_id += 1
+            req_id = self._mkt_data_req_id
+
+        event = threading.Event()
+        with self._price_req_lock:
+            self._pending_price_reqs[req_id] = event
+
+        try:
+            # snapshot=True returns a one-off snapshot then auto-cancels — cleaner than streaming
+            self.reqMktData(req_id, contract, "", True, False, [])
+            if not event.wait(timeout=timeout):
+                print(f"WARNING: price fetch for {symbol} timed out")
+                return None
+            with self._price_req_lock:
+                return self._price_results.get(req_id)
+        finally:
+            # clean up state; snapshot auto-cancels but cancel anyway to be safe
+            self.cancelMktData(req_id)
+            with self._price_req_lock:
+                self._pending_price_reqs.pop(req_id, None)
+                self._price_results.pop(req_id, None)
+                
+    def _reference_price(self, resolved_intent: dict) -> Optional[float]:
+        if resolved_intent.get("limit_price") is not None:
+            return resolved_intent["limit_price"]
+
+        expected = resolved_intent.get("expected_price")
+        if expected is not None:
+            return expected
+
+        # pull a live snapshot from IB
+        symbol = resolved_intent["instrument"]["symbol"]
+        exchange = resolved_intent["instrument"].get("exchange", "SMART")
+        pulled = self.fetch_price(symbol, exchange=exchange)
+        if pulled is not None:
+            return pulled
+
+        return None
+    
     def _resolve_intent_type(self, intent: OrderIntent) -> dict:
         symbol = intent.instrument.symbol
 
         if intent.intent_type == "target_position":
-            # cancel any still-open orders for this symbol before computing delta —
-            # otherwise pending exposure from a stale order double-counts or,
-            # worse, both orders execute independently
             self._cancel_open_orders_for_symbol(symbol)
 
-        confirmed = self.current_positions.get(symbol, 0.0)
-        pending = self.pending_deltas.get(symbol, 0.0)
-        effective_current = confirmed + pending
+        effective_current = self.ledger.effective_position(symbol)
 
         if intent.intent_type == "delta":
-            signed_qty = intent.quantity if intent.side == "buy" else -intent.quantity
-            delta = signed_qty
+            delta = intent.quantity if intent.side == "buy" else -intent.quantity
         elif intent.intent_type == "target_position":
             delta = intent.target_quantity - effective_current
         else:
@@ -241,91 +305,174 @@ class CentralExecutor(EClient, EWrapper):
         for order_id, status in list(self.order_status.items()):
             if status["symbol"] == symbol and status["status"] in ("PreSubmitted", "Submitted"):
                 print(f"Cancelling stale open order {order_id} for {symbol} before resolving new target")
-                self.cancelOrder(order_id)
-                # zero out its contribution to pending_deltas — it's being cancelled, not filled
+                self.cancelOrder(order_id)  # FIX: second arg required
                 pending_contribution = status.get("pending_qty", 0.0)
-                self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) - pending_contribution
-            
+                # reverse this order's pending contribution in the ledger
+                self.ledger.record_pending(symbol, -pending_contribution)
+
+    # ------------------------------------------------------------------
+    # Fill / position callbacks — all delegate to the ledger
+    # ------------------------------------------------------------------
     def execDetails(self, reqId: int, contract: Contract, execution: Execution) -> None:
+        order_info = self.order_status.get(execution.orderId, {})
+        strategy_id = order_info.get("strategy_id", "unknown")
         signed_qty = execution.shares if execution.side == "BOT" else -execution.shares
-        symbol = contract.symbol
-        self.current_positions[symbol] = self.current_positions.get(symbol, 0.0) + signed_qty
-        self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) - signed_qty  # this much is no longer "pending", it's confirmed
-        print(f"ExecDetails - {symbol} {execution.side} {execution.shares} @ {execution.price}")
+
+        self.ledger.record_fill(contract.symbol, signed_qty, execution.price, strategy_id)
+        self.risk_manager.check_drawdown(strategy_id)  # Phase 4: halt if this fill breached DD
+
+        print(f"ExecDetails - {contract.symbol} {execution.side} {execution.shares} @ {execution.price}")
+
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
-        """Fired once per held position when reqPositions() is called."""
-        self.broker_positions[contract.symbol] = position
+        # write to the LEDGER's broker_positions, not a local copy
+        self.ledger.broker_positions[contract.symbol] = position
         print(f"Position - {contract.symbol}: {position} @ avg cost {avgCost}")
 
     def positionEnd(self) -> None:
-        """Fired once, after all position() callbacks for this request have been sent."""
-        self._positions_ready.set()
+        self.ledger._positions_ready.set()
         print("Position snapshot complete")
 
-    def fetch_broker_positions(self, timeout: float = 5.0) -> Dict[str, float]:
-        self.broker_positions = {}
-        self._positions_ready.clear()
-        self.reqPositions()
-        if not self._positions_ready.wait(timeout=timeout):
-            raise TimeoutError("Timed out waiting for reqPositions() to complete")
-        return dict(self.broker_positions)
-    
-    def reconcile_positions(self, auto_correct: bool = True) -> dict:
-        broker_positions = self.fetch_broker_positions()
+    # ------------------------------------------------------------------
+    # Kill switch (Phase 4)
+    # ------------------------------------------------------------------
+    def kill_switch(self, flatten: bool = True) -> None:
+        self._killed = True
+        print("KILL SWITCH ACTIVATED")
 
-        all_symbols = set(self.current_positions.keys()) | set(broker_positions.keys())
-        discrepancies = {}
+        # 1. cancel all open orders
+        for order_id, status in list(self.order_status.items()):
+            if status["status"] in ("PreSubmitted", "Submitted"):
+                self.cancelOrder(order_id)
 
-        for symbol in all_symbols:
-            internal = self.current_positions.get(symbol, 0.0)
-            broker = broker_positions.get(symbol, 0.0)
-            if internal != broker:
-                discrepancies[symbol] = {"internal": internal, "broker": broker, "diff": broker - internal}
+        # 2. optionally flatten every position — privileged path, bypasses risk + dedup
+        if flatten:
+            for symbol, qty in list(self.ledger.current_positions.items()):
+                if qty != 0:
+                    flat_intent = {
+                        "strategy_id": "kill_switch",
+                        "client_order_id": f"flatten-{symbol}-{time.time()}",
+                        "instrument": {"symbol": symbol, "asset_class": "equity", "exchange": "SMART"},
+                        "intent_type": "delta",
+                        "side": "sell" if qty > 0 else "buy",
+                        "quantity": abs(qty),
+                        "order_type": "market",
+                        "time_in_force": "day",
+                        "schema_version": "1.0",
+                        "timestamp": "",
+                    }
+                    self.place_order(flat_intent)  # deliberately direct, not process_intent
 
-        if discrepancies and auto_correct:
-            print("Auto-correcting internal ledger to match broker...")
-            self.current_positions = dict(broker_positions)
-
-        return {
-            "reconciled_at": time.time(),
-            "matched": len(discrepancies) == 0,
-            "discrepancies": discrepancies,
-            "broker_positions": broker_positions,
-            "internal_positions": dict(self.current_positions),
-        }
+    # ------------------------------------------------------------------
+    # Startup
+    # ------------------------------------------------------------------
     def start(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 5, timeout: float = 5.0) -> dict:
-        """Connect, wait for the connection to be ready, and reconcile positions before accepting any intents."""
+        self._shutting_down = False
         self.connect(host, port, client_id)
-        threading.Thread(target=self.run, daemon=True).start()
+        self._api_thread = threading.Thread(target=self.run, daemon=True)  # store the handle
+        self._api_thread.start()
 
         if not self._order_id_ready.wait(timeout=timeout):
             raise TimeoutError("Timed out waiting for nextValidId — connection may have failed")
 
-        reconciliation = self.reconcile_positions()
+        self.reqMarketDataType(3)
+        reconciliation = self.ledger.reconcile()
         if not reconciliation["matched"]:
             print(f"WARNING: startup reconciliation found discrepancies: {reconciliation['discrepancies']}")
         return reconciliation
     
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Cleanly tear down: disconnect from IB and wait for the socket thread to exit.
+        Safe to call multiple times (idempotent) — from a signal handler, finally block,
+        or a kill-switch path."""
+        if getattr(self, "_shutting_down", False):
+            return  # already shutting down, don't double-run
+        self._shutting_down = True
+
+        print("Shutting down...")
+        try:
+            if self.isConnected():
+                self.disconnect()   # closes the socket, which unblocks run()'s read loop
+        except Exception as e:
+            print(f"Error during disconnect: {e}")
+
+        # wait for the API thread to actually finish, if we have a handle to it
+        api_thread = getattr(self, "_api_thread", None)
+        if api_thread is not None:
+            api_thread.join(timeout=timeout)
+            if api_thread.is_alive():
+                print("Warning: API thread did not exit within timeout")
+
+        print("Shutdown complete")
+  
 if __name__ == "__main__":
-    '''
     app = CentralExecutor()
-    app.connect("127.0.0.1", 7497, clientId=5)
-    threading.Thread(target=app.run, daemon=True).start()
-    app._order_id_ready.wait(timeout=5.0)
-    time.sleep(5)
 
-    burst_orders = get_burst_test_orders()
-    results = [None] * len(burst_orders)
+    def handle_sigint(sig, frame):
+        raise KeyboardInterrupt   # propagates to the try/finally, which runs shutdown()
 
-    def submit(i, intent):
-        results[i] = app.process_intent(intent)
+    signal.signal(signal.SIGINT, handle_sigint)
 
-    threads = [threading.Thread(target=submit, args=(i, intent)) for i, intent in enumerate(burst_orders)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    try:
+        app.start(client_id = 6)
+        time.sleep(5)
+        '''
+        burst_orders = get_burst_test_orders()
+        results = [None] * len(burst_orders)
 
-    for r in results:
-        print(r)
-    '''
+        def submit(i, intent):
+            results[i] = app.process_intent(intent)
+
+        threads = [threading.Thread(target=submit, args=(i, intent)) for i, intent in enumerate(burst_orders)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for r in results:
+            print(r)
+        '''
+        app = CentralExecutor()
+        app.start()
+        time.sleep(3)
+
+        # --- Tier 3, test 11: kill switch cancels open orders AND flattens positions ---
+
+        # Setup part A: create an OPEN (unfilled) order — a limit far below market that won't fill.
+        # Give it an expected_price so the risk check passes without needing live market data.
+        open_order = get_test_order("test-014-far-limit")  # AAPL buy limit @ 0.01, will sit unfilled
+        open_order["expected_price"] = 200.0                # so notional check has a price
+        r_open = app.process_intent(open_order)
+        print(f"open order submitted: {r_open}")
+
+        # Setup part B: create an actual POSITION to flatten — a market order that fills.
+        fill_order = get_test_order("test-001-aapl-buy-mkt")
+        fill_order["expected_price"] = 200.0
+        r_fill = app.process_intent(fill_order)
+        print(f"position order submitted: {r_fill}")
+
+        time.sleep(5)  # let the market order fill and the limit order settle into 'Submitted'
+
+        # Snapshot state BEFORE the kill switch, so you can compare after
+        print("\n--- before kill switch ---")
+        print(f"open orders: {[(oid, s['status']) for oid, s in app.order_status.items() if s['status'] in ('PreSubmitted', 'Submitted')]}")
+        print(f"positions: {dict(app.ledger.current_positions)}")
+
+        # Trip the kill switch
+        print("\n--- tripping kill switch ---")
+        app.kill_switch(flatten=True)
+
+        time.sleep(5)  # let cancels and flatten orders process
+
+        # Snapshot state AFTER
+        print("\n--- after kill switch ---")
+        print(f"killed flag: {app._killed}")
+        print(f"open orders: {[(oid, s['status']) for oid, s in app.order_status.items() if s['status'] in ('PreSubmitted', 'Submitted')]}")
+        print(f"positions: {dict(app.ledger.current_positions)}")
+
+        # Confirm new orders are now blocked
+        blocked = app.process_intent(get_test_order("test-005-dedup"))
+        print(f"post-kill order (should be blocked): {blocked}")
+
+        time.sleep(3)
+    except:
+        app.shutdown()

@@ -153,6 +153,7 @@ test_orders = [
         "side": "buy",
         "quantity": 10000,  # deliberately far exceeds any reasonable test allocation
         "order_type": "market",
+        "expected_price": 180.0,
         "time_in_force": "day",
         "risk": {"strategy_capital_allocation": 1000, "expected_notional": None, "max_slippage_bps": 15},
         "metadata": {"test_case": "9 - order size exceeds strategy's capital allocation, expect pre-trade rejection"}
@@ -320,7 +321,7 @@ def get_test_order(client_order_id: str) -> dict:
     Returns a fresh copy so mutating the result doesn't affect the shared list.
     """
     for order in test_orders:
-        if order["client_order_id"] == client_order_id:
+        if order.get("client_order_id") == client_order_id:
             return dict(order)
     raise KeyError(f"No test order found with client_order_id={client_order_id!r}")
 
