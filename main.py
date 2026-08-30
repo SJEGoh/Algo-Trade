@@ -5,6 +5,10 @@ from execution.central_execution import CentralExecutor
 from monitoring.logging_config import setup_logging
 
 from tests.fixtures.orders import test_orders, get_test_order, list_test_case_ids, get_burst_test_orders
+# main.py (or a dedicated test_recovery.py)
+from dotenv import load_dotenv
+from pathlib import Path
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 if __name__ == "__main__":
     setup_logging()
@@ -12,30 +16,34 @@ if __name__ == "__main__":
 
     def handle_sigint(sig, frame):
         raise KeyboardInterrupt
-
     signal.signal(signal.SIGINT, handle_sigint)
 
     try:
-        app.start(client_id=6)
-        time.sleep(3)
-        o = get_test_order("test-014-far-limit")
-        o["expected_price"] = 200.0
-        r = app.process_intent(o)
-        print(f"submitted: {r}")
-        time.sleep(2)
+        recon = app.start(client_id=6)
+        print("\n=== STARTUP RECONCILIATION ===")
+        print(f"matched: {recon['matched']}")
+        print(f"broker positions: {recon.get('broker_positions', {})}")
+        print(f"internal positions: {dict(app.ledger.current_positions)}")
+        print(f"open orders known to executor: "
+              f"{[(oid, s['status']) for oid, s in app.order_status.items() if s['status'] in ('PreSubmitted', 'Submitted')]}")
 
-        if r["accepted"]:
-            app.cancelOrder(r["order_id"])   # match YOUR ibapi signature here
-            print("cancel requested")
-            time.sleep(4)   # longer — give the Cancelled status callback time to arrive
+        # Place an order that will STAY OPEN (limit far below market, won't fill)
+        # so there's live state at IB to recover after a kill.
+        open_order = get_test_order("test-014-far-limit")
+        open_order["expected_price"] = 200.0
+        # unique client_order_id each run so the DB / dedup doesn't collide across runs
+        open_order["client_order_id"] = f"recovery-test-{int(time.time())}"
+        r = app.process_intent(open_order)
+        print(f"\nplaced open order: {r}")
 
-        # query AFTER the cancel callback has had time to land
-        rows = app.logger_db._conn.execute(
-            "SELECT order_id, symbol, side, order_type, expected_price, status FROM orders"
-        ).fetchall()
-        print("orders table:")
-        for row in rows:
-            print(" ", row)
-        time.sleep(3)
+        print("\n=== NOW KILL THIS PROCESS ===")
+        print("In another terminal, run:  pkill -9 -f 'python main.py'")
+        print("Then restart this script and check whether startup reconciliation")
+        print("recovers the open order and any position from IB.\n")
+
+        # keep the process alive so the order stays live at IB while you go kill it
+        while True:
+            time.sleep(5)
+
     finally:
         app.shutdown()

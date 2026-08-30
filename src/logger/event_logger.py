@@ -125,3 +125,35 @@ class EventLogger:
                 self._conn.close()
         except Exception as e:
             logger.error("EventLogger close failed: %s", e)
+
+    def get_order(self, order_id: int) -> Optional[dict]:
+        """Look up a previously logged order by order_id, for recovery after a restart.
+        Returns the original client_order_id / strategy_id / etc. that IB's openOrder
+        callback can't give back, or None if not found."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT order_id, client_order_id, strategy_id, symbol, side, "
+                    "quantity, order_type, limit_price, expected_price, status "
+                    "FROM orders WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()
+        except Exception as e:
+            logger.error("EventLogger get_order failed: %s", e)
+            return None
+
+        if row is None:
+            return None
+
+        return {
+            "order_id": row[0],
+            "client_order_id": row[1],
+            "strategy_id": row[2],
+            "symbol": row[3],
+            "side": row[4],
+            "quantity": row[5],
+            "order_type": row[6],
+            "limit_price": row[7],
+            "expected_price": row[8],
+            "status": row[9],
+        }

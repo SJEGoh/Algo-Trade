@@ -44,4 +44,8 @@ CONFIG = {
         "capital_allocation": 500_000.0,
         "max_drawdown": 0.15,
     },
+        "cross_sectional_momentum": {
+        "capital_allocation": 100_000.0,   # match the capital_allocation in your MomentumStrategy
+        "max_drawdown": 0.15,              # fraction of allocation, e.g. 0.15 = 15%
+    },
 }

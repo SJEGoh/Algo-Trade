@@ -13,6 +13,7 @@ Two things this handles beyond a plain basicConfig:
 
 import logging
 from logging.handlers import RotatingFileHandler
+from monitoring.alerter import Alerter, AlertingHandler
 from pathlib import Path
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -56,5 +57,8 @@ def setup_logging(level: int = logging.INFO, ibapi_level: int = logging.WARNING)
     root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    alerter = Alerter()
+    root.addHandler(AlertingHandler(alerter, level=logging.CRITICAL))
 
     logging.getLogger("ibapi").setLevel(ibapi_level)

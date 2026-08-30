@@ -24,6 +24,20 @@ from typing import Optional, Literal
 
 from config import CONFIG
 
+import pandas_market_calendars as mcal
+from datetime import datetime, time as dtime
+import pytz
+
+def is_market_open(exchange: str = "NYSE") -> bool:
+    cal = mcal.get_calendar(exchange)
+    now_et = datetime.now(pytz.timezone("America/New_York"))
+    schedule = cal.schedule(start_date=now_et.date(), end_date=now_et.date())
+    if schedule.empty:
+        return False  # holiday or weekend
+    market_open = schedule.iloc[0]["market_open"].tz_convert("America/New_York")
+    market_close = schedule.iloc[0]["market_close"].tz_convert("America/New_York")
+    return market_open <= now_et <= market_close
+
 import logging
 logger = logging.getLogger("executor")
 
@@ -98,7 +112,9 @@ class CentralExecutor(EClient, EWrapper):
         self._pending_price_reqs: Dict[int, threading.Event] = {}   # reqId -> event fired when price arrives
         self._price_results: Dict[int, float] = {}                   # reqId -> price received
         self._price_req_lock = threading.Lock()
-        self._mkt_data_req_id = 9000                                  # base, kept away from order IDs
+        self._mkt_data_req_id = 9000       
+
+        self._open_orders_ready = threading.Event()                           # base, kept away from order IDs
 
         # EventLogger
         self.logger_db = EventLogger()
@@ -154,6 +170,13 @@ class CentralExecutor(EClient, EWrapper):
             order.orderType = "MKT"
         elif intent["order_type"] == "limit":
             order.orderType = "LMT"
+            order.lmtPrice = intent["limit_price"]
+        elif intent["order_type"] == "stop":
+            order.orderType = "STP"
+            order.auxPrice = intent["stop_price"]
+        elif intent["order_type"] == "stop_limit":
+            order.orderType = "STP LMT"
+            order.auxPrice = intent["stop_price"]
             order.lmtPrice = intent["limit_price"]
         else:
             raise ValueError(f"Unsupported order_type: {intent['order_type']}")
@@ -371,12 +394,45 @@ class CentralExecutor(EClient, EWrapper):
                         "timestamp": "",
                     }
                     self.place_order(flat_intent)  # deliberately direct, not process_intent
+    
     def reconcile_and_log(self) -> dict:
         result = self.ledger.reconcile()
         self.logger_db.log_reconciliation(result["matched"], result["discrepancies"])
         if not result["matched"]:
             logger.warning("reconciliation found discrepancies: %s", result["discrepancies"])
         return result
+
+    def recover_open_orders(self, timeout: float = 5.0) -> None:
+        self._open_orders_ready.clear()
+        self.reqAllOpenOrders()
+        if not self._open_orders_ready.wait(timeout=timeout):
+            logger.warning("open-order recovery timed out")
+
+    def openOrder(self, orderId, contract, order, orderState):
+        # rebuild order_status from what IB reports as live
+        if orderId not in self.order_status:
+            original = self.logger_db.get_order(orderId)  # you'd add this method
+            client_order_id = original["client_order_id"] if original else f"recovered-{orderId}"
+            strategy_id = original["strategy_id"] if original else "recovered"
+            signed_qty = order.totalQuantity if order.action == "BUY" else -order.totalQuantity
+            self.order_status[orderId] = {
+                "client_order_id": client_order_id,   # we don't know the original
+                "strategy_id": strategy_id,
+                "symbol": contract.symbol,
+                "status": orderState.status,
+                "filled": 0,
+                "remaining": order.totalQuantity,
+                "pending_qty": signed_qty,
+            }
+            if client_order_id != f"recovered-{orderId}":
+                self._seen_client_order_ids[client_order_id] = orderId
+            # also restore pending exposure to the ledger
+            self.ledger.record_pending(contract.symbol, signed_qty)
+            logger.warning("recovered open order %s: %s %s %s",
+                        orderId, order.action, order.totalQuantity, contract.symbol)
+
+    def openOrderEnd(self):
+        self._open_orders_ready.set()
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -389,8 +445,10 @@ class CentralExecutor(EClient, EWrapper):
         if not self._order_id_ready.wait(timeout=timeout):
             raise TimeoutError("Timed out waiting for nextValidId — connection may have failed")
         self.reqMarketDataType(3)
-        return self.reconcile_and_log() 
-    
+        result = self.reconcile_and_log()      # ledger recovers positions
+        self.recover_open_orders()             # executor recovers open orders
+        return result
+        
     def shutdown(self, timeout: float = 5.0) -> None:
         """Cleanly tear down: disconnect from IB and wait for the socket thread to exit.
         Safe to call multiple times (idempotent) — from a signal handler, finally block,
