@@ -1,6 +1,9 @@
-from position_ledger import PositionLedger
+from ledger.position_ledger import PositionLedger
 import threading
 from typing import Dict, Optional, Literal
+
+import logging
+logger = logging.getLogger("executor")
 
 class RiskManager:
     def __init__(self, ledger, config: dict):
@@ -24,7 +27,7 @@ class RiskManager:
                 return {"approved": False,
                         "reason": f"order would exceed allocation: {current_notional + order_notional:.0f} > {alloc:.0f}"}
         else:
-            print(f"WARNING: no reference price for {strategy_id} — notional check skipped")
+            logger.warning("No reference price for %s — notional check skipped", strategy_id)
 
         return {"approved": True}
         
@@ -35,12 +38,12 @@ class RiskManager:
     def halt_strategy(self, strat_id: str, reason: str) -> None:
         with self._lock:
             self._active_strategies.discard(strat_id)
-        print(f"HALTED: {strat_id} - {reason}")
+        logger.warning("HALTED: %s - %s", strat_id, reason)
 
     def reactivate_strategy(self, strat_id: str) -> None:
         with self._lock:
             self._active_strategies.add(strat_id)
-        print(f"REACTIVATED: {strat_id}")
+        logger.info("REACTIVATED: %s", strat_id)
 
     def check_drawdown(self, strat_id: str) -> None:
         cfg = self._config.get(strat_id, {})
@@ -53,4 +56,5 @@ class RiskManager:
         pnl = self._ledger.strategy_realized_pnl.get(strat_id, 0.0)
         drawdown_pct = -pnl/alloc if pnl < 0 else 0.0
         if drawdown_pct >= max_dd:
-            self.halt_strategy(strat_id, f"drawdown breach {drawdown_pct:.1%} >= {max_dd:.1%}")
+            logger.critical("DRAWDOWN BREACH: %s at %.1f%% >= limit %.1f%%",
+                            strat_id, drawdown_pct * 100, max_dd * 100)

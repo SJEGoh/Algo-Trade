@@ -2,6 +2,9 @@ from typing import Dict, Optional, Literal
 import threading
 from typing import TYPE_CHECKING
 
+import logging
+logger = logging.getLogger("executor")
+
 if TYPE_CHECKING:
     from central_execution import CentralExecutor  # only imported by type checkers, never at runtime
 

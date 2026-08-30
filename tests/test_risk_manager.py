@@ -3,9 +3,8 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "execution"))
-from risk_manager import RiskManager
-from position_ledger import PositionLedger
+from risk.risk_manager import RiskManager
+from ledger.position_ledger import PositionLedger
 
 
 @pytest.fixture

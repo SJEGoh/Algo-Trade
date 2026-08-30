@@ -9,19 +9,25 @@ import threading
 import signal
 import sys
 
-from position_ledger import PositionLedger
-from risk_manager import RiskManager
+from ledger.position_ledger import PositionLedger
+from risk.risk_manager import RiskManager
+from logger.event_logger import EventLogger
+from monitoring.logging_config import setup_logging
 
 from typing import Dict, Optional, Literal
 import pandas as pd
 import time
 
-from orders import test_orders, get_test_order, list_test_case_ids, get_burst_test_orders
 from pydantic import BaseModel, Field, field_validator, model_validator
+from monitoring.logging_config import setup_logging
 from typing import Optional, Literal
 
 from config import CONFIG
 
+import logging
+logger = logging.getLogger("executor")
+
+# import these from a seperate file later
 class Instrument(BaseModel):
     symbol: str
     asset_class: str
@@ -67,6 +73,10 @@ class OrderIntent(BaseModel):
                 raise ValueError("'target_quantity' is required when intent_type is 'target_position'")
             if self.side is not None or self.quantity is not None:
                 raise ValueError("'side'/'quantity' should not be set for target_position intents — use 'target_quantity'")
+
+        if self.order_type == "market" and self.expected_price is None:
+            raise ValueError("expected_price is required for market orders "
+                         "(a systematic strategy always has a reference price at signal time)")
         return self
 
 class CentralExecutor(EClient, EWrapper):
@@ -89,6 +99,9 @@ class CentralExecutor(EClient, EWrapper):
         self._price_results: Dict[int, float] = {}                   # reqId -> price received
         self._price_req_lock = threading.Lock()
         self._mkt_data_req_id = 9000                                  # base, kept away from order IDs
+
+        # EventLogger
+        self.logger_db = EventLogger()
     # ------------------------------------------------------------------
     # Contract builders
     # ------------------------------------------------------------------
@@ -118,7 +131,7 @@ class CentralExecutor(EClient, EWrapper):
     def nextValidId(self, orderId: int) -> None:
         self._next_order_id = orderId
         self._order_id_ready.set()
-        print(f"Next valid order ID: {orderId}")
+        logger.info("Next valid order ID: %s", orderId)
 
     def get_next_order_id(self, timeout: float = 5.0) -> int:
         if not self._order_id_ready.wait(timeout=timeout):
@@ -158,7 +171,7 @@ class CentralExecutor(EClient, EWrapper):
 
         order_id = self.get_next_order_id()
         self.placeOrder(order_id, contract, order)
-
+        self.logger_db.log_order(order_id, intent)
         signed_qty = intent["quantity"] if intent["side"] == "buy" else -intent["quantity"]
         symbol = instrument["symbol"]
 
@@ -184,7 +197,8 @@ class CentralExecutor(EClient, EWrapper):
                 "status": status, "filled": filled,
                 "remaining": remaining, "avg_fill_price": avgFillPrice,
             })
-        print(f"OrderStatus - id:{orderId} status:{status} filled:{filled} remaining:{remaining}")
+            self.logger_db.update_order_status(orderId, status)
+        logger.debug("OrderStatus - id:%s status:%s filled:%s remaining:%s", orderId, status, filled, remaining)
 
     # ------------------------------------------------------------------
     # Intent processing (Phase 2 + Phase 4 risk check)
@@ -250,7 +264,7 @@ class CentralExecutor(EClient, EWrapper):
             # snapshot=True returns a one-off snapshot then auto-cancels — cleaner than streaming
             self.reqMktData(req_id, contract, "", True, False, [])
             if not event.wait(timeout=timeout):
-                print(f"WARNING: price fetch for {symbol} timed out")
+                logger.warning("price fetch for %s timed out", symbol)
                 return None
             with self._price_req_lock:
                 return self._price_results.get(req_id)
@@ -261,22 +275,12 @@ class CentralExecutor(EClient, EWrapper):
                 self._pending_price_reqs.pop(req_id, None)
                 self._price_results.pop(req_id, None)
                 
-    def _reference_price(self, resolved_intent: dict) -> Optional[float]:
+    def _reference_price(self, resolved_intent: dict) -> float:
+        # limit orders: the limit price is the reference
         if resolved_intent.get("limit_price") is not None:
             return resolved_intent["limit_price"]
-
-        expected = resolved_intent.get("expected_price")
-        if expected is not None:
-            return expected
-
-        # pull a live snapshot from IB
-        symbol = resolved_intent["instrument"]["symbol"]
-        exchange = resolved_intent["instrument"].get("exchange", "SMART")
-        pulled = self.fetch_price(symbol, exchange=exchange)
-        if pulled is not None:
-            return pulled
-
-        return None
+        # market orders: expected_price is guaranteed present by schema validation
+        return resolved_intent["expected_price"]
     
     def _resolve_intent_type(self, intent: OrderIntent) -> dict:
         symbol = intent.instrument.symbol
@@ -304,7 +308,7 @@ class CentralExecutor(EClient, EWrapper):
     def _cancel_open_orders_for_symbol(self, symbol: str) -> None:
         for order_id, status in list(self.order_status.items()):
             if status["symbol"] == symbol and status["status"] in ("PreSubmitted", "Submitted"):
-                print(f"Cancelling stale open order {order_id} for {symbol} before resolving new target")
+                logger.info("Cancelling stale open order %s for %s before resolving new target", order_id, symbol)
                 self.cancelOrder(order_id)  # FIX: second arg required
                 pending_contribution = status.get("pending_qty", 0.0)
                 # reverse this order's pending contribution in the ledger
@@ -319,25 +323,31 @@ class CentralExecutor(EClient, EWrapper):
         signed_qty = execution.shares if execution.side == "BOT" else -execution.shares
 
         self.ledger.record_fill(contract.symbol, signed_qty, execution.price, strategy_id)
+        self.logger_db.log_fill(
+            execution.orderId, execution.execId, contract.symbol,
+            execution.side, execution.price, execution.shares,
+            order_info.get("strategy_id", "unknown"),
+            expected_price=order_info.get("expected_price"),
+        )
         self.risk_manager.check_drawdown(strategy_id)  # Phase 4: halt if this fill breached DD
 
-        print(f"ExecDetails - {contract.symbol} {execution.side} {execution.shares} @ {execution.price}")
+        logger.info("ExecDetails - %s %s %s @ %s", contract.symbol, execution.side, execution.shares, execution.price)
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
         # write to the LEDGER's broker_positions, not a local copy
         self.ledger.broker_positions[contract.symbol] = position
-        print(f"Position - {contract.symbol}: {position} @ avg cost {avgCost}")
+        logger.info("Position - %s: %s @ avg cost %s", contract.symbol, position, avgCost)
 
     def positionEnd(self) -> None:
         self.ledger._positions_ready.set()
-        print("Position snapshot complete")
+        logger.info("Position snapshot complete")
 
     # ------------------------------------------------------------------
     # Kill switch (Phase 4)
     # ------------------------------------------------------------------
     def kill_switch(self, flatten: bool = True) -> None:
         self._killed = True
-        print("KILL SWITCH ACTIVATED")
+        logger.critical("KILL SWITCH ACTIVATED")
 
         # 1. cancel all open orders
         for order_id, status in list(self.order_status.items()):
@@ -361,7 +371,12 @@ class CentralExecutor(EClient, EWrapper):
                         "timestamp": "",
                     }
                     self.place_order(flat_intent)  # deliberately direct, not process_intent
-
+    def reconcile_and_log(self) -> dict:
+        result = self.ledger.reconcile()
+        self.logger_db.log_reconciliation(result["matched"], result["discrepancies"])
+        if not result["matched"]:
+            logger.warning("reconciliation found discrepancies: %s", result["discrepancies"])
+        return result
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -373,12 +388,8 @@ class CentralExecutor(EClient, EWrapper):
 
         if not self._order_id_ready.wait(timeout=timeout):
             raise TimeoutError("Timed out waiting for nextValidId — connection may have failed")
-
         self.reqMarketDataType(3)
-        reconciliation = self.ledger.reconcile()
-        if not reconciliation["matched"]:
-            print(f"WARNING: startup reconciliation found discrepancies: {reconciliation['discrepancies']}")
-        return reconciliation
+        return self.reconcile_and_log() 
     
     def shutdown(self, timeout: float = 5.0) -> None:
         """Cleanly tear down: disconnect from IB and wait for the socket thread to exit.
@@ -388,91 +399,19 @@ class CentralExecutor(EClient, EWrapper):
             return  # already shutting down, don't double-run
         self._shutting_down = True
 
-        print("Shutting down...")
+        logger.info("Shutting down...")
         try:
+            self.logger_db.close()
             if self.isConnected():
                 self.disconnect()   # closes the socket, which unblocks run()'s read loop
         except Exception as e:
-            print(f"Error during disconnect: {e}")
+            logger.error(f"Error during disconnect: {e}")
 
         # wait for the API thread to actually finish, if we have a handle to it
         api_thread = getattr(self, "_api_thread", None)
         if api_thread is not None:
             api_thread.join(timeout=timeout)
             if api_thread.is_alive():
-                print("Warning: API thread did not exit within timeout")
+                logger.warning("API thread did not exit within timeout")
 
-        print("Shutdown complete")
-  
-if __name__ == "__main__":
-    app = CentralExecutor()
-
-    def handle_sigint(sig, frame):
-        raise KeyboardInterrupt   # propagates to the try/finally, which runs shutdown()
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    try:
-        app.start(client_id = 6)
-        time.sleep(5)
-        '''
-        burst_orders = get_burst_test_orders()
-        results = [None] * len(burst_orders)
-
-        def submit(i, intent):
-            results[i] = app.process_intent(intent)
-
-        threads = [threading.Thread(target=submit, args=(i, intent)) for i, intent in enumerate(burst_orders)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        for r in results:
-            print(r)
-        '''
-        app = CentralExecutor()
-        app.start()
-        time.sleep(3)
-
-        # --- Tier 3, test 11: kill switch cancels open orders AND flattens positions ---
-
-        # Setup part A: create an OPEN (unfilled) order — a limit far below market that won't fill.
-        # Give it an expected_price so the risk check passes without needing live market data.
-        open_order = get_test_order("test-014-far-limit")  # AAPL buy limit @ 0.01, will sit unfilled
-        open_order["expected_price"] = 200.0                # so notional check has a price
-        r_open = app.process_intent(open_order)
-        print(f"open order submitted: {r_open}")
-
-        # Setup part B: create an actual POSITION to flatten — a market order that fills.
-        fill_order = get_test_order("test-001-aapl-buy-mkt")
-        fill_order["expected_price"] = 200.0
-        r_fill = app.process_intent(fill_order)
-        print(f"position order submitted: {r_fill}")
-
-        time.sleep(5)  # let the market order fill and the limit order settle into 'Submitted'
-
-        # Snapshot state BEFORE the kill switch, so you can compare after
-        print("\n--- before kill switch ---")
-        print(f"open orders: {[(oid, s['status']) for oid, s in app.order_status.items() if s['status'] in ('PreSubmitted', 'Submitted')]}")
-        print(f"positions: {dict(app.ledger.current_positions)}")
-
-        # Trip the kill switch
-        print("\n--- tripping kill switch ---")
-        app.kill_switch(flatten=True)
-
-        time.sleep(5)  # let cancels and flatten orders process
-
-        # Snapshot state AFTER
-        print("\n--- after kill switch ---")
-        print(f"killed flag: {app._killed}")
-        print(f"open orders: {[(oid, s['status']) for oid, s in app.order_status.items() if s['status'] in ('PreSubmitted', 'Submitted')]}")
-        print(f"positions: {dict(app.ledger.current_positions)}")
-
-        # Confirm new orders are now blocked
-        blocked = app.process_intent(get_test_order("test-005-dedup"))
-        print(f"post-kill order (should be blocked): {blocked}")
-
-        time.sleep(3)
-    except:
-        app.shutdown()
+        logger.info("Shutdown complete")
