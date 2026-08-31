@@ -199,7 +199,7 @@ class CentralExecutor(EClient, EWrapper):
         symbol = instrument["symbol"]
 
         # route pending exposure through the ledger, not a local dict
-        self.ledger.record_pending(symbol, signed_qty)
+        self.ledger.record_pending(symbol, signed_qty, intent["strategy_id"])
 
         self.order_status[order_id] = {
             "client_order_id": intent["client_order_id"],
@@ -304,19 +304,25 @@ class CentralExecutor(EClient, EWrapper):
             return resolved_intent["limit_price"]
         # market orders: expected_price is guaranteed present by schema validation
         return resolved_intent["expected_price"]
-    
+        
     def _resolve_intent_type(self, intent: OrderIntent) -> dict:
         symbol = intent.instrument.symbol
 
-        if intent.intent_type == "target_position":
-            self._cancel_open_orders_for_symbol(symbol)
-
-        effective_current = self.ledger.effective_position(symbol)
-
         if intent.intent_type == "delta":
             delta = intent.quantity if intent.side == "buy" else -intent.quantity
+
         elif intent.intent_type == "target_position":
-            delta = intent.target_quantity - effective_current
+            # measure against current position + orders already working
+            effective_incl_pending = self.ledger.effective_position(symbol)
+            gap = intent.target_quantity - effective_incl_pending
+            if gap == 0:
+                # existing working orders already drive us to target — leave them alone
+                raise ValueError("no-op: target already covered by position + working orders")
+            # target moved — NOW cancel the stale working orders, then size from the settled position
+            self._cancel_open_orders_for_symbol(symbol)
+            effective_after_cancel = self.ledger.effective_position(symbol)
+            delta = intent.target_quantity - effective_after_cancel
+
         else:
             raise ValueError(f"Unsupported intent_type: {intent.intent_type}")
 
@@ -335,7 +341,7 @@ class CentralExecutor(EClient, EWrapper):
                 self.cancelOrder(order_id)  # FIX: second arg required
                 pending_contribution = status.get("pending_qty", 0.0)
                 # reverse this order's pending contribution in the ledger
-                self.ledger.record_pending(symbol, -pending_contribution)
+                self.ledger.record_pending(symbol, -pending_contribution, status["strategy_id"])
 
     # ------------------------------------------------------------------
     # Fill / position callbacks — all delegate to the ledger
@@ -352,8 +358,9 @@ class CentralExecutor(EClient, EWrapper):
             order_info.get("strategy_id", "unknown"),
             expected_price=order_info.get("expected_price"),
         )
-        self.risk_manager.check_drawdown(strategy_id)  # Phase 4: halt if this fill breached DD
-
+        breached_dd = self.risk_manager.check_drawdown(strategy_id)  # Phase 4: halt if this fill breached DD
+        if breached_dd:
+            self.halt
         logger.info("ExecDetails - %s %s %s @ %s", contract.symbol, execution.side, execution.shares, execution.price)
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
@@ -427,7 +434,7 @@ class CentralExecutor(EClient, EWrapper):
             if client_order_id != f"recovered-{orderId}":
                 self._seen_client_order_ids[client_order_id] = orderId
             # also restore pending exposure to the ledger
-            self.ledger.record_pending(contract.symbol, signed_qty)
+            self.ledger.record_pending(contract.symbol, signed_qty, strategy_id)
             logger.warning("recovered open order %s: %s %s %s",
                         orderId, order.action, order.totalQuantity, contract.symbol)
 

@@ -1,7 +1,7 @@
 [project]
 name = "algo_trade"
 version = "0.1.0"
-dependencies = ["ibapi", "pydantic", "pandas"]
+dependencies = ["ibapi", "pydantic", "pandas", "fastapi", "uvicorn[standard]"]
 
 [build-system]
 requires = ["setuptools"]

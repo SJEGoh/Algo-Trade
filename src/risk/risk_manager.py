@@ -14,23 +14,25 @@ class RiskManager:
 
     def check_order(self, intent: dict, resolved_delta: float, price: Optional[float]) -> dict:
         strategy_id = intent["strategy_id"]
-
         if strategy_id not in self._active_strategies:
             return {"approved": False, "reason": f"strategy {strategy_id} is not active"}
 
-        alloc = self._config[strategy_id]["capital_allocation"]
-
-        if price is not None:
-            order_notional = abs(resolved_delta) * price
-            current_notional = self._strategy_gross_notional(strategy_id, price)
-            if current_notional + order_notional > alloc:
-                return {"approved": False,
-                        "reason": f"order would exceed allocation: {current_notional + order_notional:.0f} > {alloc:.0f}"}
-        else:
+        if price is None:
             logger.warning("No reference price for %s — notional check skipped", strategy_id)
+            return {"approved": True}
 
+        alloc  = self._config[strategy_id]["capital_allocation"]
+        symbol = intent["instrument"]["symbol"]
+
+        eff = self._ledger.strategy_effective_positions(strategy_id)   # filled + pending
+        eff[symbol] = eff.get(symbol, 0.0) + resolved_delta           # simulate this order landing
+        projected_gross = sum(abs(q) * price for q in eff.values())
+
+        if projected_gross > alloc:
+            return {"approved": False,
+                    "reason": f"order would exceed allocation: projected gross {projected_gross:.0f} > {alloc:.0f}"}
         return {"approved": True}
-        
+    
     def _strategy_gross_notional(self, strat_id: str, price: float) -> float:
         positions = self._ledger.strategy_positions.get(strat_id, {})
         return sum(abs(qty) * price for qty in positions.values())
@@ -45,7 +47,7 @@ class RiskManager:
             self._active_strategies.add(strat_id)
         logger.info("REACTIVATED: %s", strat_id)
 
-    def check_drawdown(self, strat_id: str) -> None:
+    def check_drawdown(self, strat_id: str) -> bool:
         cfg = self._config.get(strat_id, {})
         alloc = cfg.get("capital_allocation")
         max_dd = cfg.get("max_drawdown")
@@ -58,3 +60,8 @@ class RiskManager:
         if drawdown_pct >= max_dd:
             logger.critical("DRAWDOWN BREACH: %s at %.1f%% >= limit %.1f%%",
                             strat_id, drawdown_pct * 100, max_dd * 100)
+            self.halt_strategy(strat_id, f"DRAWDOWN BREACH: {strat_id} at {drawdown_pct * 100:.1f} >= limit {max_dd * 100:.1f}")
+
+    def is_active(self, strategy_id: str) -> bool:
+        with self._lock:
+            return strategy_id in self._active_strategies

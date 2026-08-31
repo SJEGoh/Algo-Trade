@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger("executor")
 
 if TYPE_CHECKING:
-    from central_execution import CentralExecutor  # only imported by type checkers, never at runtime
+    from execution.central_execution import CentralExecutor  # only imported by type checkers, never at runtime
 
 
 class PositionLedger:
@@ -20,17 +20,27 @@ class PositionLedger:
         self.strategy_realized_pnl: Dict[str, float] = {}  # Phase 3 addition
         self._positions_ready = threading.Event()
         self._lock = threading.Lock()
-
+        self.strategy_pending: Dict[str, Dict[str, float]] = {}
 
     def record_fill(self, symbol: str, signed_qty: float, price: float, strat_id: str) -> None:
         with self._lock:
             self.current_positions[symbol] = self.current_positions.get(symbol, 0.0) + signed_qty
-            self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) - signed_qty
+            self.pending_deltas[symbol]    = self.pending_deltas.get(symbol, 0.0) - signed_qty
+            sp = self.strategy_pending.setdefault(strat_id, {})
+            sp[symbol] = sp.get(symbol, 0.0) - signed_qty        # <-- new: keep lockstep with pending_deltas
             self._attribute_fill(symbol, signed_qty, price, strat_id)
-
-    def record_pending(self, symbol: str, signed_qty: float) -> None:
+    def strategy_effective_positions(self, strat_id: str) -> Dict[str, float]:
+        """Filled + pending, per symbol, for one strategy — a snapshot under lock."""
+        with self._lock:
+            filled  = self.strategy_positions.get(strat_id, {})
+            pending = self.strategy_pending.get(strat_id, {})
+            return {s: filled.get(s, 0.0) + pending.get(s, 0.0) for s in set(filled) | set(pending)}
+        
+    def record_pending(self, symbol: str, signed_qty: float, strat_id: str) -> None:
         with self._lock:
             self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) + signed_qty
+            sp = self.strategy_pending.setdefault(strat_id, {})
+            sp[symbol] = sp.get(symbol, 0.0) + signed_qty
 
     def effective_position(self, symbol: str) -> float:
         with self._lock:
