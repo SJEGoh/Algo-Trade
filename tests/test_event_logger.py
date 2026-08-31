@@ -10,8 +10,7 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "execution"))
-from event_logger import EventLogger
+from logger.event_logger import EventLogger
 
 
 @pytest.fixture

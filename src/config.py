@@ -36,11 +36,11 @@ CONFIG = {
     },
 
     # Tier 5 netting strategies
-    "strategy_a": {
+    "demo_momentum": {
         "capital_allocation": 500_000.0,
         "max_drawdown": 0.15,
     },
-    "strategy_b": {
+    "demo_meanrev": {
         "capital_allocation": 500_000.0,
         "max_drawdown": 0.15,
     },

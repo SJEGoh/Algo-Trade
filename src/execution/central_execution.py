@@ -118,6 +118,9 @@ class CentralExecutor(EClient, EWrapper):
 
         # EventLogger
         self.logger_db = EventLogger()
+
+        self._mark_cache: Dict[str, float] = {}   # symbol -> last good mark
+        self._mark_lock = threading.Lock()
     # ------------------------------------------------------------------
     # Contract builders
     # ------------------------------------------------------------------
@@ -297,7 +300,29 @@ class CentralExecutor(EClient, EWrapper):
             with self._price_req_lock:
                 self._pending_price_reqs.pop(req_id, None)
                 self._price_results.pop(req_id, None)
-                
+
+    def get_marks(self, symbols, timeout: float = 3.0) -> Dict[str, Optional[float]]:
+        """{symbol: mark_price}, snapshot-backed with carry-forward.
+        A failed fetch reuses the last good mark; never-marked -> None."""
+        symbols = list(dict.fromkeys(symbols))
+        results: Dict[str, Optional[float]] = {}
+
+        def _one(sym):
+            px = None
+            try:
+                px = self.fetch_price(sym, timeout=timeout)   # concurrent, unique reqIds
+            except Exception as e:
+                logger.warning("mark fetch failed for %s: %s", sym, e)
+            with self._mark_lock:
+                if px is not None and px > 0:
+                    self._mark_cache[sym] = px
+                results[sym] = self._mark_cache.get(sym)      # carry-forward
+
+        threads = [threading.Thread(target=_one, args=(s,), daemon=True) for s in symbols]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=timeout + 1.0)
+        return results
+
     def _reference_price(self, resolved_intent: dict) -> float:
         # limit orders: the limit price is the reference
         if resolved_intent.get("limit_price") is not None:

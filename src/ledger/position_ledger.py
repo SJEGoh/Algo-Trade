@@ -92,6 +92,27 @@ class PositionLedger:
             self.current_positions = dict(broker)
         return {"matched": not discrepancies, "discrepancies": discrepancies}
 
+    def equity_snapshot(self, marks: Dict[str, float]) -> Dict[str, dict]:
+        """Per-strategy realized + unrealized (mark-to-market) + cumulative total.
+        (mark - avg_cost) * qty is sign-correct for long and short. Missing mark
+        -> that leg contributes 0. Read under lock for a torn-free snapshot."""
+        out = {}
+        with self._lock:
+            strats = set(self.strategy_positions) | set(self.strategy_realized_pnl)
+            for strat in strats:
+                positions = self.strategy_positions.get(strat, {})
+                costs = self.strategy_avg_cost.get(strat, {})
+                realized = self.strategy_realized_pnl.get(strat, 0.0)
+                unrealized = 0.0
+                for sym, qty in positions.items():
+                    mark = marks.get(sym)
+                    if qty == 0 or mark is None:
+                        continue
+                    unrealized += (mark - costs.get(sym, 0.0)) * qty
+                out[strat] = {"realized": realized, "unrealized": unrealized,
+                              "equity": realized + unrealized}
+        return out
+    
 if __name__ == "__main__":
     led = PositionLedger(executor=None)  # no connection needed to test attribution
 

@@ -6,14 +6,22 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from execution.central_execution import CentralExecutor
 from monitoring.logging_config import setup_logging
 from config import CONFIG
 
+import threading
+from datetime import datetime, timezone
+import logging
+
 # .env lives at repo root (one level above src/) — same pattern as main.py
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 EXECUTOR_API_KEY = os.environ.get("EXECUTOR_API_KEY")
 SERVER_CLIENT_ID = 8  # distinct from main.py / run_strat.py (both use 6)
@@ -31,14 +39,17 @@ async def lifespan(app: FastAPI):
 
     executor = CentralExecutor()
     recon = executor.start(client_id = SERVER_CLIENT_ID)
+    threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
     app.state.startup_reconciliation = recon
 
     try:
         yield
     finally:
+        _sampler_stop.set()
         executor.shutdown()
 
 app = FastAPI(title="Algo Trade Executor", version="0.1.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def require_api_key(x_api_key: str = Header(default = "")) -> None:
     if not secrets.compare_digest(x_api_key, EXECUTOR_API_KEY or ""):
@@ -119,3 +130,57 @@ def reconcile():
         "discrepancies": result["discrepancies"],
         "positions": dict(executor.ledger.current_positions),
     }
+
+
+# ------------------------------------------------------------------
+# Dashboard (read-only monitor) + the list endpoints it needs
+# ------------------------------------------------------------------
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/orders")
+def list_orders():
+    # live, session-scoped view from in-memory order_status (richest: filled/remaining)
+    return {"orders": [{"order_id": oid, **st} for oid, st in executor.order_status.items()]}
+
+
+@app.get("/fills")
+def list_fills(limit: int = 50):
+    return {"fills": executor.logger_db.get_recent_fills(limit)}
+
+
+@app.get("/strategies")
+def list_strategies():
+    return {"strategies": [
+        {
+            "strategy_id": sid,
+            "capital_allocation": cfg["capital_allocation"],
+            "max_drawdown": cfg["max_drawdown"],
+            "active": executor.risk_manager.is_active(sid),
+        }
+        for sid, cfg in CONFIG.items()
+    ]}
+
+_sampler_stop = threading.Event()
+
+def _equity_sampler(interval: float = 60.0):
+    log = logging.getLogger("executor")
+    while not _sampler_stop.is_set():
+        try:
+            symbols = set()
+            for pos in executor.ledger.strategy_positions.values():
+                symbols |= {s for s, q in pos.items() if q != 0}
+            marks = executor.get_marks(symbols) if symbols else {}
+            ts = datetime.now(timezone.utc).isoformat()
+            for strat, v in executor.ledger.equity_snapshot(marks).items():
+                executor.logger_db.log_equity(ts, strat, v["realized"], v["unrealized"], v["equity"])
+        except Exception as e:
+            log.error("equity sampler error: %s", e)
+        _sampler_stop.wait(interval)   # sleep, wakes early on stop
+
+
+@app.get("/pnl/history")
+def pnl_history(strategy: Optional[str] = None, since: Optional[str] = None):
+    return {"history": executor.logger_db.get_equity_history(strategy_id=strategy, since=since)}

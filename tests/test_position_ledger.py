@@ -3,9 +3,7 @@ import pytest
 import sys
 import os
 
-# make the ledger importable — adjust path to your layout
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "execution"))
-from position_ledger import PositionLedger
+from ledger.position_ledger import PositionLedger
 
 
 @pytest.fixture

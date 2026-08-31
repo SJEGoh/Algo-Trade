@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<link rel="stylesheet" href="/static/uPlot.min.css">
+<script src="/static/uPlot.min.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Algo Trade Monitor</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#171b22; --border:#252b36; --text:#e6edf3;
+    --muted:#8b949e; --green:#3fb950; --red:#f85149; --amber:#d29922; --accent:#58a6ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px;
+           background:var(--panel); border-bottom:1px solid var(--border); position:sticky; top:0; }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
+  header.stale { background:#3a1d1d; }
+  .pill { padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.ok { background:rgba(63,185,80,.15); color:var(--green); }
+  .pill.bad { background:rgba(248,81,73,.15); color:var(--red); }
+  .pill.warn { background:rgba(210,153,34,.15); color:var(--amber); }
+  .spacer { flex:1; }
+  #updated { color:var(--muted); font-size:12px; }
+  main { padding:20px; display:grid; gap:20px; max-width:1200px; margin:0 auto; }
+  section { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  section > h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted);
+                 margin:0; padding:10px 14px; border-bottom:1px solid var(--border); }
+  .body { padding:4px 0; }
+  .err { color:var(--red); padding:12px 14px; }
+  .empty { color:var(--muted); padding:12px 14px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:right; padding:6px 14px; white-space:nowrap; }
+  th:first-child,td:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  tbody tr:hover { background:rgba(88,166,255,.06); }
+  .pos { color:var(--green); } .neg { color:var(--red); } .dim { color:var(--muted); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; padding:14px; }
+  .card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
+  .card .name { font-weight:600; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center; }
+  .card .row { display:flex; justify-content:space-between; color:var(--muted); }
+  .card .row span:last-child { color:var(--text); }
+</style>
+</head>
+<body>
+<header id="hdr">
+  <h1>ALGO TRADE MONITOR</h1>
+  <span id="conn" class="pill warn">connecting…</span>
+  <span id="killed" class="pill" hidden></span>
+  <span class="spacer"></span>
+  <span id="updated">—</span>
+</header>
+
+<main>
+  <section><h2>Equity Curve (total)</h2><div class="body"><div id="equity" style="padding:8px"></div></div></section>
+  <section><h2>Strategies</h2><div class="body" id="strategies"></div></section>
+  <section><h2>Positions</h2><div class="body" id="positions"></div></section>
+  <section><h2>Orders (this session)</h2><div class="body" id="orders"></div></section>
+  <section><h2>Fills &amp; Slippage</h2><div class="body" id="fills"></div></section>
+</main>
+
+<script>
+"use strict";
+
+// ---------- data layer: one function per endpoint, the only place that knows URLs ----------
+const api = {
+  async _get(path) {
+    const r = await fetch(path, { cache: "no-store" });
+    if (!r.ok) throw new Error(`${path} -> ${r.status}`);
+    return r.json();
+  },
+  health()     { return this._get("/health"); },
+  strategies() { return this._get("/strategies"); },
+  pnl()        { return this._get("/pnl"); },
+  positions()  { return this._get("/positions"); },
+  orders()     { return this._get("/orders"); },
+  fills()      { return this._get("/fills"); },
+};
+
+// ---------- state: single source of truth ----------
+const state = {
+  data: {},            // last good payload per key
+  errors: {},          // per-panel error message
+  lastUpdated: null,   // ms timestamp of last fully-successful poll cycle
+};
+
+// ---------- helpers ----------
+const el = (id) => document.getElementById(id);
+const num = (v, d = 0) => (v == null ? "—" : Number(v).toLocaleString(undefined, { maximumFractionDigits: d }));
+const money = (v) => (v == null ? "—" : "$" + Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 }));
+const signClass = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "dim");
+function table(cols, rows) {
+  if (!rows.length) return `<div class="empty">none</div>`;
+  const head = cols.map(c => `<th>${c.label}</th>`).join("");
+  const body = rows.map(r => "<tr>" + cols.map(c => `<td class="${c.cls ? c.cls(r) : ""}">${c.get(r)}</td>`).join("") + "</tr>").join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+function panel(id, render) {
+  const box = el(id);
+  if (state.errors[id]) { box.innerHTML = `<div class="err">⚠ ${state.errors[id]}</div>`; return; }
+  try { box.innerHTML = render(); }
+  catch (e) { box.innerHTML = `<div class="err">render error: ${e.message}</div>`; }
+}
+
+// ---------- render: pure functions, read state, never fetch ----------
+function renderHeader() {
+  const h = state.data.health;
+  const conn = el("conn"), killed = el("killed"), hdr = el("hdr");
+  if (h) {
+    conn.className = "pill " + (h.connected ? "ok" : "bad");
+    conn.textContent = h.connected ? "IB connected" : "IB DISCONNECTED";
+    killed.hidden = !h.killed;
+    if (h.killed) { killed.className = "pill bad"; killed.textContent = "KILL SWITCH ACTIVE"; }
+  }
+  // staleness: red header if last good cycle > 10s ago or the last cycle errored
+  const ageMs = state.lastUpdated ? Date.now() - state.lastUpdated : Infinity;
+  const stale = ageMs > 10000;
+  hdr.classList.toggle("stale", stale);
+  el("updated").textContent = state.lastUpdated
+    ? `updated ${Math.round(ageMs / 1000)}s ago` : "no data yet";
+}
+
+function renderStrategies() {
+  panel("strategies", () => {
+    const strats = (state.data.strategies?.strategies) || [];
+    const pnl = (state.data.pnl?.realized_pnl) || {};
+    if (!strats.length) return `<div class="empty">none configured</div>`;
+    return `<div class="cards">` + strats.map(s => {
+      const p = pnl[s.strategy_id] ?? 0;
+      const active = s.active;
+      return `<div class="card">
+        <div class="name">${s.strategy_id}
+          <span class="pill ${active ? "ok" : "bad"}">${active ? "active" : "HALTED"}</span></div>
+        <div class="row"><span>allocation</span><span>${money(s.capital_allocation)}</span></div>
+        <div class="row"><span>max drawdown</span><span>${(s.max_drawdown * 100).toFixed(0)}%</span></div>
+        <div class="row"><span>realized P&amp;L</span><span class="${signClass(p)}">${money(p)}</span></div>
+      </div>`;
+    }).join("") + `</div>`;
+  });
+}
+
+function renderPositions() {
+  panel("positions", () => {
+    const cur = (state.data.positions?.current_positions) || {};
+    const rows = Object.entries(cur).filter(([, q]) => q !== 0).map(([sym, q]) => ({ sym, q }));
+    return table([
+      { label: "Symbol", get: r => r.sym },
+      { label: "Quantity", cls: r => signClass(r.q), get: r => num(r.q) },
+    ], rows);
+  });
+}
+
+function renderOrders() {
+  panel("orders", () => {
+    const rows = ((state.data.orders?.orders) || [])
+      .sort((a, b) => b.order_id - a.order_id);
+    return table([
+      { label: "ID", get: r => r.order_id },
+      { label: "Symbol", get: r => r.symbol },
+      { label: "Status", cls: r => r.status === "Filled" ? "pos" : r.status === "Cancelled" ? "dim" : "", get: r => r.status },
+      { label: "Filled", get: r => num(r.filled) },
+      { label: "Remaining", get: r => num(r.remaining) },
+      { label: "Pending", cls: r => signClass(r.pending_qty), get: r => num(r.pending_qty) },
+      { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
+    ], rows);
+  });
+}
+
+function renderFills() {
+  panel("fills", () => {
+    const rows = (state.data.fills?.fills) || [];
+    const slip = (f) => {
+      if (f.expected_price == null) return null;
+      const sign = f.side === "BOT" ? 1 : -1;          // +ve = worse than expected
+      return (f.price - f.expected_price) * sign;
+    };
+    const bps = (f) => {
+      const s = slip(f);
+      return s == null || !f.expected_price ? null : (s / f.expected_price) * 10000;
+    };
+    return table([
+      { label: "Time", cls: () => "dim", get: r => (r.filled_at || "").slice(11, 19) },
+      { label: "Symbol", get: r => r.symbol },
+      { label: "Side", get: r => r.side === "BOT" ? "BUY" : "SELL" },
+      { label: "Qty", get: r => num(r.quantity) },
+      { label: "Fill", get: r => num(r.price, 2) },
+      { label: "Expected", cls: () => "dim", get: r => num(r.expected_price, 2) },
+      { label: "Slip", cls: r => signClass(slip(r) ?? 0), get: r => { const s = slip(r); return s == null ? "—" : (s > 0 ? "+" : "") + s.toFixed(2); } },
+      { label: "bps", cls: r => signClass(bps(r) ?? 0), get: r => { const b = bps(r); return b == null ? "—" : (b > 0 ? "+" : "") + b.toFixed(0); } },
+      { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
+    ], rows);
+  });
+}
+
+let uplot = null;
+const PALETTE = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf"];
+function renderEquity() {
+  const box = el("equity");
+  try {
+    if (typeof uPlot === "undefined") {
+      box.innerHTML = `<div class="err">uPlot failed to load (CDN blocked?)</div>`; return;
+    }
+    const rows = (state.data.equityhist?.history) || [];
+    if (!rows.length) { box.innerHTML = `<div class="empty">no snapshots yet</div>`; return; }
+    const ts = [...new Set(rows.map(r => r.ts))].sort();
+    const strats = [...new Set(rows.map(r => r.strategy_id))].sort();
+    const byTs = {}; rows.forEach(r => (byTs[r.ts] ??= {})[r.strategy_id] = r.equity);
+    const x = ts.map(t => Date.parse(t) / 1000);
+    const overall = ts.map(t => strats.reduce((s, st) => s + (byTs[t][st] ?? 0), 0));
+    const data = [x, overall, ...strats.map(st => ts.map(t => byTs[t][st] ?? null))];
+    if (!uplot) {
+      box.innerHTML = "";  // clear any placeholder text before mounting the chart
+      const series = [{}, { label: "OVERALL", stroke: "#e6edf3", width: 2 },
+        ...strats.map((st, i) => ({ label: st, stroke: PALETTE[i % PALETTE.length], width: 1 }))];
+      uplot = new uPlot({ width: box.clientWidth || 900, height: 260, series,
+        axes: [{ stroke: "#8b949e" }, { stroke: "#8b949e" }] }, data, box);
+    } else {
+      uplot.setData(data);
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="err">equity render error: ${e.message}</div>`;
+    uplot = null;  // allow a clean re-mount on the next poll
+  }
+}
+
+function renderAll() {
+  renderHeader(); renderStrategies(); renderPositions(); renderOrders(); renderFills(); renderEquity();
+}
+
+// ---------- poll loop: fetch -> state -> render (error-isolated per panel) ----------
+const FEEDS = [
+  ["health", api.health.bind(api), null],
+  ["strategies", api.strategies.bind(api), "strategies"],
+  ["pnl", api.pnl.bind(api), "strategies"],
+  ["positions", api.positions.bind(api), "positions"],
+  ["orders", api.orders.bind(api), "orders"],
+  ["fills", api.fills.bind(api), "fills"],
+  ["equityhist", () => api._get("/pnl/history"), null],   // <-- add this line
+];
+
+async function poll() {
+  const results = await Promise.allSettled(FEEDS.map(([, fn]) => fn()));
+  let allOk = true;
+  results.forEach((res, i) => {
+    const [key, , panelId] = FEEDS[i];
+    if (res.status === "fulfilled") {
+      state.data[key] = res.value;
+      if (panelId) delete state.errors[panelId];
+    } else {
+      allOk = false;
+      if (panelId) state.errors[panelId] = res.reason.message;
+    }
+  });
+  if (allOk) state.lastUpdated = Date.now();
+  renderAll();
+}
+
+poll();
+setInterval(poll, 3000);
+setInterval(renderHeader, 1000);   // keep "updated Ns ago" / staleness ticking between polls
+</script>
+</body>
+</html>

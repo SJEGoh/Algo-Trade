@@ -61,6 +61,15 @@ class EventLogger:
                     detail      TEXT,
                     occurred_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS equity_snapshots (
+                    snap_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    realized    REAL NOT NULL,
+                    unrealized  REAL NOT NULL,
+                    equity      REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts);
             """)
             self._conn.commit()
 
@@ -157,3 +166,43 @@ class EventLogger:
             "expected_price": row[8],
             "status": row[9],
         }
+
+    def get_recent_fills(self, limit: int = 50) -> list:
+        """Most-recent fills first, for the dashboard fills/slippage panel."""
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT order_id, exec_id, symbol, side, price, expected_price, "
+                    "quantity, strategy_id, filled_at "
+                    "FROM fills ORDER BY fill_id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        except Exception as e:
+            logger.error("EventLogger get_recent_fills failed: %s", e)
+            return []
+        cols = ["order_id", "exec_id", "symbol", "side", "price",
+                "expected_price", "quantity", "strategy_id", "filled_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def log_equity(self, ts, strategy_id, realized, unrealized, equity) -> None:
+        self._execute(
+            "INSERT INTO equity_snapshots (ts, strategy_id, realized, unrealized, equity) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts, strategy_id, realized, unrealized, equity),
+        )
+
+    def get_equity_history(self, strategy_id=None, since=None) -> list:
+        q = "SELECT ts, strategy_id, realized, unrealized, equity FROM equity_snapshots"
+        conds, params = [], []
+        if strategy_id: conds.append("strategy_id = ?"); params.append(strategy_id)
+        if since:       conds.append("ts >= ?");         params.append(since)
+        if conds: q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY ts ASC"
+        try:
+            with self._lock:
+                rows = self._conn.execute(q, tuple(params)).fetchall()
+        except Exception as e:
+            logger.error("get_equity_history failed: %s", e)
+            return []
+        cols = ["ts", "strategy_id", "realized", "unrealized", "equity"]
+        return [dict(zip(cols, r)) for r in rows]
