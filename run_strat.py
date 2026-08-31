@@ -118,6 +118,8 @@ if __name__ == "__main__":
         raise SystemExit(f"server up but IB not connected: {health}")
     if health.get("killed"):
         raise SystemExit("server is in kill-switch state — refusing to trade")
+    if not health.get("market_open"):
+        raise SystemExit("market is closed — skipping cycle (executor would reject anyway)")
 
     # 2. pull-before-act — skip the cycle entirely if halted
     status = requests.get(f"{BASE_URL}/strategies/{STRATEGY_ID}/status", timeout=5).json()

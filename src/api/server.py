@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from execution.central_execution import CentralExecutor
+from execution.central_execution import CentralExecutor, is_market_open
 from monitoring.logging_config import setup_logging
 from config import CONFIG
 
@@ -91,6 +91,7 @@ def health():
     return {
         "connected": executor.isConnected(),
         "killed": executor._killed,
+        "market_open": is_market_open(),
     }
 
 
@@ -174,7 +175,10 @@ def _equity_sampler(interval: float = 60.0):
                 symbols |= {s for s, q in pos.items() if q != 0}
             marks = executor.get_marks(symbols) if symbols else {}
             ts = datetime.now(timezone.utc).isoformat()
-            for strat, v in executor.ledger.equity_snapshot(marks).items():
+            snap = executor.ledger.equity_snapshot(marks)
+            for sid in CONFIG:  # ensure every configured strategy has a point, even flat
+                snap.setdefault(sid, {"realized": 0.0, "unrealized": 0.0, "equity": 0.0})
+            for strat, v in snap.items():
                 executor.logger_db.log_equity(ts, strat, v["realized"], v["unrealized"], v["equity"])
         except Exception as e:
             log.error("equity sampler error: %s", e)

@@ -28,15 +28,30 @@ import pandas_market_calendars as mcal
 from datetime import datetime, time as dtime
 import pytz
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=4)
+def _market_calendar(exchange: str):
+    return mcal.get_calendar(exchange)
+
+
+_schedule_cache: dict = {}   # (exchange, date) -> (open_dt, close_dt) or None
+
+
 def is_market_open(exchange: str = "NYSE") -> bool:
-    cal = mcal.get_calendar(exchange)
     now_et = datetime.now(pytz.timezone("America/New_York"))
-    schedule = cal.schedule(start_date=now_et.date(), end_date=now_et.date())
-    if schedule.empty:
-        return False  # holiday or weekend
-    market_open = schedule.iloc[0]["market_open"].tz_convert("America/New_York")
-    market_close = schedule.iloc[0]["market_close"].tz_convert("America/New_York")
-    return market_open <= now_et <= market_close
+    key = (exchange, now_et.date())
+    if key not in _schedule_cache:
+        sched = _market_calendar(exchange).schedule(start_date=now_et.date(), end_date=now_et.date())
+        if sched.empty:
+            _schedule_cache[key] = None
+        else:
+            o = sched.iloc[0]["market_open"].tz_convert("America/New_York")
+            c = sched.iloc[0]["market_close"].tz_convert("America/New_York")
+            _schedule_cache[key] = (o, c)
+    window = _schedule_cache[key]
+    return window is not None and window[0] <= now_et <= window[1]
 
 import logging
 logger = logging.getLogger("executor")
@@ -105,6 +120,7 @@ class CentralExecutor(EClient, EWrapper):
         self._seen_client_order_ids: Dict[str, Optional[int]] = {}
         self._dedup_lock = threading.Lock()
         self._killed = False  # kill-switch flag (Phase 4)
+        self._enforce_market_hours = True  # reject orders while market closed (per-intent override: metadata.allow_when_closed)
 
         # --- position/risk state (owned by their components, NOT duplicated here) ---
         self.ledger = PositionLedger(self)
@@ -237,6 +253,11 @@ class CentralExecutor(EClient, EWrapper):
             intent = OrderIntent(**raw_intent)
         except Exception as e:
             return {"accepted": False, "reason": f"schema validation failed: {e}"}
+
+        if self._enforce_market_hours and not is_market_open() and not intent.metadata.get("allow_when_closed"):
+            return {"accepted": False,
+                    "reason": "market closed — order not submitted "
+                              "(set metadata.allow_when_closed=true to queue for open)"}
 
         with self._dedup_lock:
             if intent.client_order_id in self._seen_client_order_ids:

@@ -175,16 +175,19 @@ def test_pnl(client):
     assert body["realized_pnl"][KNOWN_STRAT] == 1234.5
 
 
-def test_health(client, fake):
+def test_health(client, fake, monkeypatch):
+    # pin market status so the test doesn't depend on the wall clock
+    monkeypatch.setattr(server, "is_market_open", lambda *a, **k: True)
+
     fake._connected = True
     fake._killed = False
     body = client.get("/health").json()
-    assert body == {"connected": True, "killed": False}
+    assert body == {"connected": True, "killed": False, "market_open": True}
 
     fake._connected = False
     fake._killed = True
     body = client.get("/health").json()
-    assert body == {"connected": False, "killed": True}
+    assert body == {"connected": False, "killed": True, "market_open": True}
 
 
 # ---------------------------------------------------------------------------
