@@ -228,6 +228,7 @@ class CentralExecutor(EClient, EWrapper):
             "filled": 0,
             "remaining": intent["quantity"],
             "pending_qty": signed_qty,
+            "expected_price": intent.get("expected_price"),
         }
         return order_id
 
@@ -476,6 +477,7 @@ class CentralExecutor(EClient, EWrapper):
                 "filled": 0,
                 "remaining": order.totalQuantity,
                 "pending_qty": signed_qty,
+                "expected_price": original["expected_price"] if original else None,
             }
             if client_order_id != f"recovered-{orderId}":
                 self._seen_client_order_ids[client_order_id] = orderId
