@@ -12,7 +12,8 @@ class RiskManager:
         self._active_strategies: set = set(config.keys())
         self._lock = threading.Lock()
 
-    def check_order(self, intent: dict, resolved_delta: float, price: Optional[float]) -> dict:
+    def check_order(self, intent: dict, resolved_delta: float, price, multiplier: float = 1.0,
+                    ref_values: dict = None) -> dict:
         strategy_id = intent["strategy_id"]
         if strategy_id not in self._active_strategies:
             return {"approved": False, "reason": f"strategy {strategy_id} is not active"}
@@ -21,18 +22,24 @@ class RiskManager:
             logger.warning("No reference price for %s — notional check skipped", strategy_id)
             return {"approved": True}
 
-        alloc  = self._config[strategy_id]["capital_allocation"]
+        alloc = self._config[strategy_id]["capital_allocation"]
         symbol = intent["instrument"]["symbol"]
 
-        eff = self._ledger.strategy_effective_positions(strategy_id)   # filled + pending
-        eff[symbol] = eff.get(symbol, 0.0) + resolved_delta           # simulate this order landing
-        projected_gross = sum(abs(q) * price for q in eff.values())
+        # Per-symbol contract value = price * multiplier (multiplier = 1 for equities).
+        # ref_values carries prior legs' values so gross is valued per symbol, not all at
+        # one price — matters once futures with large multipliers share the book.
+        unit = dict(ref_values or {})
+        unit[symbol] = price * float(multiplier)
+
+        eff = self._ledger.strategy_effective_positions(strategy_id)
+        eff[symbol] = eff.get(symbol, 0.0) + resolved_delta
+        projected_gross = sum(abs(q) * unit.get(s, price * float(multiplier)) for s, q in eff.items())
 
         if projected_gross > alloc:
             return {"approved": False,
                     "reason": f"order would exceed allocation: projected gross {projected_gross:.0f} > {alloc:.0f}"}
         return {"approved": True}
-    
+
     def _strategy_gross_notional(self, strat_id: str, price: float) -> float:
         positions = self._ledger.strategy_positions.get(strat_id, {})
         return sum(abs(qty) * price for qty in positions.values())

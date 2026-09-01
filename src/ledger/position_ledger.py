@@ -46,6 +46,21 @@ class PositionLedger:
         with self._lock:
             return self.current_positions.get(symbol, 0.0) + self.pending_deltas.get(symbol, 0.0)
 
+    def record_net_pending(self, symbol: str, signed_qty: float) -> None:
+        """Netting path: adjust NET pending only (no per-strategy attribution).
+        Used when placing a pooled net order; attribution happens on the fill."""
+        with self._lock:
+            self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) + signed_qty
+
+    def apply_attributed_fill(self, symbol: str, signed_qty: float, price: float, strat_id: str) -> None:
+        """Netting fill: update net position + this strategy's book & realized P&L, and
+        reverse the NET pending. Does NOT touch strategy_pending (net pending is tracked
+        separately via record_net_pending)."""
+        with self._lock:
+            self.current_positions[symbol] = self.current_positions.get(symbol, 0.0) + signed_qty
+            self.pending_deltas[symbol] = self.pending_deltas.get(symbol, 0.0) - signed_qty
+            self._attribute_fill(symbol, signed_qty, price, strat_id)
+
     def _attribute_fill(self, symbol: str, signed_qty: float, price: float, strat_id: str) -> None:
         strat_pos = self.strategy_positions.setdefault(strat_id, {})
         strat_cost = self.strategy_avg_cost.setdefault(strat_id, {})

@@ -219,3 +219,9 @@ venv_algotrade
 
 db
 logs
+
+CHANGELOG.md
+
+run_equity.py
+run_strat.py
+run_vecm.py

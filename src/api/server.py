@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from execution.central_execution import CentralExecutor, is_market_open
+from execution.netting import NettingCoordinator
 from monitoring.logging_config import setup_logging
 from config import CONFIG
 
@@ -22,6 +23,7 @@ import logging
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+DB_DIR = Path(__file__).resolve().parent.parent.parent / "db"
 
 EXECUTOR_API_KEY = os.environ.get("EXECUTOR_API_KEY")
 SERVER_CLIENT_ID = 8  # distinct from main.py / run_strat.py (both use 6)
@@ -39,6 +41,7 @@ async def lifespan(app: FastAPI):
 
     executor = CentralExecutor()
     recon = executor.start(client_id = SERVER_CLIENT_ID)
+    executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
     app.state.startup_reconciliation = recon
 
@@ -62,6 +65,47 @@ class KillRequest(BaseModel):
 def submit_order(intent: dict):
     result = executor.process_intent(intent)
     return result
+
+
+class TargetRequest(BaseModel):
+    strategy_id: str
+    symbol: str
+    quantity: float
+    instrument: Optional[dict] = None
+    price: Optional[float] = None
+
+
+@app.post("/target", dependencies=[Depends(require_api_key)])
+def set_target(req: TargetRequest):
+    """Net-pooling: incremental. Set ONE symbol's absolute target for a strategy; the
+    coordinator re-nets and trades the account to the pooled net. Exit = quantity 0."""
+    if executor.coordinator is None:
+        raise HTTPException(status_code=503, detail="netting coordinator not initialised")
+    return executor.coordinator.set_target(
+        req.strategy_id, req.symbol, req.quantity,
+        instrument=req.instrument, price=req.price,
+    )
+
+
+@app.post("/targets", dependencies=[Depends(require_api_key)])
+def submit_book(body: dict):
+    """Net-pooling: full-book resync. Authoritative snapshot of a strategy's whole book;
+    any name dropped from the book is closed. body = {strategy_id, intents:[{instrument,
+    target_quantity, expected_price}]}. Run periodically to self-heal drift."""
+    if executor.coordinator is None:
+        raise HTTPException(status_code=503, detail="netting coordinator not initialised")
+    sid = body.get("strategy_id")
+    if not sid:
+        raise HTTPException(status_code=422, detail="strategy_id required")
+    return executor.coordinator.submit_book(sid, body.get("intents", []))
+
+
+@app.get("/net")
+def get_net():
+    """Inspect the pooled net book and each strategy's desired book (read-only)."""
+    if executor.coordinator is None:
+        return {"net": {}, "desired": {}}
+    return {"net": executor.coordinator.net(), "desired": executor.coordinator.desired}
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: int):
@@ -188,3 +232,11 @@ def _equity_sampler(interval: float = 60.0):
 @app.get("/pnl/history")
 def pnl_history(strategy: Optional[str] = None, since: Optional[str] = None):
     return {"history": executor.logger_db.get_equity_history(strategy_id=strategy, since=since)}
+
+
+@app.get("/resolve_front/{symbol}")
+def resolve_front(symbol: str, exchange: str = "NYMEX"):
+    r = executor.resolve_front_month(symbol, exchange=exchange)
+    if r is None:
+        raise HTTPException(status_code=404, detail=f"no front-month contract for {symbol}")
+    return r

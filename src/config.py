@@ -48,4 +48,23 @@ CONFIG = {
         "capital_allocation": 100_000.0,   # match the capital_allocation in your MomentumStrategy
         "max_drawdown": 0.15,              # fraction of allocation, e.g. 0.15 = 15%
     },
+
+    # Kalman VECM (WTI vs Brent+RBOB futures). capital_allocation here is the sizing NAV +
+    # the executor's loose multiplier-aware risk backstop; the strategy's own hard risk_limits
+    # (per-leg / gross notional in models/vecm_strategy.py) are the BINDING caps — tune both
+    # to your competition capital.
+    "kalman_vecm": {
+        "capital_allocation": 2_000_000.0,
+        "max_drawdown": 0.15,
+    },
+
+    # Best-2 equities strategies from the claude research (daily-rebalanced port).
+    "ovn_volsurge": {   # best unbiased strategy (Sharpe 2.62) — overnight vol-surge hold
+        "capital_allocation": 200_000.0,
+        "max_drawdown": 0.15,
+    },
+    "orb_breakout": {   # intraday opening-range breakout (30-min bars); unbiased Sharpe ~2.5
+        "capital_allocation": 200_000.0,
+        "max_drawdown": 0.15,
+    },
 }

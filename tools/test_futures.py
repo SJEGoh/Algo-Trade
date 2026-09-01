@@ -111,7 +111,7 @@ def main():
     if not app._ready.wait(timeout=8):
         print("FAIL: could not connect / no nextValidId — is paper TWS up on 7497?")
         return
-    app.reqMarketDataType(3)  # delayed OK for a permissions probe
+    app.reqMarketDataType(4)  # delayed OK for a permissions probe
 
     print(f"{'SYM':<5}{'RESOLVED':<22}{'PRICE':>10}   TRADING PERMISSION")
     print("-" * 70)

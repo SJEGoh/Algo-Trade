@@ -111,3 +111,30 @@ def test_reducing_order_passes_when_at_cap():
 # ---------------------------------------------------------------------------
 def test_drawdown_breach_halts_strategy():
     ledger, rm = make(alloc=100_000, max_dd=0.10)
+
+
+# ---------------------------------------------------------------------------
+# Futures: multiplier-aware notional (Phase 2)
+# ---------------------------------------------------------------------------
+def test_futures_notional_uses_multiplier():
+    """1 CL contract at $75 x mult 1000 = $75k notional, not $75."""
+    _, rm = make(alloc=100_000)
+    assert rm.check_order(intent("CL"), resolved_delta=1, price=75.0, multiplier=1000)["approved"] is True
+    # 2 contracts -> 150k > 100k; without multiplier awareness this would wrongly pass at $150
+    assert rm.check_order(intent("CL"), resolved_delta=2, price=75.0, multiplier=1000)["approved"] is False
+
+
+def test_futures_gross_values_each_leg_by_its_own_unit():
+    """ref_values lets a mixed-multiplier book be valued per leg, not all at one price."""
+    ledger, rm = make(alloc=1_000_000)
+    ledger.record_pending("RB", 1, STRAT)                 # RBOB leg already working
+    ref = {"RB": 2.3 * 42000}                              # its own unit value (~96.6k)
+    r = rm.check_order(intent("CL"), resolved_delta=1, price=75.0, multiplier=1000, ref_values=ref)
+    assert r["approved"] is True                           # 75k + 96.6k = 171.6k < 1M
+
+
+def test_equities_default_multiplier_unchanged():
+    """Equities path (no multiplier) behaves exactly as before."""
+    _, rm = make(alloc=100_000)
+    assert rm.check_order(intent("AAA"), resolved_delta=500, price=100.0)["approved"] is True   # 50k
+    assert rm.check_order(intent("AAA"), resolved_delta=1500, price=100.0)["approved"] is False  # 150k

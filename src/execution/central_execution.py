@@ -6,20 +6,15 @@ from ibapi.common import BarData
 from ibapi.order_state import OrderState
 from ibapi.execution import Execution
 import threading
-import signal
-import sys
-
 from ledger.position_ledger import PositionLedger
 from risk.risk_manager import RiskManager
 from logger.event_logger import EventLogger
-from monitoring.logging_config import setup_logging
 
 from typing import Dict, Optional, Literal
 import pandas as pd
 import time
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from monitoring.logging_config import setup_logging
 from typing import Optional, Literal
 
 from config import CONFIG
@@ -61,6 +56,9 @@ class Instrument(BaseModel):
     symbol: str
     asset_class: str
     exchange: str = "SMART"
+    sec_type: str = "STK"                    # "STK" (default) or "FUT"
+    multiplier: Optional[float] = None       # futures contract multiplier
+    last_trade_date: Optional[str] = None    # futures expiry "YYYYMM" or "YYYYMMDD"
 
 class OrderIntent(BaseModel):
     expected_price: Optional[float] = None
@@ -121,6 +119,10 @@ class CentralExecutor(EClient, EWrapper):
         self._dedup_lock = threading.Lock()
         self._killed = False  # kill-switch flag (Phase 4)
         self._enforce_market_hours = True  # reject orders while market closed (per-intent override: metadata.allow_when_closed)
+        self._multipliers = {}          # symbol -> contract multiplier (1 for equities)
+        self._ref_value = {}            # symbol -> price*multiplier, for multiplier-aware risk notional
+        self._contract_details = {}     # reqId -> [Contract] (futures front-month resolution)
+        self._contract_details_end = {} # reqId -> Event
 
         # --- position/risk state (owned by their components, NOT duplicated here) ---
         self.ledger = PositionLedger(self)
@@ -137,6 +139,7 @@ class CentralExecutor(EClient, EWrapper):
 
         self._mark_cache: Dict[str, float] = {}   # symbol -> last good mark
         self._mark_lock = threading.Lock()
+        self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
     # ------------------------------------------------------------------
     # Contract builders
     # ------------------------------------------------------------------
@@ -154,6 +157,16 @@ class CentralExecutor(EClient, EWrapper):
     @staticmethod
     def get_stock_contract(symbol: str, exchange: str = "SMART", currency: str = "USD") -> Contract:
         return CentralExecutor.get_contract(symbol, sec_type="STK", exchange=exchange, currency=currency)
+
+    @staticmethod
+    def get_future_contract(symbol: str, exchange: str = "NYMEX", last_trade_date=None,
+                            multiplier=None, currency: str = "USD") -> Contract:
+        kwargs = {}
+        if last_trade_date:
+            kwargs["lastTradeDateOrContractMonth"] = str(last_trade_date)
+        if multiplier is not None:
+            kwargs["multiplier"] = str(int(multiplier))
+        return CentralExecutor.get_contract(symbol, sec_type="FUT", exchange=exchange, currency=currency, **kwargs)
 
     @staticmethod
     def get_forex_contract(pair: str, exchange: str = "IDEALPRO", currency: str = "USD") -> Contract:
@@ -208,7 +221,14 @@ class CentralExecutor(EClient, EWrapper):
 
     def place_order(self, intent: dict) -> int:
         instrument = intent["instrument"]
-        contract = self.get_stock_contract(instrument["symbol"], exchange=instrument.get("exchange", "SMART"))
+        if instrument.get("sec_type", "STK") == "FUT":
+            contract = self.get_future_contract(
+                instrument["symbol"], exchange=instrument.get("exchange", "NYMEX"),
+                last_trade_date=instrument.get("last_trade_date"),
+                multiplier=instrument.get("multiplier"),
+            )
+        else:
+            contract = self.get_stock_contract(instrument["symbol"], exchange=instrument.get("exchange", "SMART"))
         order = self.build_order(intent)
 
         order_id = self.get_next_order_id()
@@ -216,6 +236,13 @@ class CentralExecutor(EClient, EWrapper):
         self.logger_db.log_order(order_id, intent)
         signed_qty = intent["quantity"] if intent["side"] == "buy" else -intent["quantity"]
         symbol = instrument["symbol"]
+
+        # multiplier-aware risk notional bookkeeping
+        _mult = float(instrument.get("multiplier") or 1.0)
+        self._multipliers[symbol] = _mult
+        _px = intent.get("expected_price") or intent.get("limit_price")
+        if _px:
+            self._ref_value[symbol] = float(_px) * _mult
 
         # route pending exposure through the ledger, not a local dict
         self.ledger.record_pending(symbol, signed_qty, intent["strategy_id"])
@@ -229,6 +256,61 @@ class CentralExecutor(EClient, EWrapper):
             "remaining": intent["quantity"],
             "pending_qty": signed_qty,
             "expected_price": intent.get("expected_price"),
+        }
+        return order_id
+
+    def place_net_order(self, symbol: str, delta: float, instrument: dict, ref_price):
+        """Pooled net order (coordinator path): trade the whole net delta for a symbol
+        under the synthetic '__net__' strategy. Pending is tracked at the NET level via
+        record_net_pending (NOT per-strategy); the fill is decomposed into per-strategy
+        sub-fills by the coordinator in execDetails. `delta` is signed (buy>0 / sell<0)."""
+        if abs(delta) < 1e-9:
+            return None
+        instrument = dict(instrument or {"symbol": symbol})
+        sym = instrument.get("symbol", symbol)
+        side = "buy" if delta > 0 else "sell"
+        intent = {
+            "client_order_id": f"net-{sym}-{int(time.time() * 1000)}",
+            "strategy_id": "__net__",
+            "instrument": instrument,
+            "side": side,
+            "quantity": abs(delta),
+            "order_type": "market",
+            "time_in_force": "day",
+            "expected_price": ref_price,
+        }
+        if instrument.get("sec_type", "STK") == "FUT":
+            contract = self.get_future_contract(
+                sym, exchange=instrument.get("exchange", "NYMEX"),
+                last_trade_date=instrument.get("last_trade_date"),
+                multiplier=instrument.get("multiplier"),
+            )
+        else:
+            contract = self.get_stock_contract(sym, exchange=instrument.get("exchange", "SMART"))
+        order = self.build_order(intent)
+
+        order_id = self.get_next_order_id()
+        self.placeOrder(order_id, contract, order)
+        self.logger_db.log_order(order_id, intent)
+
+        _mult = float(instrument.get("multiplier") or 1.0)
+        self._multipliers[sym] = _mult
+        if ref_price:
+            self._ref_value[sym] = float(ref_price) * _mult
+
+        # NET pending only — attribution to strategies happens on the fill
+        self.ledger.record_net_pending(sym, delta)
+
+        self.order_status[order_id] = {
+            "client_order_id": intent["client_order_id"],
+            "strategy_id": "__net__",
+            "symbol": sym,
+            "status": "Submitted",
+            "filled": 0,
+            "remaining": abs(delta),
+            "pending_qty": delta,
+            "expected_price": ref_price,
+            "net": True,
         }
         return order_id
 
@@ -255,11 +337,14 @@ class CentralExecutor(EClient, EWrapper):
         except Exception as e:
             return {"accepted": False, "reason": f"schema validation failed: {e}"}
 
-        if self._enforce_market_hours and not is_market_open() and not intent.metadata.get("allow_when_closed"):
+        _is_future = getattr(intent.instrument, "sec_type", "STK") == "FUT"
+        if (self._enforce_market_hours and not _is_future
+                and not is_market_open() and not intent.metadata.get("allow_when_closed")):
             return {"accepted": False,
                     "reason": "market closed — order not submitted "
                               "(set metadata.allow_when_closed=true to queue for open)"}
-
+        if self._should_pool(intent):
+            return self._submit_pooled(intent)
         with self._dedup_lock:
             if intent.client_order_id in self._seen_client_order_ids:
                 existing_order_id = self._seen_client_order_ids[intent.client_order_id]
@@ -273,7 +358,11 @@ class CentralExecutor(EClient, EWrapper):
 
                 # --- Phase 4: risk check, after resolution, before placing ---
                 reference_price = self._reference_price(resolved_intent)
-                risk_result = self.risk_manager.check_order(resolved_intent, resolved_delta, reference_price)
+                _mult = float(resolved_intent["instrument"].get("multiplier") or 1.0)
+                risk_result = self.risk_manager.check_order(
+                    resolved_intent, resolved_delta, reference_price,
+                    multiplier=_mult, ref_values=self._ref_value,
+                )
                 if not risk_result["approved"]:
                     del self._seen_client_order_ids[intent.client_order_id]
                     return {"accepted": False, "reason": risk_result["reason"]}
@@ -388,7 +477,16 @@ class CentralExecutor(EClient, EWrapper):
                 self.cancelOrder(order_id)  # FIX: second arg required
                 pending_contribution = status.get("pending_qty", 0.0)
                 # reverse this order's pending contribution in the ledger
-                self.ledger.record_pending(symbol, -pending_contribution, status["strategy_id"])
+                if status.get("net"):
+                    # pooled net order: pending lives at net level only (record_net_pending),
+                    # so reverse it there — NOT via record_pending, which would write a
+                    # phantom strategy_pending["__net__"] entry.
+                    self.ledger.record_net_pending(symbol, -pending_contribution)
+                else:
+                    self.ledger.record_pending(symbol, -pending_contribution, status["strategy_id"])
+                # Mark it cancelled locally so a rapid re-target (another rebalance before IB
+                # confirms this cancel) won't cancel it AGAIN and reverse its pending twice.
+                status["status"] = "PendingCancel"
 
     # ------------------------------------------------------------------
     # Fill / position callbacks — all delegate to the ledger
@@ -398,6 +496,21 @@ class CentralExecutor(EClient, EWrapper):
         strategy_id = order_info.get("strategy_id", "unknown")
         signed_qty = execution.shares if execution.side == "BOT" else -execution.shares
 
+        # Pooled net order: let the coordinator decompose this fill into per-strategy
+        # sub-fills (correct P&L even with opposing legs), then check drawdown per book.
+        if order_info.get("net") and self.coordinator is not None:
+            self.coordinator.attribute_fill(contract.symbol, signed_qty, execution.price)
+            self.logger_db.log_fill(
+                execution.orderId, execution.execId, contract.symbol,
+                execution.side, execution.price, execution.shares,
+                "__net__", expected_price=order_info.get("expected_price"),
+            )
+            for sid in list(self.coordinator.desired.keys()):
+                self.risk_manager.check_drawdown(sid)
+            logger.info("ExecDetails(net) - %s %s %s @ %s",
+                        contract.symbol, execution.side, execution.shares, execution.price)
+            return
+
         self.ledger.record_fill(contract.symbol, signed_qty, execution.price, strategy_id)
         self.logger_db.log_fill(
             execution.orderId, execution.execId, contract.symbol,
@@ -405,9 +518,7 @@ class CentralExecutor(EClient, EWrapper):
             order_info.get("strategy_id", "unknown"),
             expected_price=order_info.get("expected_price"),
         )
-        breached_dd = self.risk_manager.check_drawdown(strategy_id)  # Phase 4: halt if this fill breached DD
-        if breached_dd:
-            self.halt
+        self.risk_manager.check_drawdown(strategy_id)  # halts the strategy internally on breach
         logger.info("ExecDetails - %s %s %s @ %s", contract.symbol, execution.side, execution.shares, execution.price)
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
@@ -418,6 +529,48 @@ class CentralExecutor(EClient, EWrapper):
     def positionEnd(self) -> None:
         self.ledger._positions_ready.set()
         logger.info("Position snapshot complete")
+
+    # ------------------------------------------------------------------
+    # Futures front-month resolution
+    # ------------------------------------------------------------------
+    def contractDetails(self, reqId, contractDetails):
+        self._contract_details.setdefault(reqId, []).append(contractDetails.contract)
+
+    def contractDetailsEnd(self, reqId):
+        ev = self._contract_details_end.get(reqId)
+        if ev:
+            ev.set()
+
+    def resolve_front_month(self, symbol, exchange="NYMEX", currency="USD",
+                            roll_buffer_days=5, timeout=8.0):
+        """Front-month futures contract, skipping any expiring within roll_buffer_days
+        (avoids the physical-delivery-at-expiry rejection). Returns a dict or None."""
+        from datetime import datetime, timedelta
+        with self._order_id_lock:
+            self._mkt_data_req_id += 1
+            rid = self._mkt_data_req_id
+        ev = threading.Event()
+        self._contract_details_end[rid] = ev
+        self._contract_details[rid] = []
+        c = self.get_contract(symbol, sec_type="FUT", exchange=exchange, currency=currency)
+        self.reqContractDetails(rid, c)
+        ev.wait(timeout=timeout)
+        cands = self._contract_details.pop(rid, [])
+        self._contract_details_end.pop(rid, None)
+        cutoff = (datetime.now() + timedelta(days=roll_buffer_days)).strftime("%Y%m%d")
+        dated = []
+        for k in cands:
+            exp = k.lastTradeDateOrContractMonth
+            expf = exp if len(exp) == 8 else exp + "01"
+            if expf >= cutoff:
+                dated.append((expf, k))
+        if not dated:
+            return None
+        dated.sort()
+        front = dated[0][1]
+        return {"last_trade_date": front.lastTradeDateOrContractMonth,
+                "multiplier": float(front.multiplier) if front.multiplier else None,
+                "local_symbol": front.localSymbol}
 
     # ------------------------------------------------------------------
     # Kill switch (Phase 4)
@@ -488,6 +641,36 @@ class CentralExecutor(EClient, EWrapper):
 
     def openOrderEnd(self):
         self._open_orders_ready.set()
+
+    def _should_pool(self, intent: OrderIntent) -> bool:
+        """Single-front-door routing: which intents go through the netting pool.
+        Only target_position intents can pool (delta stays direct). An explicit
+        metadata.pool flag wins in both directions; otherwise the default is to pool
+        equities (they share a universe) and send futures direct (disjoint / already
+        netted upstream by VECM)."""
+        if self.coordinator is None or intent.intent_type != "target_position":
+            return False
+        if "pool" in intent.metadata:
+            return bool(intent.metadata["pool"])
+        return getattr(intent.instrument, "sec_type", "STK") == "STK"
+    def _submit_pooled(self, intent: OrderIntent) -> dict:
+        r = self.coordinator.set_target(
+            intent.strategy_id,
+            intent.instrument.symbol,
+            intent.target_quantity,                     # already signed
+            instrument=intent.instrument.model_dump(),  # carries sec_type/multiplier/exchange
+            price=intent.expected_price or intent.limit_price,
+        )
+        if not r.get("accepted"):
+            return {"accepted": False, "reason": r.get("reason", "rejected by coordinator")}
+        orders = r.get("orders", [])                     # 0 or 1 for a single-symbol set_target
+        return {
+            "accepted": True,
+            "pooled": True,
+            "order_id": orders[0]["order_id"] if orders else None,
+            "orders": orders,
+            "note": None if orders else "already at net target — no market order needed",
+        }
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
