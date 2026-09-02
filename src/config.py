@@ -67,4 +67,51 @@ CONFIG = {
         "capital_allocation": 200_000.0,
         "max_drawdown": 0.15,
     },
+    # --- halt-test strategies: tight 1% max_drawdown to exercise the drawdown -> halt path
+    #     LIVE (RiskManager.check_drawdown -> halt_strategy -> is_active False -> subsequent
+    #     orders rejected). Allocation fits one micro future (e.g. MCL ~$6.85k notional).
+    #     Drive with tools/halt_test.py. 1% of 10k = $100 realized-loss halt threshold.
+    "halt_test_1": {
+        "capital_allocation": 10_000.0,
+        "max_drawdown": 0.01,
+    },
+    "halt_test_2": {
+        "capital_allocation": 10_000.0,
+        "max_drawdown": 0.01,
+    },
+    "halt_test_3": {
+        "capital_allocation": 10_000.0,
+        "max_drawdown": 0.01,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# GLOBAL (portfolio-level) risk + safety guards. See ROADMAP "Safety / survival".
+# Breaker + margin check are DISABLED by default (set thresholds to enable) so they can't
+# surprise-halt an unsupervised run; the protective guards default ON.
+# ---------------------------------------------------------------------------
+GLOBAL = {
+    # Portfolio circuit breaker: if total P&L (realized + unrealized) since the daily baseline
+    # falls by >= this many dollars, HALT + FLATTEN every strategy and set the kill switch.
+    "max_daily_loss": None,          # e.g. 50_000.0 ; None = disabled
+    # Cap on total gross notional across ALL strategies (pre-trade reject). None = disabled.
+    "max_gross_exposure": None,      # e.g. 5_000_000.0 ; None = disabled
+
+    # Fill-price sanity guard (post-fill; market orders can't be pre-rejected).
+    "fill_slippage_alert_pct": 0.05, # alert (CRITICAL -> Telegram) when |fill-expected|/expected exceeds this
+    "fill_slippage_halt_pct": None,  # also halt+flatten the strategy beyond this; None = alert only
+
+    # Pre-trade margin probe (whatIf) before placing. Adds a blocking round-trip; OFF by default.
+    "pretrade_margin_check": False,
+    "max_order_init_margin": None,   # $ cap on an order's init-margin change (required if the check is on)
+
+    # Unrealized-drawdown data-quality guard: a mark older than this (or missing) makes the
+    # total-equity drawdown check SKIP that strategy for the cycle (realized fast path still runs).
+    "mark_staleness_sec": 120.0,
+
+    # Auto-reconnect to IB on an unexpected disconnect (then reconcile + recover open orders).
+    "auto_reconnect": True,
+    "reconnect_max_attempts": 30,
+    "reconnect_backoff_sec": 10.0,
 }

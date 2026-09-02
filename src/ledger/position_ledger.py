@@ -21,6 +21,7 @@ class PositionLedger:
         self._positions_ready = threading.Event()
         self._lock = threading.Lock()
         self.strategy_pending: Dict[str, Dict[str, float]] = {}
+        self.multipliers: Dict[str, float] = {}  # symbol -> contract multiplier (1 for equities); makes P&L dollar-denominated
 
     def record_fill(self, symbol: str, signed_qty: float, price: float, strat_id: str) -> None:
         with self._lock:
@@ -78,7 +79,8 @@ class PositionLedger:
         else:
             closed_qty = min(abs(signed_qty), abs(prev_qty))
             direction = 1 if prev_qty > 0 else -1
-            self.strategy_realized_pnl[strat_id] += (price - prev_cost) * closed_qty * direction
+            mult = self.multipliers.get(symbol, 1.0)   # dollar-denominate (futures multiplier)
+            self.strategy_realized_pnl[strat_id] += (price - prev_cost) * closed_qty * direction * mult
 
             if abs(signed_qty) > abs(prev_qty):
                 strat_cost[symbol] = price
@@ -123,7 +125,7 @@ class PositionLedger:
                     mark = marks.get(sym)
                     if qty == 0 or mark is None:
                         continue
-                    unrealized += (mark - costs.get(sym, 0.0)) * qty
+                    unrealized += (mark - costs.get(sym, 0.0)) * qty * self.multipliers.get(sym, 1.0)
                 out[strat] = {"realized": realized, "unrealized": unrealized,
                               "equity": realized + unrealized}
         return out

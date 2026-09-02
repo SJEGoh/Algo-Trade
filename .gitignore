@@ -225,3 +225,6 @@ CHANGELOG.md
 run_equity.py
 run_strat.py
 run_vecm.py
+
+ROADMAP.md
+KNOWN_ISSUES.md

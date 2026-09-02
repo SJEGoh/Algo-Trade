@@ -1,13 +1,17 @@
 [Unit]
-Description=Algo Trading Executor
+Description=Algo Trading Executor (FastAPI server + NettingCoordinator)
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/algo_trade
-ExecStart=/home/ubuntu/algo_trade/venv_algotrade/bin/python main.py
 EnvironmentFile=/home/ubuntu/algo_trade/.env
+# server.py does `from execution...` / `from config...` -> src must be importable
+Environment=PYTHONPATH=/home/ubuntu/algo_trade/src
+# uvicorn runs the FastAPI app whose lifespan builds the executor + coordinator.
+# 127.0.0.1 only: runners/dashboard hit it locally; expose via SSH tunnel, not the unit.
+ExecStart=/home/ubuntu/algo_trade/venv_algotrade/bin/uvicorn api.server:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=10
 StartLimitIntervalSec=300

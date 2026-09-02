@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from execution.central_execution import CentralExecutor, is_market_open
 from execution.netting import NettingCoordinator
+from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
 from config import CONFIG
 
@@ -39,16 +40,28 @@ async def lifespan(app: FastAPI):
             "EXECUTOR_API_KEY not set in .env — generate with secrets.token_hex(32)"
         )
 
+    # Route any logger.critical(...) anywhere in the app to Telegram (drawdown halts,
+    # kill switch, unexpected disconnects). No-op if TELEGRAM_* env vars are unset.
+    alerter = Alerter()
+    logging.getLogger().addHandler(AlertingHandler(alerter))
+    app.state.alerter = alerter
+
     executor = CentralExecutor()
     recon = executor.start(client_id = SERVER_CLIENT_ID)
     executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
     app.state.startup_reconciliation = recon
+    alerter.send(f"\u2705 Executor server up \u2014 IB connected, reconciled "
+                 f"(matched={recon.get('matched') if isinstance(recon, dict) else recon})")
 
     try:
         yield
     finally:
         _sampler_stop.set()
+        try:
+            app.state.alerter.send("\U0001F6D1 Executor server shutting down")
+        except Exception:
+            pass
         executor.shutdown()
 
 app = FastAPI(title="Algo Trade Executor", version="0.1.0", lifespan=lifespan)
@@ -75,12 +88,24 @@ class TargetRequest(BaseModel):
     price: Optional[float] = None
 
 
+def _pool_preflight(is_future_only: bool) -> None:
+    """Same protections /orders enforces, for the pooled endpoints: no coordinator -> 503;
+    kill switch -> 423; equities while the market is closed -> 409 (futures-only books pass,
+    matching the futures bypass in process_intent)."""
+    if executor.coordinator is None:
+        raise HTTPException(status_code=503, detail="netting coordinator not initialised")
+    if executor._killed:
+        raise HTTPException(status_code=423, detail="kill switch active — pooled orders rejected")
+    if not is_future_only and executor._enforce_market_hours and not is_market_open():
+        raise HTTPException(status_code=409, detail="market closed — pooled equity orders rejected")
+
+
 @app.post("/target", dependencies=[Depends(require_api_key)])
 def set_target(req: TargetRequest):
     """Net-pooling: incremental. Set ONE symbol's absolute target for a strategy; the
     coordinator re-nets and trades the account to the pooled net. Exit = quantity 0."""
-    if executor.coordinator is None:
-        raise HTTPException(status_code=503, detail="netting coordinator not initialised")
+    _fut = (req.instrument or {}).get("sec_type", "STK") == "FUT"
+    _pool_preflight(_fut)
     return executor.coordinator.set_target(
         req.strategy_id, req.symbol, req.quantity,
         instrument=req.instrument, price=req.price,
@@ -92,12 +117,14 @@ def submit_book(body: dict):
     """Net-pooling: full-book resync. Authoritative snapshot of a strategy's whole book;
     any name dropped from the book is closed. body = {strategy_id, intents:[{instrument,
     target_quantity, expected_price}]}. Run periodically to self-heal drift."""
-    if executor.coordinator is None:
-        raise HTTPException(status_code=503, detail="netting coordinator not initialised")
     sid = body.get("strategy_id")
     if not sid:
         raise HTTPException(status_code=422, detail="strategy_id required")
-    return executor.coordinator.submit_book(sid, body.get("intents", []))
+    intents = body.get("intents", [])
+    fut_only = bool(intents) and all(
+        (it.get("instrument") or {}).get("sec_type", "STK") == "FUT" for it in intents)
+    _pool_preflight(fut_only)
+    return executor.coordinator.submit_book(sid, intents)
 
 
 @app.get("/net")
@@ -164,6 +191,24 @@ def strategy_allocation(strategy_id: str):
         "max_drawdown": cfg["max_drawdown"],
     }
 
+@app.post("/strategies/{strategy_id}/reactivate", dependencies=[Depends(require_api_key)])
+def reactivate_strategy(strategy_id: str):
+    """Clear a halt: re-add the strategy to the active set (after reviewing a drawdown halt,
+    or to reset a halt-test strategy without restarting the server)."""
+    if strategy_id not in CONFIG:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {strategy_id}")
+    executor.risk_manager.reactivate_strategy(strategy_id)
+    return {"strategy_id": strategy_id, "status": "active"}
+
+
+@app.post("/reset_daily", dependencies=[Depends(require_api_key)])
+def reset_daily():
+    """Reset the portfolio circuit-breaker daily baseline (call at the open) and clear a
+    tripped breaker. The next sampler cycle re-captures the baseline from current equity."""
+    executor.reset_daily_baseline()
+    return {"reset": True, "circuit_broken": executor._circuit_broken}
+
+
 @app.post("/reconcile", dependencies=[Depends(require_api_key)])
 def reconcile():
     try:
@@ -224,6 +269,18 @@ def _equity_sampler(interval: float = 60.0):
                 snap.setdefault(sid, {"realized": 0.0, "unrealized": 0.0, "equity": 0.0})
             for strat, v in snap.items():
                 executor.logger_db.log_equity(ts, strat, v["realized"], v["unrealized"], v["equity"])
+            # portfolio circuit breaker on total equity (realized + unrealized across all strategies)
+            total_equity = sum(v.get("equity", 0.0) for v in snap.values())
+            executor.enforce_daily_loss(total_equity)
+            # per-strategy total-equity drawdown; SKIP a strategy if any held symbol's mark is
+            # stale/missing (don't halt+flatten on incomplete unrealized data — realized fast
+            # path still guards it).
+            for sid in CONFIG:
+                held = [s for s, q in executor.ledger.strategy_positions.get(sid, {}).items() if q != 0]
+                if held and not all(executor.mark_is_fresh(s) for s in held):
+                    log.warning("total-drawdown check skipped for %s (stale/missing mark)", sid)
+                    continue
+                executor.enforce_drawdown(sid, snap.get(sid, {}).get("equity", 0.0), "total")
         except Exception as e:
             log.error("equity sampler error: %s", e)
         _sampler_stop.wait(interval)   # sleep, wakes early on stop

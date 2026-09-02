@@ -6,9 +6,10 @@ import logging
 logger = logging.getLogger("executor")
 
 class RiskManager:
-    def __init__(self, ledger, config: dict):
+    def __init__(self, ledger, config: dict, global_config: dict = None):
         self._ledger = ledger
         self._config = config
+        self._global = global_config or {}
         self._active_strategies: set = set(config.keys())
         self._lock = threading.Lock()
 
@@ -38,6 +39,20 @@ class RiskManager:
         if projected_gross > alloc:
             return {"approved": False,
                     "reason": f"order would exceed allocation: projected gross {projected_gross:.0f} > {alloc:.0f}"}
+
+        # Global gross-exposure cap across ALL strategies (portfolio-level), if configured.
+        max_gross = self._global.get("max_gross_exposure")
+        if max_gross is not None:
+            total_gross = 0.0
+            for other_sid in set(self._ledger.strategy_positions) | {strategy_id}:
+                eff_other = self._ledger.strategy_effective_positions(other_sid)
+                if other_sid == strategy_id:
+                    eff_other[symbol] = eff_other.get(symbol, 0.0) + resolved_delta
+                for s, q in eff_other.items():
+                    total_gross += abs(q) * unit.get(s, price * float(multiplier))
+            if total_gross > max_gross:
+                return {"approved": False,
+                        "reason": f"order would exceed GLOBAL gross exposure: projected {total_gross:.0f} > {max_gross:.0f}"}
         return {"approved": True}
 
     def _strategy_gross_notional(self, strat_id: str, price: float) -> float:
@@ -68,6 +83,18 @@ class RiskManager:
             logger.critical("DRAWDOWN BREACH: %s at %.1f%% >= limit %.1f%%",
                             strat_id, drawdown_pct * 100, max_dd * 100)
             self.halt_strategy(strat_id, f"DRAWDOWN BREACH: {strat_id} at {drawdown_pct * 100:.1f} >= limit {max_dd * 100:.1f}")
+
+    def drawdown_status(self, strat_id: str, pnl: float) -> dict:
+        """Pure predicate: is `pnl` (realized, or realized+unrealized) a drawdown breach for
+        this strategy? pnl is dollar-denominated (multiplier-aware). Enforcement (halt +
+        flatten) is the executor's job — see CentralExecutor.enforce_drawdown."""
+        cfg = self._config.get(strat_id, {})
+        alloc = cfg.get("capital_allocation")
+        max_dd = cfg.get("max_drawdown")
+        if alloc is None or max_dd is None or alloc <= 0:
+            return {"breached": False, "drawdown_pct": 0.0, "max_dd": max_dd or 0.0}
+        dd = (-pnl / alloc) if pnl < 0 else 0.0
+        return {"breached": dd >= max_dd, "drawdown_pct": dd, "max_dd": max_dd}
 
     def is_active(self, strategy_id: str) -> bool:
         with self._lock:

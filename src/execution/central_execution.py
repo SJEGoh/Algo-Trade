@@ -17,7 +17,7 @@ import time
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, Literal
 
-from config import CONFIG
+from config import CONFIG, GLOBAL
 
 import pandas_market_calendars as mcal
 from datetime import datetime, time as dtime
@@ -123,10 +123,11 @@ class CentralExecutor(EClient, EWrapper):
         self._ref_value = {}            # symbol -> price*multiplier, for multiplier-aware risk notional
         self._contract_details = {}     # reqId -> [Contract] (futures front-month resolution)
         self._contract_details_end = {} # reqId -> Event
+        self._instruments = {}          # symbol -> instrument dict (to rebuild a contract when flattening)
 
         # --- position/risk state (owned by their components, NOT duplicated here) ---
         self.ledger = PositionLedger(self)
-        self.risk_manager = RiskManager(self.ledger, CONFIG)
+        self.risk_manager = RiskManager(self.ledger, CONFIG, GLOBAL)
         self._pending_price_reqs: Dict[int, threading.Event] = {}   # reqId -> event fired when price arrives
         self._price_results: Dict[int, float] = {}                   # reqId -> price received
         self._price_req_lock = threading.Lock()
@@ -138,7 +139,14 @@ class CentralExecutor(EClient, EWrapper):
         self.logger_db = EventLogger()
 
         self._mark_cache: Dict[str, float] = {}   # symbol -> last good mark
+        self._mark_ts: Dict[str, float] = {}       # symbol -> time.time() of last good mark (staleness guard)
         self._mark_lock = threading.Lock()
+        self._conn = {"host": "127.0.0.1", "port": 7497, "client_id": 5}  # remembered for auto-reconnect
+        self._reconnecting = False
+        self._whatif: Dict[int, dict] = {}         # orderId -> margin impact (whatIf openOrder)
+        self._whatif_events: Dict[int, threading.Event] = {}
+        self._daily_baseline: Optional[float] = None  # portfolio equity baseline for the circuit breaker
+        self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
     # ------------------------------------------------------------------
     # Contract builders
@@ -240,6 +248,8 @@ class CentralExecutor(EClient, EWrapper):
         # multiplier-aware risk notional bookkeeping
         _mult = float(instrument.get("multiplier") or 1.0)
         self._multipliers[symbol] = _mult
+        self.ledger.multipliers[symbol] = _mult          # dollar-denominate P&L / drawdown
+        self._instruments[symbol] = dict(instrument)     # remembered so we can flatten later
         _px = intent.get("expected_price") or intent.get("limit_price")
         if _px:
             self._ref_value[symbol] = float(_px) * _mult
@@ -295,6 +305,8 @@ class CentralExecutor(EClient, EWrapper):
 
         _mult = float(instrument.get("multiplier") or 1.0)
         self._multipliers[sym] = _mult
+        self.ledger.multipliers[sym] = _mult
+        self._instruments[sym] = dict(instrument)
         if ref_price:
             self._ref_value[sym] = float(ref_price) * _mult
 
@@ -367,6 +379,15 @@ class CentralExecutor(EClient, EWrapper):
                     del self._seen_client_order_ids[intent.client_order_id]
                     return {"accepted": False, "reason": risk_result["reason"]}
 
+                if GLOBAL.get("pretrade_margin_check"):
+                    cap = GLOBAL.get("max_order_init_margin")
+                    wi = self.margin_whatif(resolved_intent) or {}
+                    im = wi.get("init_margin")
+                    if cap is not None and im is not None and im > cap:
+                        del self._seen_client_order_ids[intent.client_order_id]
+                        return {"accepted": False,
+                                "reason": f"pre-trade init margin {im:.0f} > cap {cap:.0f}"}
+
                 order_id = self.place_order(resolved_intent)
             except Exception as e:
                 del self._seen_client_order_ids[intent.client_order_id]
@@ -427,6 +448,7 @@ class CentralExecutor(EClient, EWrapper):
             with self._mark_lock:
                 if px is not None and px > 0:
                     self._mark_cache[sym] = px
+                    self._mark_ts[sym] = time.time()
                 results[sym] = self._mark_cache.get(sym)      # carry-forward
 
         threads = [threading.Thread(target=_one, args=(s,), daemon=True) for s in symbols]
@@ -495,6 +517,11 @@ class CentralExecutor(EClient, EWrapper):
         order_info = self.order_status.get(execution.orderId, {})
         strategy_id = order_info.get("strategy_id", "unknown")
         signed_qty = execution.shares if execution.side == "BOT" else -execution.shares
+        if getattr(contract, "multiplier", None):
+            try:
+                self.ledger.multipliers[contract.symbol] = float(contract.multiplier)
+            except (TypeError, ValueError):
+                pass
 
         # Pooled net order: let the coordinator decompose this fill into per-strategy
         # sub-fills (correct P&L even with opposing legs), then check drawdown per book.
@@ -505,8 +532,9 @@ class CentralExecutor(EClient, EWrapper):
                 execution.side, execution.price, execution.shares,
                 "__net__", expected_price=order_info.get("expected_price"),
             )
+            self._check_fill_sanity("__net__", contract.symbol, execution.price, order_info.get("expected_price"))
             for sid in list(self.coordinator.desired.keys()):
-                self.risk_manager.check_drawdown(sid)
+                self.enforce_drawdown(sid, self.ledger.strategy_realized_pnl.get(sid, 0.0))
             logger.info("ExecDetails(net) - %s %s %s @ %s",
                         contract.symbol, execution.side, execution.shares, execution.price)
             return
@@ -518,12 +546,30 @@ class CentralExecutor(EClient, EWrapper):
             order_info.get("strategy_id", "unknown"),
             expected_price=order_info.get("expected_price"),
         )
-        self.risk_manager.check_drawdown(strategy_id)  # halts the strategy internally on breach
+        self._check_fill_sanity(strategy_id, contract.symbol, execution.price, order_info.get("expected_price"))
+        self.enforce_drawdown(strategy_id, self.ledger.strategy_realized_pnl.get(strategy_id, 0.0))  # halt+flatten on breach
         logger.info("ExecDetails - %s %s %s @ %s", contract.symbol, execution.side, execution.shares, execution.price)
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
         # write to the LEDGER's broker_positions, not a local copy
         self.ledger.broker_positions[contract.symbol] = position
+        _mult = None
+        if getattr(contract, "multiplier", None):
+            try:
+                _mult = float(contract.multiplier)
+                self.ledger.multipliers[contract.symbol] = _mult
+            except (TypeError, ValueError):
+                _mult = None
+        # remember how to rebuild this contract, so a drawdown flatten works after a restart
+        self._instruments.setdefault(contract.symbol, {
+            "symbol": contract.symbol,
+            "asset_class": "future" if contract.secType == "FUT" else "equity",
+            "sec_type": contract.secType or "STK",
+            "exchange": contract.exchange or getattr(contract, "primaryExchange", "")
+                        or ("NYMEX" if contract.secType == "FUT" else "SMART"),
+            "multiplier": _mult,
+            "last_trade_date": getattr(contract, "lastTradeDateOrContractMonth", None) or None,
+        })
         logger.info("Position - %s: %s @ avg cost %s", contract.symbol, position, avgCost)
 
     def positionEnd(self) -> None:
@@ -575,6 +621,183 @@ class CentralExecutor(EClient, EWrapper):
     # ------------------------------------------------------------------
     # Kill switch (Phase 4)
     # ------------------------------------------------------------------
+    def connectionClosed(self) -> None:
+        """IB socket closed. Expected during shutdown; otherwise a hard disconnect (Gateway
+        restart, network drop) — log CRITICAL (-> alert) and, if auto_reconnect is on, kick
+        off a background reconnect. Nothing trades until the connection is back."""
+        if getattr(self, "_shutting_down", False):
+            logger.info("IB connection closed (during shutdown)")
+            return
+        logger.critical("IB connection closed UNEXPECTEDLY \u2014 trading halted until reconnected")
+        if GLOBAL.get("auto_reconnect", True) and not self._reconnecting:
+            self._reconnecting = True
+            threading.Thread(target=self._reconnect_loop, daemon=True).start()
+
+    def _reconnect_loop(self) -> None:
+        """Retry connect() with backoff; on success re-run reconcile + recover open orders."""
+        attempts = int(GLOBAL.get("reconnect_max_attempts", 30))
+        backoff = float(GLOBAL.get("reconnect_backoff_sec", 10.0))
+        c = self._conn
+        for i in range(1, attempts + 1):
+            if getattr(self, "_shutting_down", False):
+                break
+            time.sleep(backoff)
+            try:
+                logger.warning("IB reconnect attempt %d/%d ...", i, attempts)
+                self._order_id_ready.clear()
+                self.connect(c["host"], c["port"], c["client_id"])
+                self._api_thread = threading.Thread(target=self.run, daemon=True)
+                self._api_thread.start()
+                if not self._order_id_ready.wait(timeout=8.0):
+                    logger.warning("reconnect %d: no nextValidId yet", i)
+                    continue
+                self.reqMarketDataType(3)
+                self.reconcile_and_log()
+                self.recover_open_orders()
+                logger.critical("IB RECONNECTED after %d attempt(s) — reconciled + recovered", i)
+                self._reconnecting = False
+                return
+            except Exception as e:
+                logger.warning("reconnect attempt %d failed: %s", i, e)
+        self._reconnecting = False
+        logger.critical("IB reconnect gave up after %d attempts — manual intervention needed", attempts)
+
+    def _check_fill_sanity(self, strategy_id: str, symbol: str, price, expected) -> None:
+        """Post-fill guard: a fill far from the expected price alerts (CRITICAL -> Telegram)
+        and, beyond the harder halt threshold, halts + flattens the strategy. Market orders
+        can't be pre-rejected, so this is detection after the fact."""
+        if not expected or expected <= 0 or not price:
+            return
+        dev = abs(price - expected) / expected
+        alert = GLOBAL.get("fill_slippage_alert_pct")
+        haltp = GLOBAL.get("fill_slippage_halt_pct")
+        if alert is not None and dev > alert:
+            logger.critical("FILL SANITY: %s %s filled @ %.4f vs expected %.4f (%.1f%% off)",
+                            strategy_id, symbol, price, expected, dev * 100)
+            if (haltp is not None and dev > haltp
+                    and strategy_id != "__net__" and self.risk_manager.is_active(strategy_id)):
+                self.halt_and_flatten(strategy_id, f"fill deviation {dev * 100:.1f}% on {symbol}")
+
+    def margin_whatif(self, intent: dict, timeout: float = 5.0) -> Optional[dict]:
+        """Send a whatIf order (no real order placed) and return its margin impact dict."""
+        instrument = intent["instrument"]
+        if instrument.get("sec_type", "STK") == "FUT":
+            contract = self.get_future_contract(
+                instrument["symbol"], exchange=instrument.get("exchange", "NYMEX"),
+                last_trade_date=instrument.get("last_trade_date"),
+                multiplier=instrument.get("multiplier"))
+        else:
+            contract = self.get_stock_contract(instrument["symbol"], exchange=instrument.get("exchange", "SMART"))
+        order = self.build_order(intent)
+        order.whatIf = True
+        oid = self.get_next_order_id()
+        ev = threading.Event()
+        self._whatif_events[oid] = ev
+        try:
+            self.placeOrder(oid, contract, order)
+            ev.wait(timeout=timeout)
+            return self._whatif.get(oid)
+        finally:
+            self._whatif_events.pop(oid, None)
+            self._whatif.pop(oid, None)
+
+    def mark_is_fresh(self, symbol: str) -> bool:
+        """True if we have a mark for `symbol` no older than GLOBAL['mark_staleness_sec']."""
+        max_age = GLOBAL.get("mark_staleness_sec")
+        if max_age is None:
+            return symbol in self._mark_cache
+        with self._mark_lock:
+            ts = self._mark_ts.get(symbol)
+        return ts is not None and (time.time() - ts) <= float(max_age)
+
+    def trip_circuit_breaker(self, reason: str) -> None:
+        """Portfolio circuit breaker: HALT + FLATTEN every strategy and kill new orders.
+        Idempotent — fires once until _circuit_broken is cleared."""
+        if self._circuit_broken:
+            return
+        self._circuit_broken = True
+        logger.critical("CIRCUIT BREAKER TRIPPED: %s \u2014 flattening ALL strategies, killing new orders", reason)
+        for sid in set(CONFIG) | set(self.ledger.strategy_positions):
+            try:
+                if self.risk_manager.is_active(sid):
+                    self.risk_manager.halt_strategy(sid, f"circuit breaker: {reason}")
+                if self.coordinator is not None and sid in getattr(self.coordinator, "desired", {}):
+                    self.coordinator.halt(sid)
+                else:
+                    self._flatten_direct(sid)
+            except Exception as e:
+                logger.error("circuit-breaker flatten failed for %s: %s", sid, e)
+        self._killed = True
+
+    def enforce_daily_loss(self, total_equity: float) -> None:
+        """Portfolio daily-loss circuit breaker (called by the sampler). Baseline is captured
+        on the first call (or reset via reset_daily_baseline); trips when the loss since the
+        baseline reaches GLOBAL['max_daily_loss']."""
+        if self._daily_baseline is None:
+            self._daily_baseline = total_equity
+        max_loss = GLOBAL.get("max_daily_loss")
+        if max_loss is None or self._circuit_broken:
+            return
+        loss = self._daily_baseline - total_equity
+        if loss >= max_loss:
+            self.trip_circuit_breaker(f"daily loss {loss:,.0f} >= {max_loss:,.0f}")
+
+    def reset_daily_baseline(self, total_equity: float = None) -> None:
+        """Reset the circuit-breaker baseline (call at the open) and clear a tripped breaker."""
+        self._daily_baseline = total_equity
+        self._circuit_broken = False
+
+    def enforce_drawdown(self, strat_id: str, pnl: float, source: str = "realized") -> None:
+        """If `pnl` (dollar-denominated) breaches the strategy's max_drawdown, HALT it and
+        FLATTEN its holdings. `source` is 'realized' (fast path, on each fill) or 'total'
+        (periodic, realized + unrealized mark-to-market)."""
+        if not self.risk_manager.is_active(strat_id):
+            return
+        st = self.risk_manager.drawdown_status(strat_id, pnl)
+        if st["breached"]:
+            reason = (f"DRAWDOWN BREACH ({source}): {strat_id} at {st['drawdown_pct'] * 100:.1f}% "
+                      f">= limit {st['max_dd'] * 100:.1f}% (P&L {pnl:,.0f})")
+            self.halt_and_flatten(strat_id, reason)
+
+    def halt_and_flatten(self, strat_id: str, reason: str) -> None:
+        """Stop a strategy AND close its positions. Pooled strategies unwind via the
+        coordinator (so the desired book is zeroed and won't re-open); direct strategies get
+        closing market orders. Idempotent — a no-op if already halted."""
+        if not self.risk_manager.is_active(strat_id):
+            return
+        logger.critical(reason)                       # -> AlertingHandler pages Telegram
+        self.risk_manager.halt_strategy(strat_id, reason)
+        try:
+            if self.coordinator is not None and strat_id in getattr(self.coordinator, "desired", {}):
+                self.coordinator.halt(strat_id)       # zero desired book + unwind (attributes to strat)
+            else:
+                self._flatten_direct(strat_id)
+        except Exception as e:
+            logger.error("flatten failed for %s: %s", strat_id, e)
+
+    def _flatten_direct(self, strat_id: str) -> None:
+        """Close every non-flat position of a (non-pooled) strategy with market orders.
+        Bypasses the active-strategy risk check by calling place_order directly — the
+        strategy is halted, but this system-initiated unwind must still go through."""
+        book = dict(self.ledger.strategy_positions.get(strat_id, {}))
+        for sym, qty in book.items():
+            if abs(qty) < 1e-9:
+                continue
+            inst = self._instruments.get(sym) or {
+                "symbol": sym, "asset_class": "equity", "sec_type": "STK", "exchange": "SMART"}
+            intent = {
+                "client_order_id": f"flat-{strat_id}-{sym}-{int(time.time() * 1000)}",
+                "strategy_id": strat_id,
+                "instrument": inst,
+                "side": "sell" if qty > 0 else "buy",
+                "quantity": abs(qty),
+                "order_type": "market",
+                "time_in_force": "day",
+                "expected_price": self._ref_value.get(sym),
+            }
+            logger.warning("FLATTEN %s: %s %g %s", strat_id, intent["side"], abs(qty), sym)
+            self.place_order(intent)
+
     def kill_switch(self, flatten: bool = True) -> None:
         self._killed = True
         logger.critical("KILL SWITCH ACTIVATED")
@@ -616,6 +839,20 @@ class CentralExecutor(EClient, EWrapper):
             logger.warning("open-order recovery timed out")
 
     def openOrder(self, orderId, contract, order, orderState):
+        # whatIf probe (pre-trade margin check) — capture margin impact, don't treat as live
+        if orderId in self._whatif_events:
+            def _f(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+            self._whatif[orderId] = {
+                "init_margin": _f(orderState.initMarginChange),
+                "maint_margin": _f(orderState.maintMarginChange),
+                "commission": _f(getattr(orderState, "commission", None)),
+            }
+            self._whatif_events[orderId].set()
+            return
         # rebuild order_status from what IB reports as live
         if orderId not in self.order_status:
             original = self.logger_db.get_order(orderId)  # you'd add this method
@@ -676,6 +913,7 @@ class CentralExecutor(EClient, EWrapper):
     # ------------------------------------------------------------------
     def start(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 5, timeout: float = 5.0) -> dict:
         self._shutting_down = False
+        self._conn = {"host": host, "port": port, "client_id": client_id}
         self.connect(host, port, client_id)
         self._api_thread = threading.Thread(target=self.run, daemon=True)  # store the handle
         self._api_thread.start()
