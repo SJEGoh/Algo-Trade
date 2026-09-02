@@ -42,6 +42,16 @@
   .card .name { font-weight:600; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center; }
   .card .row { display:flex; justify-content:space-between; color:var(--muted); }
   .card .row span:last-child { color:var(--text); }
+  details { border-top:1px solid var(--border); }
+  details > summary { cursor:pointer; padding:10px 14px; color:var(--muted); font-size:12px;
+                      font-weight:600; text-transform:uppercase; letter-spacing:.8px;
+                      list-style:none; user-select:none; }
+  details > summary::-webkit-details-marker { display:none; }
+  details > summary::before { content:"▸ "; }
+  details[open] > summary::before { content:"▾ "; }
+  .recon-bar { display:flex; gap:12px; align-items:center; padding:8px 14px;
+               font-size:12px; border-bottom:1px solid var(--border); }
+  .recon-bar .label { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -56,9 +66,17 @@
 <main>
   <section><h2>Equity Curve (total)</h2><div class="body"><div id="equity" style="padding:8px"></div></div></section>
   <section><h2>Strategies</h2><div class="body" id="strategies"></div></section>
-  <section><h2>Positions</h2><div class="body" id="positions"></div></section>
-  <section><h2>Orders (this session)</h2><div class="body" id="orders"></div></section>
-  <section><h2>Fills &amp; Slippage</h2><div class="body" id="fills"></div></section>
+  <section>
+    <h2>Positions</h2>
+    <div id="recon-bar" class="recon-bar" hidden></div>
+    <div class="body" id="positions"></div>
+  </section>
+  <section><h2>Open Orders</h2><div class="body" id="open-orders"></div></section>
+  <section><h2>Recent Fills (Last 5)</h2><div class="body" id="recent-fills"></div></section>
+  <section>
+    <details><summary>All Orders (this session)</summary><div class="body" id="orders"></div></details>
+    <details><summary>All Fills &amp; Slippage</summary><div class="body" id="fills"></div></details>
+  </section>
 </main>
 
 <script>
@@ -152,6 +170,64 @@ function renderPositions() {
   });
 }
 
+function renderOpenOrders() {
+  panel("open-orders", () => {
+    const rows = ((state.data.orders?.orders) || [])
+      .filter(r => r.status === "Submitted" || r.status === "PreSubmitted")
+      .sort((a, b) => b.order_id - a.order_id);
+    return table([
+      { label: "ID", get: r => r.order_id },
+      { label: "Symbol", get: r => r.symbol },
+      { label: "Side", get: r => (r.pending_qty > 0 ? "BUY" : r.pending_qty < 0 ? "SELL" : "—") },
+      { label: "Pending", cls: r => signClass(r.pending_qty), get: r => num(r.pending_qty) },
+      { label: "Filled", get: r => num(r.filled) },
+      { label: "Remaining", get: r => num(r.remaining) },
+      { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
+    ], rows);
+  });
+}
+
+function renderRecentFills() {
+  panel("recent-fills", () => {
+    const rows = ((state.data.fills?.fills) || []).slice(0, 5);
+    const slip = (f) => {
+      if (f.expected_price == null) return null;
+      const sign = f.side === "BOT" ? 1 : -1;
+      return (f.price - f.expected_price) * sign;
+    };
+    const bps = (f) => {
+      const s = slip(f);
+      return s == null || !f.expected_price ? null : (s / f.expected_price) * 10000;
+    };
+    return table([
+      { label: "Time", cls: () => "dim", get: r => (r.filled_at || "").slice(11, 19) },
+      { label: "Symbol", get: r => r.symbol },
+      { label: "Side", get: r => r.side === "BOT" ? "BUY" : "SELL" },
+      { label: "Qty", get: r => num(r.quantity) },
+      { label: "Fill", get: r => num(r.price, 2) },
+      { label: "Expected", cls: () => "dim", get: r => num(r.expected_price, 2) },
+      { label: "Slip", cls: r => signClass(slip(r) ?? 0), get: r => { const s = slip(r); return s == null ? "\u2014" : (s > 0 ? "+" : "") + s.toFixed(2); } },
+      { label: "bps", cls: r => signClass(bps(r) ?? 0), get: r => { const b = bps(r); return b == null ? "\u2014" : (b > 0 ? "+" : "") + b.toFixed(0); } },
+      { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
+    ], rows);
+  });
+}
+
+function renderReconBar() {
+  const bar = el("recon-bar");
+  const r = state.data.reconcile;
+  if (!r) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const matched = r.matched ?? "?";
+  const disc = r.discrepancies || [];
+  if (disc.length === 0) {
+    bar.innerHTML = '<span class="pill ok">reconciled</span><span class="label">matched: ' + matched + ' positions</span>';
+  } else {
+    bar.innerHTML = '<span class="pill bad">' + disc.length + ' discrepancies</span><span class="label">' +
+      disc.map(d => (typeof d === "string" ? d : JSON.stringify(d))).join("; ") + '</span>';
+  }
+}
+
 function renderOrders() {
   panel("orders", () => {
     const rows = ((state.data.orders?.orders) || [])
@@ -226,7 +302,7 @@ function renderEquity() {
 }
 
 function renderAll() {
-  renderHeader(); renderStrategies(); renderPositions(); renderOrders(); renderFills(); renderEquity();
+  renderHeader(); renderStrategies(); renderPositions(); renderReconBar(); renderOpenOrders(); renderRecentFills(); renderOrders(); renderFills(); renderEquity();
 }
 
 // ---------- poll loop: fetch -> state -> render (error-isolated per panel) ----------
@@ -237,7 +313,8 @@ const FEEDS = [
   ["positions", api.positions.bind(api), "positions"],
   ["orders", api.orders.bind(api), "orders"],
   ["fills", api.fills.bind(api), "fills"],
-  ["equityhist", () => api._get("/pnl/history"), null],   // <-- add this line
+  ["equityhist", () => api._get("/pnl/history"), null],
+  ["reconcile", () => api._get("/reconcile/status"), null],   // <-- add this line
 ];
 
 async function poll() {

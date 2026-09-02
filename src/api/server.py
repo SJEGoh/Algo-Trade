@@ -53,6 +53,11 @@ async def lifespan(app: FastAPI):
     executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
     app.state.startup_reconciliation = recon
+    _last_reconcile.update({
+        "matched": recon.get("matched") if isinstance(recon, dict) else recon,
+        "discrepancies": recon.get("discrepancies", []) if isinstance(recon, dict) else [],
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
     alerter.send(f"\u2705 Executor server up \u2014 IB connected, reconciled "
                  f"(matched={recon.get('matched') if isinstance(recon, dict) else recon})")
 
@@ -69,6 +74,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Algo Trade Executor", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
+def _alert(message: str, topic: str = None) -> None:
+    """Send a Telegram alert if the alerter is initialised (no-op in tests / before lifespan)."""
+    alerter = getattr(app.state, "alerter", None)
+    if alerter:
+        alerter.send(message, topic=topic)
+
 def require_api_key(x_api_key: str = Header(default = "")) -> None:
     if not secrets.compare_digest(x_api_key, EXECUTOR_API_KEY or ""):
         raise HTTPException(status_code=401, detail="invalid or missing API key")
@@ -79,6 +91,15 @@ class KillRequest(BaseModel):
 @app.post("/orders", dependencies = [Depends(require_api_key)])
 def submit_order(intent: dict):
     result = executor.process_intent(intent)
+    # Alert order submission to orders topic
+    if result.get("accepted"):
+        symbol = intent.get("instrument", {}).get("symbol", "?")
+        oid = result.get("order_id", "?")
+        _alert(
+            f"\U0001f4e8 Order submitted — {symbol} id={oid} "
+            f"({intent.get('intent_type', '?')})",
+            topic="orders",
+        )
     return result
 
 
@@ -108,10 +129,15 @@ def set_target(req: TargetRequest):
     coordinator re-nets and trades the account to the pooled net. Exit = quantity 0."""
     _fut = (req.instrument or {}).get("sec_type", "STK") == "FUT"
     _pool_preflight(_fut)
-    return executor.coordinator.set_target(
+    result = executor.coordinator.set_target(
         req.strategy_id, req.symbol, req.quantity,
         instrument=req.instrument, price=req.price,
     )
+    _alert(
+        f"\U0001f3af Target set — {req.strategy_id} {req.symbol} qty={req.quantity}",
+        topic="orders",
+    )
+    return result
 
 
 @app.post("/targets", dependencies=[Depends(require_api_key)])
@@ -171,6 +197,10 @@ def health():
 @app.post("/kill", dependencies=[Depends(require_api_key)])
 def kill(req: KillRequest):
     executor.kill_switch(flatten=req.flatten)
+    _alert(
+        f"\U0001f6d1 KILL SWITCH activated (flatten={req.flatten})",
+        topic="errors",
+    )
     return {"killed": True, "flattened": req.flatten}
 
 @app.get("/strategies/{strategy_id}/status")
@@ -211,17 +241,30 @@ def reset_daily():
     return {"reset": True, "circuit_broken": executor._circuit_broken}
 
 
+# last reconcile result for dashboard polling
+_last_reconcile = {"matched": None, "discrepancies": [], "ts": None}
+
 @app.post("/reconcile", dependencies=[Depends(require_api_key)])
 def reconcile():
     try:
         result = executor.reconcile_and_log()   # pulls reqPositions, corrects ledger to broker
     except TimeoutError as e:
         raise HTTPException(status_code=503, detail=f"reconcile timed out talking to IB: {e}")
+    _last_reconcile.update({
+        "matched": result["matched"],
+        "discrepancies": result["discrepancies"],
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
     return {
         "matched": result["matched"],
         "discrepancies": result["discrepancies"],
         "positions": dict(executor.ledger.current_positions),
     }
+
+
+@app.get("/reconcile/status")
+def reconcile_status():
+    return _last_reconcile
 
 
 # ------------------------------------------------------------------
