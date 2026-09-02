@@ -93,7 +93,8 @@ class NettingCoordinator:
                 return {"accepted": False,
                         "reason": f"{sid} desired gross exceeds allocation {alloc:.0f}"}
             self._save()
-            return {"accepted": True, "orders": self._rebalance({symbol})}
+            rebal = self._rebalance({symbol})
+            return {"accepted": True, **rebal}
 
     def submit_book(self, sid, intents):
         """Full-book replace: authoritative snapshot. Closes any name dropped from the book."""
@@ -116,7 +117,8 @@ class NettingCoordinator:
                 return {"accepted": False,
                         "reason": f"{sid} desired gross exceeds allocation {alloc:.0f}"}
             self._save()
-            return {"accepted": True, "orders": self._rebalance(set(old) | set(new_book))}
+            rebal = self._rebalance(set(old) | set(new_book))
+            return {"accepted": True, **rebal}
 
     def halt(self, sid):
         """Flatten a strategy's book (keep the entry so its unwind attributes to it)."""
@@ -126,8 +128,90 @@ class NettingCoordinator:
             self._save()
             return self._rebalance(set(old))
 
+    # ---------------- internal crossing ----------------
+    def _internal_cross(self, symbols):
+        """Cross offsetting strategy deltas internally at the reference price.
+        Returns list of dicts: {symbol, strategy_id, side, quantity, price}.
+        Updates per-strategy positions via apply_internal_cross (zero-sum,
+        no change to current_positions or pending_deltas)."""
+        import logging
+        logger = logging.getLogger("executor")
+        crosses = []
+        _counter = [0]
+
+        for sym in symbols:
+            price = self.ref_price.get(sym)
+            if not price or price <= 0:
+                continue
+
+            # Per-strategy deltas: what each strategy still needs
+            deltas = {}
+            for sid, book in self.desired.items():
+                want = book.get(sym, 0.0)
+                have = self.ex.ledger.strategy_positions.get(sid, {}).get(sym, 0.0)
+                d = want - have
+                if abs(d) > _EPS:
+                    deltas[sid] = d
+
+            if not deltas:
+                continue
+
+            buyers = {sid: d for sid, d in deltas.items() if d > 0}
+            sellers = {sid: abs(d) for sid, d in deltas.items() if d < 0}
+
+            if not buyers or not sellers:
+                continue  # all same direction — nothing to cross
+
+            total_buy = sum(buyers.values())
+            total_sell = sum(sellers.values())
+            crossable = min(total_buy, total_sell)
+
+            if crossable < _EPS:
+                continue
+
+            # Pro-rata allocation of the cross to each side
+            buy_scale = crossable / total_buy
+            sell_scale = crossable / total_sell
+
+            for sid, qty in buyers.items():
+                fill_qty = qty * buy_scale
+                self.ex.ledger.apply_internal_cross(sym, fill_qty, price, sid)
+                crosses.append({
+                    "symbol": sym, "strategy_id": sid,
+                    "side": "BOT", "quantity": abs(fill_qty), "price": price,
+                })
+                # Log to DB
+                _counter[0] += 1
+                exec_id = f"xnet-{sym}-{int(time.time()*1000)}-{_counter[0]}"
+                self.ex.logger_db.log_fill(
+                    0, exec_id, sym, "BOT", price, abs(fill_qty), sid,
+                    expected_price=price,
+                )
+
+            for sid, qty in sellers.items():
+                fill_qty = qty * sell_scale
+                self.ex.ledger.apply_internal_cross(sym, -fill_qty, price, sid)
+                crosses.append({
+                    "symbol": sym, "strategy_id": sid,
+                    "side": "SLD", "quantity": abs(fill_qty), "price": price,
+                })
+                _counter[0] += 1
+                exec_id = f"xnet-{sym}-{int(time.time()*1000)}-{_counter[0]}"
+                self.ex.logger_db.log_fill(
+                    0, exec_id, sym, "SLD", price, abs(fill_qty), sid,
+                    expected_price=price,
+                )
+
+            logger.info("InternalCross %s: crossed %.1f shares @ %.2f (%d buyers, %d sellers)",
+                        sym, crossable, price, len(buyers), len(sellers))
+
+        return crosses
+
     # ---------------- rebalance to net ----------------
     def _rebalance(self, symbols):
+        """Cross internally first, then send residual net delta to IB.
+        Returns {"orders": [...], "internal_crosses": [...]}."""
+        crosses = self._internal_cross(symbols)
         net = self.net()
         placed = []
         for sym in symbols:
@@ -140,12 +224,13 @@ class NettingCoordinator:
                 continue
             oid = self.ex.place_net_order(sym, delta, self.instrument.get(sym), self.ref_price.get(sym))
             placed.append({"symbol": sym, "delta": delta, "order_id": oid})
-        return placed
+        return {"orders": placed, "internal_crosses": crosses}
 
     # ---------------- fill attribution ----------------
     def attribute_fill(self, symbol, filled_signed, price):
         """Decompose a net fill into per-strategy sub-fills at the fill price, so each
-        strategy books only its own change (correct P&L even with opposing legs)."""
+        strategy books only its own change (correct P&L even with opposing legs).
+        Returns a list of (strategy_id, attributed_qty) tuples for DB logging."""
         with self._lock:
             changes = {}
             for sid, book in self.desired.items():
@@ -156,7 +241,11 @@ class NettingCoordinator:
             total = sum(changes.values())
             if abs(total) < _EPS:
                 self.ex.ledger.apply_attributed_fill(symbol, filled_signed, price, self.NET_SID)
-                return
+                return [(self.NET_SID, filled_signed)]
             scale = filled_signed / total                       # pro-rata; exact on a full fill
+            attributed = []
             for sid, ch in changes.items():
-                self.ex.ledger.apply_attributed_fill(symbol, ch * scale, price, sid)
+                sub_qty = ch * scale
+                self.ex.ledger.apply_attributed_fill(symbol, sub_qty, price, sid)
+                attributed.append((sid, sub_qty))
+            return attributed

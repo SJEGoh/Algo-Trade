@@ -7,10 +7,21 @@ from execution.netting import NettingCoordinator
 INST = {"symbol": "X", "asset_class": "equity", "exchange": "SMART"}
 
 
+class _FakeLoggerDB:
+    def __init__(self):
+        self.fills = []
+    def log_fill(self, order_id, exec_id, symbol, side, price, quantity,
+                 strategy_id, expected_price=None):
+        self.fills.append({"order_id": order_id, "exec_id": exec_id,
+                           "symbol": symbol, "side": side, "price": price,
+                           "quantity": quantity, "strategy_id": strategy_id})
+
+
 class FakeExecutor:
     def __init__(self, config):
         self.ledger = PositionLedger(None)
         self.risk_manager = RiskManager(self.ledger, config)
+        self.logger_db = _FakeLoggerDB()
         self.placed = []
 
     def _cancel_open_orders_for_symbol(self, sym):
@@ -98,7 +109,8 @@ def test_halt_unwinds_and_attributes_to_the_strategy():
     ex = FakeExecutor(cfg); co = NettingCoordinator(ex, cfg)
     co.set_target("s1", "MSFT", 100, instrument=inst("MSFT"), price=500); ex.fill_last(co)
     co.set_target("s2", "MSFT", 50, instrument=inst("MSFT"), price=500); ex.fill_last(co)  # net 150
-    orders = co.halt("s1")
+    result = co.halt("s1")
+    orders = result["orders"]
     assert orders[0]["delta"] == -100                # net 50 - current 150
     ex.fill_orders(co, orders)
     assert ex.ledger.current_positions["MSFT"] == 50

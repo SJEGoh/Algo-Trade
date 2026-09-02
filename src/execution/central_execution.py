@@ -526,17 +526,28 @@ class CentralExecutor(EClient, EWrapper):
         # Pooled net order: let the coordinator decompose this fill into per-strategy
         # sub-fills (correct P&L even with opposing legs), then check drawdown per book.
         if order_info.get("net") and self.coordinator is not None:
-            self.coordinator.attribute_fill(contract.symbol, signed_qty, execution.price)
+            attributed = self.coordinator.attribute_fill(contract.symbol, signed_qty, execution.price)
+            # Log the raw net fill (the actual IB execution)
             self.logger_db.log_fill(
                 execution.orderId, execution.execId, contract.symbol,
                 execution.side, execution.price, execution.shares,
                 "__net__", expected_price=order_info.get("expected_price"),
             )
+            # Log per-strategy attributed fills so P&L survives restarts
+            for i, (sid, sub_qty) in enumerate(attributed):
+                sub_side = "BOT" if sub_qty > 0 else "SLD"
+                attr_exec_id = f"{execution.execId}-attr-{sid}-{i}"
+                self.logger_db.log_fill(
+                    execution.orderId, attr_exec_id, contract.symbol,
+                    sub_side, execution.price, abs(sub_qty),
+                    sid, expected_price=order_info.get("expected_price"),
+                )
             self._check_fill_sanity("__net__", contract.symbol, execution.price, order_info.get("expected_price"))
             for sid in list(self.coordinator.desired.keys()):
                 self.enforce_drawdown(sid, self.ledger.strategy_realized_pnl.get(sid, 0.0))
-            logger.info("ExecDetails(net) - %s %s %s @ %s",
-                        contract.symbol, execution.side, execution.shares, execution.price)
+            logger.info("ExecDetails(net) - %s %s %s @ %s (attributed to %s)",
+                        contract.symbol, execution.side, execution.shares, execution.price,
+                        ", ".join(f"{sid}:{qty:+.1f}" for sid, qty in attributed))
             return
 
         self.ledger.record_fill(contract.symbol, signed_qty, execution.price, strategy_id)
