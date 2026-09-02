@@ -9,7 +9,7 @@ alias deactivate 'test $?_OLD_VIRTUAL_PATH != 0 && setenv PATH "$_OLD_VIRTUAL_PA
 # Unset irrelevant variables.
 deactivate nondestructive
 
-setenv VIRTUAL_ENV "/Users/sjegoh/Documents/GitHub/algo_trade/venv_algotrade"
+setenv VIRTUAL_ENV "/Users/sjegoh/Documents/GitHub/execution/algo_trade/venv_algotrade"
 
 set _OLD_VIRTUAL_PATH="$PATH"
 setenv PATH "$VIRTUAL_ENV/bin:$PATH"

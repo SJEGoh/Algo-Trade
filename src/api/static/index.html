@@ -219,7 +219,7 @@ function renderReconBar() {
   if (!r) { bar.hidden = true; return; }
   bar.hidden = false;
   const matched = r.matched ?? "?";
-  const disc = r.discrepancies || [];
+  const disc = Array.isArray(r.discrepancies) ? r.discrepancies : (r.discrepancies && typeof r.discrepancies === "object" ? Object.entries(r.discrepancies).map(([k,v]) => k + ": " + JSON.stringify(v)) : []);
   if (disc.length === 0) {
     bar.innerHTML = '<span class="pill ok">reconciled</span><span class="label">matched: ' + matched + ' positions</span>';
   } else {

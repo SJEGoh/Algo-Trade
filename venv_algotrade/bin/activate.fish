@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV "/Users/sjegoh/Documents/GitHub/algo_trade/venv_algotrade"
+set -gx VIRTUAL_ENV "/Users/sjegoh/Documents/GitHub/execution/algo_trade/venv_algotrade"
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/bin" $PATH

@@ -1,4 +1,4 @@
-#!/Users/sjegoh/Documents/GitHub/algo_trade/venv_algotrade/bin/python3.12
+#!/Users/sjegoh/Documents/GitHub/execution/algo_trade/venv_algotrade/bin/python3.12
 
 import datetime
 import os

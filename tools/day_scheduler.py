@@ -57,9 +57,9 @@ ENABLE = {
 }
 ORB_EVERY_MIN = 30              # cadence of the ORB runner through the session
 ORB_START_AFTER_OPEN_MIN = 30   # wait for the opening range to form before the first ORB
-MOMENTUM_AFTER_OPEN_MIN = 5     # let the open settle before the daily momentum rebalance
+MOMENTUM_AFTER_OPEN_MIN = 60     # let the open settle before the daily momentum rebalance
 ENTER_BEFORE_CLOSE_MIN = 2      # ovn_volsurge enter, near the close (today's volume ~complete)
-EXIT_AFTER_OPEN_MIN = 1         # ovn_volsurge exit, at the open
+EXIT_AFTER_OPEN_MIN = 60         # ovn_volsurge exit, at the open
 VECM_AFTER_CLOSE_MIN = 5        # VECM EOD run, after the close
 ORB_STOP_BEFORE_CLOSE_MIN = 15  # last ORB fire this long before the close
 RECONCILE_EVERY_MIN = 60        # POST /reconcile this often through the session (0 disables)

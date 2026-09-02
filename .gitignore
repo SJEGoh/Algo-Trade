@@ -235,3 +235,5 @@ ibgateway_compose/tws_settings/
 docker-compose.yml
 build.log
 .DS_Store
+
+venv_algotrade/
