@@ -27,7 +27,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DB_DIR = Path(__file__).resolve().parent.parent.parent / "db"
 
 EXECUTOR_API_KEY = os.environ.get("EXECUTOR_API_KEY")
-SERVER_CLIENT_ID = 8  # distinct from main.py / run_strat.py (both use 6)
+SERVER_CLIENT_ID = int(os.environ.get("IB_CLIENT_ID", "8"))  # distinct from main.py / run_strat.py (both use 6)
+IB_HOST = os.environ.get("IB_HOST", "127.0.0.1")               # 'ib-gateway' in Docker compose
+IB_PORT = int(os.environ.get("IB_PORT", "4002"))              # 4002 paper / 4001 live (Gateway); 7497 TWS paper
 
 executor: Optional[CentralExecutor] = None
 
@@ -47,7 +49,7 @@ async def lifespan(app: FastAPI):
     app.state.alerter = alerter
 
     executor = CentralExecutor()
-    recon = executor.start(client_id = SERVER_CLIENT_ID)
+    recon = executor.start(host=IB_HOST, port=IB_PORT, client_id=SERVER_CLIENT_ID)
     executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
     app.state.startup_reconciliation = recon

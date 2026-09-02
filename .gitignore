@@ -228,3 +228,10 @@ run_vecm.py
 
 ROADMAP.md
 KNOWN_ISSUES.md
+
+# Deploy / infra
+ibgateway_compose/.env
+ibgateway_compose/tws_settings/
+docker-compose.yml
+build.log
+.DS_Store

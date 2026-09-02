@@ -2,6 +2,7 @@
 disabled Alerter is a safe no-op, and the executor's connectionClosed logs CRITICAL on an
 unexpected disconnect (which the handler turns into an alert) but stays quiet during shutdown."""
 import logging
+import time
 
 import pytest
 
@@ -49,3 +50,27 @@ def test_connection_closed_during_shutdown_is_quiet(caplog):
     with caplog.at_level(logging.DEBUG, logger="executor"):
         ex.connectionClosed()
     assert not any(r.levelno == logging.CRITICAL for r in caplog.records)
+
+
+def test_send_is_nonblocking_and_worker_posts():
+    a = Alerter(bot_token="t", chat_id="c")
+    posted = []
+    a._post = lambda m: (posted.append(m) or True)   # stand in for the HTTP call
+    a.send("hi")                                       # must return immediately
+    for _ in range(100):
+        if posted:
+            break
+        time.sleep(0.02)
+    assert posted == ["hi"]
+
+
+def test_alerter_self_mutes_after_repeated_failures():
+    a = Alerter(bot_token="t", chat_id="c", max_failures=2, cooldown_sec=999)
+    a._post = lambda m: False                          # every send fails
+    for i in range(3):
+        a.send(f"m{i}")
+    for _ in range(150):
+        if a._muted_until > 0:
+            break
+        time.sleep(0.02)
+    assert a._muted_until > 0                          # muted after the failure streak

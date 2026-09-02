@@ -17,6 +17,11 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
+import os
+
+IB_HOST = os.environ.get("IB_HOST", "127.0.0.1")
+IB_PORT = int(os.environ.get("IB_PORT", "4002"))
+IB_CLIENT_ID = int(os.environ.get("IB_CLIENT_ID", "12"))
 
 SYMBOLS = [("CL", "WTI crude"), ("BZ", "Brent crude"), ("RB", "RBOB gasoline")]
 EXCHANGE = "NYMEX"
@@ -106,10 +111,10 @@ class FuturesTest(EClient, EWrapper):
 
 def main():
     app = FuturesTest()
-    app.connect("127.0.0.1", 7497, clientId=11)
+    app.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
     threading.Thread(target=app.run, daemon=True).start()
     if not app._ready.wait(timeout=8):
-        print("FAIL: could not connect / no nextValidId — is paper TWS up on 7497?")
+        print(f"FAIL: could not connect / no nextValidId — is paper TWS up on {IB_PORT}?")
         return
     app.reqMarketDataType(4)  # delayed OK for a permissions probe
 

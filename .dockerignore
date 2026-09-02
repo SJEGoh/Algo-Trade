@@ -1,0 +1,24 @@
+# venv is macOS-linked and huge; never ship it
+venv_algotrade/
+.venv/
+# vcs / caches
+.git/
+.gitignore
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+# secrets — pass at runtime via --env-file, never bake in
+.env
+# runtime state — mounted as volumes, don't copy stale copies
+db/
+logs/
+*.log
+# scratch / os junk
+*.tar.gz
+.DS_Store
+node_modules/
+netting.json
+vecm_state.json

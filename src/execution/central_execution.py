@@ -141,7 +141,7 @@ class CentralExecutor(EClient, EWrapper):
         self._mark_cache: Dict[str, float] = {}   # symbol -> last good mark
         self._mark_ts: Dict[str, float] = {}       # symbol -> time.time() of last good mark (staleness guard)
         self._mark_lock = threading.Lock()
-        self._conn = {"host": "127.0.0.1", "port": 7497, "client_id": 5}  # remembered for auto-reconnect
+        self._conn = {"host": "127.0.0.1", "port": 4002, "client_id": 5}  # remembered for auto-reconnect
         self._reconnecting = False
         self._whatif: Dict[int, dict] = {}         # orderId -> margin impact (whatIf openOrder)
         self._whatif_events: Dict[int, threading.Event] = {}
@@ -911,7 +911,7 @@ class CentralExecutor(EClient, EWrapper):
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
-    def start(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 5, timeout: float = 5.0) -> dict:
+    def start(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 5, timeout: float = 5.0) -> dict:
         self._shutting_down = False
         self._conn = {"host": host, "port": port, "client_id": client_id}
         self.connect(host, port, client_id)
