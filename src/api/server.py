@@ -133,8 +133,12 @@ def set_target(req: TargetRequest):
         req.strategy_id, req.symbol, req.quantity,
         instrument=req.instrument, price=req.price,
     )
+    crosses = result.get("internal_crosses", []) if isinstance(result, dict) else []
+    cross_note = ""
+    if crosses:
+        cross_note = " [\U0001f504 internally crossed]"
     _alert(
-        f"\U0001f3af Target set — {req.strategy_id} {req.symbol} qty={req.quantity}",
+        f"\U0001f3af Target set — {req.strategy_id} {req.symbol} qty={req.quantity}{cross_note}",
         topic="orders",
     )
     return result
@@ -152,7 +156,25 @@ def submit_book(body: dict):
     fut_only = bool(intents) and all(
         (it.get("instrument") or {}).get("sec_type", "STK") == "FUT" for it in intents)
     _pool_preflight(fut_only)
-    return executor.coordinator.submit_book(sid, intents)
+    result = executor.coordinator.submit_book(sid, intents)
+    orders = result.get("orders", []) if isinstance(result, dict) else []
+    crosses = result.get("internal_crosses", []) if isinstance(result, dict) else []
+    msg_parts = []
+    if crosses:
+        cross_summary = ", ".join(
+            f"{c['symbol']} {c['side']} {c['quantity']:.0f}@{c['price']:.2f} ({c['strategy_id']})"
+            for c in crosses
+        )
+        msg_parts.append(f"\U0001f504 Internal: {cross_summary}")
+    if orders:
+        order_summary = ", ".join(
+            f"{o.get('symbol')} delta={o.get('delta')} id={o.get('order_id')}"
+            for o in orders
+        )
+        msg_parts.append(f"\U0001f4e6 IB: {order_summary}")
+    if msg_parts:
+        _alert(f"Book resync — {sid}:\n" + "\n".join(msg_parts), topic="orders")
+    return result
 
 
 @app.get("/net")
