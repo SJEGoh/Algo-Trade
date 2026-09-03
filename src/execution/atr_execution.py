@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from execution.central_execution import CentralExecutor
 
 logger = logging.getLogger("executor.atr")
 
@@ -46,11 +49,12 @@ class ExecutionLayer:
     # subclasses set this to tag metadata (e.g. "atr_execution", "vwap_execution")
     METADATA_KEY: str = "execution_layer"
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, executor: "CentralExecutor" = None):
         self.enabled: bool = cfg.get("enabled", False)
         self.cache_ttl: float = float(cfg.get("cache_ttl_sec", 300))
         self.strategies: list = list(cfg.get("strategies", []))
         self.skip_exits: bool = cfg.get("skip_exits", True)
+        self._executor = executor
 
         # symbol -> (cached_value, fetch_time)  — subclasses use via _get_cached / _set_cached
         self._cache: Dict[str, tuple] = {}
@@ -171,7 +175,7 @@ class ExecutionLayer:
 
 
 # ======================================================================
-# Concrete layer: ATR limit-at-pullback
+# Concrete layer: ATR limit-at-pullback (IBKR intraday bars)
 # ======================================================================
 
 class AtrPullbackLayer(ExecutionLayer):
@@ -180,22 +184,28 @@ class AtrPullbackLayer(ExecutionLayer):
     limit_price = price - atr_fraction * ATR(atr_period)   (for buys)
     limit_price = price + atr_fraction * ATR(atr_period)   (for sells)
 
+    ATR is computed from intraday bars fetched via IBKR reqHistoricalData.
+
     Config (extends ExecutionLayer):
-      atr_period     – ATR lookback in daily bars (default 14)
+      atr_period     – ATR lookback in bars (default 14)
       atr_fraction   – fraction of ATR to offset (default 0.5)
+      bar_size       – IBKR bar size string (default "5 mins")
+      duration       – IBKR duration string (default "2 D")
     """
 
     METADATA_KEY = "atr_execution"
 
-    def __init__(self, cfg: dict):
-        super().__init__(cfg)
+    def __init__(self, cfg: dict, executor: "CentralExecutor" = None):
+        super().__init__(cfg, executor=executor)
         self.atr_period: int = int(cfg.get("atr_period", 14))
         self.atr_fraction: float = float(cfg.get("atr_fraction", 0.5))
+        self.bar_size: str = cfg.get("bar_size", "5 mins")
+        self.duration: str = cfg.get("duration", "2 D")
 
     def compute_limit_price(self, symbol: str, price: float, is_buy: bool) -> Optional[float]:
         atr = self._get_atr(symbol)
         if atr is None or atr <= 0:
-            logger.warning("ATR fetch failed for %s — falling through to market order", symbol)
+            logger.warning("ATR unavailable for %s — falling through to market order", symbol)
             return None
         if is_buy:
             lp = round(price - self.atr_fraction * atr, 2)
@@ -210,12 +220,13 @@ class AtrPullbackLayer(ExecutionLayer):
             "original_order_type": "market",
             "atr": round(atr, 4),
             "atr_fraction": self.atr_fraction,
+            "bar_size": self.bar_size,
             "expected_price": price,
             "limit_price": limit_price,
         }
 
     # ------------------------------------------------------------------
-    # ATR computation with cache
+    # ATR computation with cache — fetches from IBKR via executor
     # ------------------------------------------------------------------
 
     def _get_atr(self, symbol: str) -> Optional[float]:
@@ -228,38 +239,17 @@ class AtrPullbackLayer(ExecutionLayer):
         return atr
 
     def _fetch_atr(self, symbol: str) -> Optional[float]:
-        """Fetch daily OHLC via yfinance and compute ATR(period)."""
+        """Fetch ATR via the executor's IBKR historical data connection."""
+        if self._executor is None:
+            logger.warning("ATR layer has no executor reference — cannot fetch bars")
+            return None
         try:
-            import yfinance as yf
-            import numpy as np
-
-            df = yf.download(symbol, period=f"{self.atr_period + 20}d",
-                             interval="1d", auto_adjust=True, progress=False)
-            if df is None or len(df) < self.atr_period + 1:
-                return None
-
-            df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
-            if hasattr(df.columns, 'get_level_values'):
-                try:
-                    df.columns = df.columns.get_level_values(0)
-                except Exception:
-                    pass
-            df.columns = [str(c).lower() for c in df.columns]
-
-            high = df["high"].values
-            low = df["low"].values
-            close = df["close"].values
-            prev_close = np.roll(close, 1)
-            prev_close[0] = close[0]
-
-            tr = np.maximum(high - low,
-                            np.maximum(np.abs(high - prev_close),
-                                       np.abs(low - prev_close)))
-            atr_series = np.convolve(tr, np.ones(self.atr_period) / self.atr_period,
-                                     mode='valid')
-            if len(atr_series) == 0:
-                return None
-            return float(atr_series[-1])
+            return self._executor.fetch_atr(
+                symbol,
+                period=self.atr_period,
+                bar_size=self.bar_size,
+                duration=self.duration,
+            )
         except Exception as e:
             logger.warning("ATR fetch error for %s: %s", symbol, e)
             return None

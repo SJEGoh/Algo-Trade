@@ -155,7 +155,12 @@ class CentralExecutor(EClient, EWrapper):
 
         # ATR limit-at-pullback execution layer
         from execution.atr_execution import AtrPullbackLayer
-        self.atr_layer = AtrPullbackLayer(ATR_EXECUTION)
+        self.atr_layer = AtrPullbackLayer(ATR_EXECUTION, executor=self)
+
+        # Historical data infrastructure (used by ATR layer)
+        self._hist_data: Dict[int, list] = {}          # reqId -> [BarData, ...]
+        self._hist_events: Dict[int, threading.Event] = {}  # reqId -> Event
+        self._hist_req_id = 20000
     # ------------------------------------------------------------------
     # Contract builders
     # ------------------------------------------------------------------
@@ -490,6 +495,81 @@ class CentralExecutor(EClient, EWrapper):
             with self._price_req_lock:
                 self._pending_price_reqs.pop(req_id, None)
                 self._price_results.pop(req_id, None)
+
+    # ------------------------------------------------------------------
+    # Historical data (IBKR reqHistoricalData) — used by ATR layer
+    # ------------------------------------------------------------------
+    def historicalData(self, reqId: int, bar: BarData) -> None:
+        """EWrapper callback: one bar at a time."""
+        self._hist_data.setdefault(reqId, []).append(bar)
+
+    def historicalDataEnd(self, reqId: int, start: str, end: str) -> None:
+        """EWrapper callback: all bars delivered."""
+        ev = self._hist_events.get(reqId)
+        if ev:
+            ev.set()
+
+    def fetch_atr(self, symbol: str, period: int = 14,
+                  bar_size: str = "5 mins", duration: str = "2 D",
+                  timeout: float = 10.0) -> Optional[float]:
+        """Fetch intraday bars from IBKR and compute ATR(period).
+        Returns the ATR value or None on failure."""
+        contract = self.get_stock_contract(symbol)
+
+        with self._order_id_lock:
+            self._hist_req_id += 1
+            req_id = self._hist_req_id
+
+        event = threading.Event()
+        self._hist_data[req_id] = []
+        self._hist_events[req_id] = event
+
+        try:
+            self.reqHistoricalData(
+                req_id, contract, "",       # endDateTime="" = now
+                duration,                   # e.g. "2 D"
+                bar_size,                   # e.g. "5 mins"
+                "TRADES",                   # whatToShow
+                1,                          # useRTH (regular trading hours only)
+                1,                          # formatDate (1 = yyyyMMdd HH:mm:ss)
+                False,                      # keepUpToDate
+                [],                         # chartOptions
+            )
+            if not event.wait(timeout=timeout):
+                logger.warning("historical data fetch for %s timed out", symbol)
+                return None
+
+            bars = self._hist_data.get(req_id, [])
+            if len(bars) < period + 1:
+                logger.warning("ATR: only %d bars for %s (need %d+1)", len(bars), symbol, period)
+                return None
+
+            # Compute ATR from the bars
+            highs = [b.high for b in bars]
+            lows = [b.low for b in bars]
+            closes = [b.close for b in bars]
+
+            true_ranges = []
+            for i in range(1, len(bars)):
+                tr = max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i - 1]),
+                    abs(lows[i] - closes[i - 1]),
+                )
+                true_ranges.append(tr)
+
+            if len(true_ranges) < period:
+                return None
+
+            atr = sum(true_ranges[-period:]) / period
+            return atr
+
+        except Exception as e:
+            logger.warning("ATR fetch error for %s: %s", symbol, e)
+            return None
+        finally:
+            self._hist_data.pop(req_id, None)
+            self._hist_events.pop(req_id, None)
 
     def get_marks(self, symbols, timeout: float = 3.0) -> Dict[str, Optional[float]]:
         """{symbol: mark_price}, snapshot-backed with carry-forward.
@@ -891,6 +971,11 @@ class CentralExecutor(EClient, EWrapper):
                 for sid in list(self.coordinator.desired):
                     all_syms |= set(self.coordinator.desired[sid])
                     self.coordinator.desired[sid] = {}
+                # Also include symbols from strategy_positions (desired may already be empty)
+                for sid, positions in self.ledger.strategy_positions.items():
+                    if sid in _INTERNAL:
+                        continue
+                    all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
                 self.coordinator._save()
                 if all_syms:
                     self.coordinator._rebalance(all_syms)

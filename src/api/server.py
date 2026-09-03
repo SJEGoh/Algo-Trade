@@ -275,6 +275,12 @@ def flatten_all():
         for sid in list(executor.coordinator.desired):
             all_syms |= set(executor.coordinator.desired[sid])
             executor.coordinator.desired[sid] = {}
+        # Also include symbols from strategy_positions (desired may already be empty
+        # from a previous flatten, but positions still need closing)
+        for sid, positions in executor.ledger.strategy_positions.items():
+            if sid in _INTERNAL:
+                continue
+            all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
         executor.coordinator._save()
         if all_syms:
             executor.coordinator._rebalance(all_syms)
@@ -512,6 +518,9 @@ def atr_status():
         "enabled": layer.enabled,
         "atr_period": layer.atr_period,
         "atr_fraction": layer.atr_fraction,
+        "bar_size": layer.bar_size,
+        "duration": layer.duration,
         "pending_orders": len(layer.pending_order_ids()),
         "cached_symbols": list(layer._cache.keys()),
+        "cached_atrs": {s: round(v[0], 4) for s, v in layer._cache.items()},
     }
