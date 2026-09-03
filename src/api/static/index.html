@@ -42,6 +42,15 @@
   .card .name { font-weight:600; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center; }
   .card .row { display:flex; justify-content:space-between; color:var(--muted); }
   .card .row span:last-child { color:var(--text); }
+
+  .strat-card { cursor:pointer; transition:border-color .15s; }
+  .strat-card:hover { border-color:var(--accent); }
+  .strat-card.expanded { border-color:var(--accent); }
+  .strat-holdings { margin-top:8px; border-top:1px solid var(--border); padding-top:8px; }
+  .strat-flat { color:var(--muted); font-size:12px; }
+  .strat-table { font-size:12px; }
+  .strat-table th { font-size:10px; padding:3px 8px; }
+  .strat-table td { padding:3px 8px; }
   details { border-top:1px solid var(--border); }
   details > summary { cursor:pointer; padding:10px 14px; color:var(--muted); font-size:12px;
                       font-weight:600; text-transform:uppercase; letter-spacing:.8px;
@@ -140,20 +149,47 @@ function renderHeader() {
     ? `updated ${Math.round(ageMs / 1000)}s ago` : "no data yet";
 }
 
+const _expandedStrategies = new Set();
+function toggleStrategy(sid) { 
+  if (_expandedStrategies.has(sid)) _expandedStrategies.delete(sid);
+  else _expandedStrategies.add(sid);
+  renderStrategies();
+}
+
 function renderStrategies() {
   panel("strategies", () => {
     const strats = (state.data.strategies?.strategies) || [];
     const pnl = (state.data.pnl?.realized_pnl) || {};
+    const stratPos = (state.data.positions?.strategy_positions) || {};
+    const stratCost = (state.data.positions?.strategy_avg_cost) || {};
     if (!strats.length) return `<div class="empty">none configured</div>`;
     return `<div class="cards">` + strats.map(s => {
-      const p = pnl[s.strategy_id] ?? 0;
+      const sid = s.strategy_id;
+      const p = pnl[sid] ?? 0;
       const active = s.active;
-      return `<div class="card">
-        <div class="name">${s.strategy_id}
+      const positions = stratPos[sid] || {};
+      const costs = stratCost[sid] || {};
+      const held = Object.entries(positions).filter(([, q]) => q !== 0);
+      const expanded = _expandedStrategies.has(sid);
+      const holdingsHtml = expanded
+        ? `<div class="strat-holdings">${held.length === 0
+            ? '<div class="strat-flat">flat</div>'
+            : '<table class="strat-table"><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th></tr></thead><tbody>'
+              + held.map(([sym, qty]) => {
+                  const cost = costs[sym];
+                  return `<tr><td>${sym}</td><td class="${signClass(qty)}">${num(qty)}</td><td class="dim">${cost ? "$" + num(cost, 2) : "—"}</td></tr>`;
+                }).join("")
+              + '</tbody></table>'
+          }</div>`
+        : '';
+      return `<div class="card strat-card${expanded ? ' expanded' : ''}" onclick="toggleStrategy('${sid}')">
+        <div class="name">${sid}
           <span class="pill ${active ? "ok" : "bad"}">${active ? "active" : "HALTED"}</span></div>
         <div class="row"><span>allocation</span><span>${money(s.capital_allocation)}</span></div>
         <div class="row"><span>max drawdown</span><span>${(s.max_drawdown * 100).toFixed(0)}%</span></div>
         <div class="row"><span>realized P&amp;L</span><span class="${signClass(p)}">${money(p)}</span></div>
+        <div class="row"><span>holdings</span><span class="dim">${held.length === 0 ? "flat" : held.length + " name" + (held.length > 1 ? "s" : "")}</span></div>
+        ${holdingsHtml}
       </div>`;
     }).join("") + `</div>`;
   });

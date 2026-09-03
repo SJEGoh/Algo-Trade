@@ -212,7 +212,10 @@ def get_positions():
         "current_positions": dict(executor.ledger.current_positions),
         "strategy_positions": {
             sid: dict(pos) for sid, pos in executor.ledger.strategy_positions.items()
-        }
+        },
+        "strategy_avg_cost": {
+            sid: dict(costs) for sid, costs in executor.ledger.strategy_avg_cost.items()
+        },
     }
 
 @app.get("/pnl")

@@ -24,11 +24,9 @@ BASE = os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000")
 KEY = os.environ.get("EXECUTOR_API_KEY")
 STRATEGY_ID = "kalman_rrg_combined"
 
-UNIVERSE = ["NVDA", "AMD", "AVGO", "MU", "AMZN", "META", "GOOGL", "MSFT", "ORCL", "TSLA",
-            "PLTR", "CRWD", "PANW", "FTNT", "SNOW", "ARM", "ANET", "MRVL", "TSM", "ASML",
-            "APP", "UBER", "ABNB", "SHOP", "MELI", "NFLX", "COIN", "HOOD", "RDDT", "DDOG",
-            "NET", "ZS", "OKTA", "HUBS", "NOW", "CRM", "ADBE", "INTU", "KLAC", "LRCX",
-            "AMAT", "QCOM", "TXN", "ON", "MCHP", "NXPI", "CDNS", "SNPS", "VRT", "SMCI"]
+UNIVERSE = [                  # cleaned cross-asset "combination B"
+    "SPY", "TLT", "GLD", "VEA", "EEM", "VNQ", "DBC", "SLV", "LQD", "HYG", "SHY", "IEF",
+]
 
 
 if __name__ == "__main__":
