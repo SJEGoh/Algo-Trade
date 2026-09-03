@@ -108,9 +108,11 @@ class ExecutionLayer:
         transformed["metadata"] = dict(intent.get("metadata", {}))
         transformed["metadata"][self.METADATA_KEY] = self._build_metadata(
             symbol, price, limit_price, is_buy)
-        logger.info("%s: %s %s market@%.2f -> limit@%.2f",
-                    self.__class__.__name__, "BUY" if is_buy else "SELL",
-                    symbol, price, limit_price)
+        atr_val = self._get_cached(symbol)
+        logger.info("ATR TRANSFORM: %s %s market@%.2f -> limit@%.2f  (ATR=%.4f, fraction=%.2f, offset=%.2f, bar=%s)",
+                    "BUY" if is_buy else "SELL", symbol, price, limit_price,
+                    atr_val or 0.0, self.atr_fraction,
+                    abs(price - limit_price), getattr(self, 'bar_size', '?'))
         return transformed
 
     def record_order(self, order_id: int) -> None:
