@@ -51,6 +51,11 @@
   .strat-table { font-size:12px; }
   .strat-table th { font-size:10px; padding:3px 8px; }
   .strat-table td { padding:3px 8px; }
+  .eq-btn { background:var(--bg); color:var(--muted); border:1px solid var(--border);
+            border-radius:4px; padding:2px 8px; font-size:11px; cursor:pointer;
+            font-family:inherit; line-height:1.4; }
+  .eq-btn.active { background:var(--accent); color:#0e1116; border-color:var(--accent); font-weight:600; }
+  .eq-btn:hover:not(.active) { border-color:var(--muted); }
   details { border-top:1px solid var(--border); }
   details > summary { cursor:pointer; padding:10px 14px; color:var(--muted); font-size:12px;
                       font-weight:600; text-transform:uppercase; letter-spacing:.8px;
@@ -73,7 +78,16 @@
 </header>
 
 <main>
-  <section><h2>Equity Curve (total)</h2><div class="body"><div id="equity" style="padding:8px"></div></div></section>
+  <section>
+    <h2 style="display:flex;align-items:center;justify-content:space-between">
+      <span>Equity Curve</span>
+      <span style="display:flex;gap:8px;align-items:center">
+        <span id="eq-tf" style="display:flex;gap:2px"></span>
+        <span id="eq-mode" style="display:flex;gap:2px"></span>
+      </span>
+    </h2>
+    <div class="body"><div id="equity" style="padding:8px"></div></div>
+  </section>
   <section><h2>Strategies</h2><div class="body" id="strategies"></div></section>
   <section>
     <h2>Positions</h2>
@@ -235,7 +249,7 @@ function renderOpenOrders() {
 
 function renderRecentFills() {
   panel("recent-fills", () => {
-    const rows = ((state.data.fills?.fills) || []).slice(0, 5);
+    const rows = ((state.data.fills?.fills) || []).filter(f => _isVisible(f.strategy_id)).slice(0, 5);
     const slip = (f) => {
       if (f.expected_price == null) return null;
       const sign = f.side === "BOT" ? 1 : -1;
@@ -292,7 +306,7 @@ function renderOrders() {
 
 function renderFills() {
   panel("fills", () => {
-    const rows = (state.data.fills?.fills) || [];
+    const rows = ((state.data.fills?.fills) || []).filter(f => _isVisible(f.strategy_id));
     const slip = (f) => {
       if (f.expected_price == null) return null;
       const sign = f.side === "BOT" ? 1 : -1;          // +ve = worse than expected
@@ -318,32 +332,95 @@ function renderFills() {
 
 let uplot = null;
 const PALETTE = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf"];
+
+// Equity chart state
+let _eqMode = "dollar";   // "dollar" | "pct"
+let _eqTF = "all";        // "1d" | "1w" | "1m" | "all"
+
+function _setEqMode(m) { _eqMode = m; _rebuildEquity(); _renderEqControls(); }
+function _setEqTF(tf) { _eqTF = tf; _rebuildEquity(); _renderEqControls(); }
+
+function _renderEqControls() {
+  const tfBox = el("eq-tf");
+  const modeBox = el("eq-mode");
+  if (!tfBox || !modeBox) return;
+  const tfs = [["1d","1D"],["1w","1W"],["1m","1M"],["all","All"]];
+  tfBox.innerHTML = tfs.map(([v,l]) =>
+    `<button class="eq-btn${_eqTF===v?" active":""}" onclick="_setEqTF('${v}')">${l}</button>`
+  ).join("");
+  const modes = [["dollar","$"],["pct","%"]];
+  modeBox.innerHTML = modes.map(([v,l]) =>
+    `<button class="eq-btn${_eqMode===v?" active":""}" onclick="_setEqMode('${v}')">${l}</button>`
+  ).join("");
+}
+
+function _filterByTimeframe(rows) {
+  if (_eqTF === "all" || !rows.length) return rows;
+  const now = Date.now();
+  const cutoffs = { "1d": 24*3600*1000, "1w": 7*24*3600*1000, "1m": 30*24*3600*1000 };
+  const cutoff = now - (cutoffs[_eqTF] || Infinity);
+  return rows.filter(r => Date.parse(r.ts) >= cutoff);
+}
+
+function _rebuildEquity() {
+  // Force chart rebuild on next render
+  if (uplot) { uplot.destroy(); uplot = null; }
+  renderEquity();
+}
+
 function renderEquity() {
   const box = el("equity");
+  _renderEqControls();
   try {
     if (typeof uPlot === "undefined") {
       box.innerHTML = `<div class="err">uPlot failed to load (CDN blocked?)</div>`; return;
     }
-    const rows = ((state.data.equityhist?.history) || []).filter(r => _isVisible(r.strategy_id));
+    let rows = ((state.data.equityhist?.history) || []).filter(r => _isVisible(r.strategy_id));
+    rows = _filterByTimeframe(rows);
     if (!rows.length) { box.innerHTML = `<div class="empty">no snapshots yet</div>`; return; }
     const ts = [...new Set(rows.map(r => r.ts))].sort();
     const strats = [...new Set(rows.map(r => r.strategy_id))].filter(_isVisible).sort();
     const byTs = {}; rows.forEach(r => (byTs[r.ts] ??= {})[r.strategy_id] = r.equity);
     const x = ts.map(t => Date.parse(t) / 1000);
-    const overall = ts.map(t => strats.reduce((s, st) => s + (byTs[t][st] ?? 0), 0));
-    const data = [x, overall, ...strats.map(st => ts.map(t => byTs[t][st] ?? null))];
+    let overall = ts.map(t => strats.reduce((s, st) => s + (byTs[t][st] ?? 0), 0));
+    let perStrat = strats.map(st => ts.map(t => byTs[t][st] ?? null));
+
+    // Percentage mode: convert to % return from first data point
+    let yLabel = "$";
+    if (_eqMode === "pct") {
+      yLabel = "%";
+      const base = overall[0] || 1;
+      overall = overall.map(v => ((v - base) / Math.abs(base)) * 100);
+      perStrat = perStrat.map(arr => {
+        const b = arr.find(v => v !== null);
+        if (b == null || b === 0) return arr;
+        return arr.map(v => v === null ? null : ((v - b) / Math.abs(b)) * 100);
+      });
+    }
+
+    const data = [x, overall, ...perStrat];
     if (!uplot) {
-      box.innerHTML = "";  // clear any placeholder text before mounting the chart
-      const series = [{}, { label: "OVERALL", stroke: "#e6edf3", width: 2 },
+      box.innerHTML = "";
+      const series = [{}, { label: "TOTAL", stroke: "#e6edf3", width: 2 },
         ...strats.map((st, i) => ({ label: st, stroke: PALETTE[i % PALETTE.length], width: 1 }))];
-      uplot = new uPlot({ width: box.clientWidth || 900, height: 260, series,
-        axes: [{ stroke: "#8b949e" }, { stroke: "#8b949e" }] }, data, box);
+      const fmtVal = _eqMode === "pct"
+        ? (self, v) => v == null ? "—" : v.toFixed(1) + "%"
+        : (self, v) => v == null ? "—" : "$" + Number(v).toLocaleString(undefined, {maximumFractionDigits:0});
+      uplot = new uPlot({
+        width: box.clientWidth || 900, height: 260, series,
+        axes: [
+          { stroke: "#8b949e" },
+          { stroke: "#8b949e", values: (u, vals) => vals.map(v =>
+            _eqMode === "pct" ? v.toFixed(1)+"%" : "$"+Number(v).toLocaleString(undefined,{maximumFractionDigits:0})
+          )}
+        ],
+      }, data, box);
     } else {
       uplot.setData(data);
     }
   } catch (e) {
     box.innerHTML = `<div class="err">equity render error: ${e.message}</div>`;
-    uplot = null;  // allow a clean re-mount on the next poll
+    uplot = null;
   }
 }
 
