@@ -210,8 +210,9 @@ class NettingCoordinator:
         return crosses
 
     # ---------------- rebalance to net ----------------
-    def _rebalance(self, symbols):
+    def _rebalance(self, symbols, urgent: bool = False):
         """Cross internally first, then send residual net delta to IB.
+        urgent=True skips ATR (used by flatten / kill_switch).
         Returns {"orders": [...], "internal_crosses": [...]}."""
         crosses = self._internal_cross(symbols)
         net = self.net()
@@ -224,7 +225,7 @@ class NettingCoordinator:
             delta = target - self.ex.ledger.effective_position(sym)
             if abs(delta) < _EPS:
                 continue
-            oid = self.ex.place_net_order(sym, delta, self.instrument.get(sym), self.ref_price.get(sym))
+            oid = self.ex.place_net_order(sym, delta, self.instrument.get(sym), self.ref_price.get(sym), urgent=urgent)
             placed.append({"symbol": sym, "delta": delta, "order_id": oid})
         return {"orders": placed, "internal_crosses": crosses}
 

@@ -320,7 +320,7 @@ class CentralExecutor(EClient, EWrapper):
         }
         return order_id
 
-    def place_net_order(self, symbol: str, delta: float, instrument: dict, ref_price):
+    def place_net_order(self, symbol: str, delta: float, instrument: dict, ref_price, urgent: bool = False):
         """Pooled net order (coordinator path): trade the whole net delta for a symbol
         under the synthetic '__net__' strategy. Pending is tracked at the NET level via
         record_net_pending (NOT per-strategy); the fill is decomposed into per-strategy
@@ -341,7 +341,9 @@ class CentralExecutor(EClient, EWrapper):
             "expected_price": ref_price,
         }
         # --- ATR execution layer: transform market -> limit-at-pullback ---
-        intent = self.atr_layer.transform(intent)
+        # Skip ATR for urgent orders (flatten / kill_switch) — must close at market
+        if not urgent:
+            intent = self.atr_layer.transform(intent)
 
         if instrument.get("sec_type", "STK") == "FUT":
             contract = self.get_future_contract(
@@ -984,7 +986,7 @@ class CentralExecutor(EClient, EWrapper):
                     all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
                 self.coordinator._save()
                 if all_syms:
-                    self.coordinator._rebalance(all_syms)
+                    self.coordinator._rebalance(all_syms, urgent=True)
             else:
                 # No coordinator: flatten each strategy directly
                 for sid, positions in list(self.ledger.strategy_positions.items()):

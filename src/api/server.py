@@ -283,7 +283,7 @@ def flatten_all():
             all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
         executor.coordinator._save()
         if all_syms:
-            executor.coordinator._rebalance(all_syms)
+            executor.coordinator._rebalance(all_syms, urgent=True)
     else:
         # No coordinator: flatten each strategy directly
         for sid, positions in list(executor.ledger.strategy_positions.items()):
