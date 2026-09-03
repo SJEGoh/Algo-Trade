@@ -130,8 +130,8 @@ GLOBAL = {
 ATR_EXECUTION = {
     "enabled": True,                 # flip to True to activate
     "atr_period": 14,                 # ATR lookback in intraday bars
-    "atr_fraction": 1.0,             # limit = price - fraction * ATR
-    "bar_size": "15 mins",            # IBKR bar size (e.g. "1 min", "5 mins", "15 mins")
+    "atr_fraction": 0.5,             # limit = price - fraction * ATR
+    "bar_size": "5 mins",            # IBKR bar size (e.g. "1 min", "5 mins", "15 mins")
     "duration": "2 D",               # IBKR lookback duration (must cover atr_period+1 bars)
     "cache_ttl_sec": 300,            # ATR cache lifetime (seconds)
     "strategies": [],                # apply to these strategy_ids; [] = all
