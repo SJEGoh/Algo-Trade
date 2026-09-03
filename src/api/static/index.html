@@ -219,7 +219,7 @@ function renderPositions() {
 function renderOpenOrders() {
   panel("open-orders", () => {
     const rows = ((state.data.orders?.orders) || [])
-      .filter(r => (r.status === "Submitted" || r.status === "PreSubmitted") && _isVisible(r.strategy_id))
+      .filter(r => r.status === "Submitted" || r.status === "PreSubmitted")
       .sort((a, b) => b.order_id - a.order_id);
     return table([
       { label: "ID", get: r => r.order_id },
