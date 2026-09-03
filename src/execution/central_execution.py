@@ -250,9 +250,14 @@ class CentralExecutor(EClient, EWrapper):
             req_id = self._mkt_data_req_id
             self._paper_mkt_subs[symbol] = req_id
             self._paper_mkt_refcount[symbol] = 1
+        # Accept delayed/frozen data — paper account may not have live subscriptions,
+        # but the fill simulator still works with delayed data flowing
+        self.reqMarketDataType(4)
         # snapshot=False -> streaming; keeps the fill simulator active for this symbol
         self.reqMktData(req_id, contract, "", False, False, [])
         logger.debug("paper fill sub: started streaming mkt data for %s (reqId=%d)", symbol, req_id)
+        # Restore to type 3 for other callers (snapshot price fetches)
+        self.reqMarketDataType(3)
 
     def _paper_unsubscribe(self, symbol: str) -> None:
         """Decrement the refcount and cancel the streaming sub when no pending orders remain."""
