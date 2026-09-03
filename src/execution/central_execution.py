@@ -340,6 +340,9 @@ class CentralExecutor(EClient, EWrapper):
             "time_in_force": "day",
             "expected_price": ref_price,
         }
+        # --- ATR execution layer: transform market -> limit-at-pullback ---
+        intent = self.atr_layer.transform(intent)
+
         if instrument.get("sec_type", "STK") == "FUT":
             contract = self.get_future_contract(
                 sym, exchange=instrument.get("exchange", "NYMEX"),
@@ -354,6 +357,9 @@ class CentralExecutor(EClient, EWrapper):
         self.placeOrder(order_id, contract, order)
         self.logger_db.log_order(order_id, intent)
         self._paper_subscribe(sym, contract)
+        # track ATR-placed limit orders for EOD cancel sweep
+        if intent.get("metadata", {}).get("atr_execution"):
+            self.atr_layer.record_order(order_id)
 
         _mult = float(instrument.get("multiplier") or 1.0)
         self._multipliers[sym] = _mult
