@@ -133,6 +133,9 @@ class CentralExecutor(EClient, EWrapper):
         self._price_results: Dict[int, float] = {}                   # reqId -> price received
         self._price_req_lock = threading.Lock()
         self._mkt_data_req_id = 9000       
+        # Paper fill helper: streaming mkt data subs that keep the paper fill engine alive
+        self._paper_mkt_subs: Dict[str, int] = {}   # symbol -> reqId of active streaming sub
+        self._paper_mkt_refcount: Dict[str, int] = {}  # symbol -> count of pending orders
 
         self._open_orders_ready = threading.Event()                           # base, kept away from order IDs
 
@@ -232,6 +235,38 @@ class CentralExecutor(EClient, EWrapper):
         order.firmQuoteOnly = False
         return order
 
+    # ------------------------------------------------------------------
+    # Paper fill helper: streaming market data to wake the fill simulator
+    # ------------------------------------------------------------------
+    def _paper_subscribe(self, symbol: str, contract) -> None:
+        """Start a streaming market data subscription for a symbol if one isn't
+        already active. The paper trading engine only simulates fills when
+        market data is flowing for that symbol."""
+        with self._price_req_lock:
+            if symbol in self._paper_mkt_subs:
+                self._paper_mkt_refcount[symbol] = self._paper_mkt_refcount.get(symbol, 0) + 1
+                return
+            self._mkt_data_req_id += 1
+            req_id = self._mkt_data_req_id
+            self._paper_mkt_subs[symbol] = req_id
+            self._paper_mkt_refcount[symbol] = 1
+        # snapshot=False -> streaming; keeps the fill simulator active for this symbol
+        self.reqMktData(req_id, contract, "", False, False, [])
+        logger.debug("paper fill sub: started streaming mkt data for %s (reqId=%d)", symbol, req_id)
+
+    def _paper_unsubscribe(self, symbol: str) -> None:
+        """Decrement the refcount and cancel the streaming sub when no pending orders remain."""
+        with self._price_req_lock:
+            count = self._paper_mkt_refcount.get(symbol, 0) - 1
+            if count > 0:
+                self._paper_mkt_refcount[symbol] = count
+                return
+            self._paper_mkt_refcount.pop(symbol, None)
+            req_id = self._paper_mkt_subs.pop(symbol, None)
+        if req_id is not None:
+            self.cancelMktData(req_id)
+            logger.debug("paper fill sub: cancelled streaming mkt data for %s (reqId=%d)", symbol, req_id)
+
     def place_order(self, intent: dict) -> int:
         instrument = intent["instrument"]
         if instrument.get("sec_type", "STK") == "FUT":
@@ -247,6 +282,7 @@ class CentralExecutor(EClient, EWrapper):
         order_id = self.get_next_order_id()
         self.placeOrder(order_id, contract, order)
         self.logger_db.log_order(order_id, intent)
+        self._paper_subscribe(instrument["symbol"], contract)
         signed_qty = intent["quantity"] if intent["side"] == "buy" else -intent["quantity"]
         symbol = instrument["symbol"]
 
@@ -307,6 +343,7 @@ class CentralExecutor(EClient, EWrapper):
         order_id = self.get_next_order_id()
         self.placeOrder(order_id, contract, order)
         self.logger_db.log_order(order_id, intent)
+        self._paper_subscribe(sym, contract)
 
         _mult = float(instrument.get("multiplier") or 1.0)
         self._multipliers[sym] = _mult
@@ -340,6 +377,11 @@ class CentralExecutor(EClient, EWrapper):
                 "remaining": remaining, "avg_fill_price": avgFillPrice,
             })
             self.logger_db.update_order_status(orderId, status)
+            # Cancel the paper-fill streaming sub once the order is done
+            if status in ("Filled", "Cancelled", "Inactive"):
+                sym = self.order_status[orderId].get("symbol")
+                if sym:
+                    self._paper_unsubscribe(sym)
         logger.debug("OrderStatus - id:%s status:%s filled:%s remaining:%s", orderId, status, filled, remaining)
 
     # ------------------------------------------------------------------
