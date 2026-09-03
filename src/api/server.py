@@ -255,15 +255,10 @@ def flatten_all():
                 pass
 
     # 2. flatten per-strategy so fills attribute to the correct strategy
-    # Zero out the coordinator's desired books so it won't re-trade
-    if getattr(executor, "coordinator", None) is not None:
-        for sid in list(executor.coordinator.desired):
-            executor.coordinator.desired[sid] = {}
-        executor.coordinator._save()
-
-    # Flatten each strategy's positions individually (skip internal pseudo-strategies)
     _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
     flattened = []
+
+    # Collect what we're about to flatten (for the response)
     for sid, positions in list(executor.ledger.strategy_positions.items()):
         if sid in _INTERNAL:
             continue
@@ -271,8 +266,41 @@ def flatten_all():
             if abs(qty) < 1e-9:
                 continue
             flattened.append({"strategy_id": sid, "symbol": symbol, "qty": qty})
-        if any(abs(q) > 1e-9 for q in positions.values()):
-            executor._flatten_direct(sid)
+
+    if getattr(executor, "coordinator", None) is not None:
+        # Coordinator path: zero out desired books and rebalance — the coordinator
+        # internally crosses offsetting legs and sends net residual to IB.  Fills
+        # flow back through attribute_fill, correctly updating each strategy.
+        all_syms = set()
+        for sid in list(executor.coordinator.desired):
+            all_syms |= set(executor.coordinator.desired[sid])
+            executor.coordinator.desired[sid] = {}
+        executor.coordinator._save()
+        if all_syms:
+            executor.coordinator._rebalance(all_syms)
+    else:
+        # No coordinator: flatten each strategy directly
+        for sid, positions in list(executor.ledger.strategy_positions.items()):
+            if sid in _INTERNAL:
+                continue
+            if any(abs(q) > 1e-9 for q in positions.values()):
+                executor._flatten_direct(sid)
+
+    # Clean up stale strategy positions for symbols already flat at the broker.
+    # This handles leftover state from before per-strategy attribution was added.
+    broker_flat = {s for s, q in executor.ledger.current_positions.items() if abs(q) < 1e-9}
+    cleaned = []
+    for sid, positions in list(executor.ledger.strategy_positions.items()):
+        if sid in _INTERNAL:
+            continue
+        for sym in list(positions):
+            if sym in broker_flat and abs(positions.get(sym, 0.0)) > 1e-9:
+                cleaned.append({"strategy_id": sid, "symbol": sym, "was": positions[sym]})
+                positions[sym] = 0.0
+                executor.ledger.strategy_avg_cost.get(sid, {})[sym] = 0.0
+    if cleaned:
+        executor.ledger.save_state(executor.logger_db)
+        logging.getLogger("executor").info("Flatten cleanup: zeroed stale strategy positions: %s", cleaned)
 
     _alert(
         f"💨 FLATTEN ALL: cancelled {len(cancelled)} orders, flattening {len(flattened)} positions (kill switch NOT set)",

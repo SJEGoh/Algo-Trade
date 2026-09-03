@@ -884,20 +884,23 @@ class CentralExecutor(EClient, EWrapper):
 
         # 2. optionally flatten every position — per-strategy so fills attribute correctly
         if flatten:
-            # Zero out the coordinator's desired books so it won't re-trade
+            _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
             if getattr(self, "coordinator", None) is not None:
+                # Coordinator path: zero desired books and rebalance to flat
+                all_syms = set()
                 for sid in list(self.coordinator.desired):
+                    all_syms |= set(self.coordinator.desired[sid])
                     self.coordinator.desired[sid] = {}
                 self.coordinator._save()
-            # Flatten each strategy's positions individually (skip internal pseudo-strategies)
-            _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
-            flattened_strats = set()
-            for sid, positions in list(self.ledger.strategy_positions.items()):
-                if sid in _INTERNAL:
-                    continue
-                if any(abs(q) > 1e-9 for q in positions.values()):
-                    self._flatten_direct(sid)
-                    flattened_strats.add(sid)
+                if all_syms:
+                    self.coordinator._rebalance(all_syms)
+            else:
+                # No coordinator: flatten each strategy directly
+                for sid, positions in list(self.ledger.strategy_positions.items()):
+                    if sid in _INTERNAL:
+                        continue
+                    if any(abs(q) > 1e-9 for q in positions.values()):
+                        self._flatten_direct(sid)
     
     def reconcile_and_log(self) -> dict:
         result = self.ledger.reconcile()
