@@ -174,6 +174,18 @@ def submit_book(body: dict):
         msg_parts.append(f"\U0001f4e6 IB: {order_summary}")
     if msg_parts:
         _alert(f"Book resync — {sid}:\n" + "\n".join(msg_parts), topic="orders")
+    # Journal: log every book resync with the order/cross summary
+    n_intents = len(intents)
+    n_orders = len(orders)
+    n_crosses = len(crosses)
+    summary = f"Book resync: {n_intents} intents, {n_orders} orders, {n_crosses} internal crosses"
+    syms = list({it.get("instrument", {}).get("symbol", "?") for it in intents})
+    import json as _json
+    executor.logger_db.log_decision(
+        sid, "rebalance", summary,
+        detail=_json.dumps({"orders": orders, "internal_crosses": crosses}, default=str),
+        symbols=syms,
+    )
     return result
 
 
@@ -252,6 +264,11 @@ def reactivate_strategy(strategy_id: str):
     if strategy_id not in CONFIG:
         raise HTTPException(status_code=404, detail=f"unknown strategy {strategy_id}")
     executor.risk_manager.reactivate_strategy(strategy_id)
+    # persist the reactivation so it survives a restart
+    executor.logger_db.save_halted_strategies(
+        set(), executor.risk_manager._active_strategies, set(CONFIG.keys()))
+    executor.logger_db.log_decision(strategy_id, "reactivate",
+                                    f"Strategy {strategy_id} reactivated via API")
     return {"strategy_id": strategy_id, "status": "active"}
 
 
@@ -353,6 +370,31 @@ def _equity_sampler(interval: float = 60.0):
         _sampler_stop.wait(interval)   # sleep, wakes early on stop
 
 
+class JournalEntry(BaseModel):
+    strategy_id: str
+    event_type: str
+    summary: str
+    detail: str = ""
+    symbols: list[str] = Field(default_factory=list)
+
+
+@app.post("/journal", dependencies=[Depends(require_api_key)])
+def post_journal(entry: JournalEntry):
+    """External journal entry — strategies log their signal/rebalance decisions here."""
+    executor.logger_db.log_decision(
+        entry.strategy_id, entry.event_type, entry.summary,
+        detail=entry.detail, symbols=entry.symbols,
+    )
+    return {"logged": True}
+
+
+@app.get("/journal")
+def get_journal(strategy: Optional[str] = None, event_type: Optional[str] = None,
+                since: Optional[str] = None, limit: int = 100):
+    return {"journal": executor.logger_db.get_journal(
+        strategy_id=strategy, event_type=event_type, since=since, limit=limit)}
+
+
 @app.get("/pnl/history")
 def pnl_history(strategy: Optional[str] = None, since: Optional[str] = None):
     return {"history": executor.logger_db.get_equity_history(strategy_id=strategy, since=since)}
@@ -364,3 +406,37 @@ def resolve_front(symbol: str, exchange: str = "NYMEX"):
     if r is None:
         raise HTTPException(status_code=404, detail=f"no front-month contract for {symbol}")
     return r
+
+
+# ---------------------------------------------------------------------------
+# ATR execution layer — EOD cancel sweep
+# ---------------------------------------------------------------------------
+@app.post("/atr/cancel", dependencies=[Depends(require_api_key)])
+def atr_cancel_unfilled():
+    """Cancel all unfilled limit orders placed by the ATR pullback layer.
+    Called by day_scheduler ~5 min before close."""
+    cancelled = []
+    for oid in executor.atr_layer.pending_order_ids():
+        status = executor.order_status.get(oid, {})
+        if status.get("status") in ("PreSubmitted", "Submitted"):
+            try:
+                executor.cancelOrder(oid)
+                cancelled.append(oid)
+                logger.info("ATR cancel: cancelled unfilled order %s (%s)", oid, status.get("symbol"))
+            except Exception as e:
+                logger.warning("ATR cancel: failed to cancel order %s: %s", oid, e)
+    executor.atr_layer.clear_tracked()
+    return {"cancelled": cancelled, "count": len(cancelled)}
+
+
+@app.get("/atr/status")
+def atr_status():
+    """Current ATR execution layer state."""
+    layer = executor.atr_layer
+    return {
+        "enabled": layer.enabled,
+        "atr_period": layer.atr_period,
+        "atr_fraction": layer.atr_fraction,
+        "pending_orders": len(layer.pending_order_ids()),
+        "cached_symbols": list(layer._cache.keys()),
+    }

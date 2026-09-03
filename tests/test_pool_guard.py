@@ -25,11 +25,16 @@ class FakeCoordinator:
         return {"accepted": True, "orders": []}
 
 
+class FakeLoggerDB:
+    def log_decision(self, *a, **kw): pass
+
+
 class FakeExecutor:
     def __init__(self):
         self._killed = False
         self._enforce_market_hours = True
         self.coordinator = FakeCoordinator()
+        self.logger_db = FakeLoggerDB()
 
 
 @pytest.fixture

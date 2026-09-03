@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, Literal
 
 from config import CONFIG, GLOBAL
+from config import ATR_EXECUTION
 
 import pandas_market_calendars as mcal
 from datetime import datetime, time as dtime
@@ -148,6 +149,10 @@ class CentralExecutor(EClient, EWrapper):
         self._daily_baseline: Optional[float] = None  # portfolio equity baseline for the circuit breaker
         self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
+
+        # ATR limit-at-pullback execution layer
+        from execution.atr_execution import AtrPullbackLayer
+        self.atr_layer = AtrPullbackLayer(ATR_EXECUTION)
     # ------------------------------------------------------------------
     # Contract builders
     # ------------------------------------------------------------------
@@ -344,6 +349,9 @@ class CentralExecutor(EClient, EWrapper):
         if self._killed:
             return {"accepted": False, "reason": "executor is in kill-switch state"}
 
+        # --- ATR execution layer: transform market -> limit-at-pullback ---
+        raw_intent = self.atr_layer.transform(raw_intent)
+
         try:
             intent = OrderIntent(**raw_intent)
         except Exception as e:
@@ -389,6 +397,9 @@ class CentralExecutor(EClient, EWrapper):
                                 "reason": f"pre-trade init margin {im:.0f} > cap {cap:.0f}"}
 
                 order_id = self.place_order(resolved_intent)
+                # track ATR-placed limit orders for EOD cancel sweep
+                if resolved_intent.get("metadata", {}).get("atr_execution"):
+                    self.atr_layer.record_order(order_id)
             except Exception as e:
                 del self._seen_client_order_ids[intent.client_order_id]
                 return {"accepted": False, "reason": str(e)}
@@ -545,6 +556,7 @@ class CentralExecutor(EClient, EWrapper):
             self._check_fill_sanity("__net__", contract.symbol, execution.price, order_info.get("expected_price"))
             for sid in list(self.coordinator.desired.keys()):
                 self.enforce_drawdown(sid, self.ledger.strategy_realized_pnl.get(sid, 0.0))
+            self.ledger.save_state(self.logger_db)  # persist after every fill
             logger.info("ExecDetails(net) - %s %s %s @ %s (attributed to %s)",
                         contract.symbol, execution.side, execution.shares, execution.price,
                         ", ".join(f"{sid}:{qty:+.1f}" for sid, qty in attributed))
@@ -559,6 +571,7 @@ class CentralExecutor(EClient, EWrapper):
         )
         self._check_fill_sanity(strategy_id, contract.symbol, execution.price, order_info.get("expected_price"))
         self.enforce_drawdown(strategy_id, self.ledger.strategy_realized_pnl.get(strategy_id, 0.0))  # halt+flatten on breach
+        self.ledger.save_state(self.logger_db)  # persist after every fill
         logger.info("ExecDetails - %s %s %s @ %s", contract.symbol, execution.side, execution.shares, execution.price)
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
@@ -778,6 +791,10 @@ class CentralExecutor(EClient, EWrapper):
             return
         logger.critical(reason)                       # -> AlertingHandler pages Telegram
         self.risk_manager.halt_strategy(strat_id, reason)
+        # persist halt state so it survives a restart
+        self.logger_db.save_halted_strategies(
+            set(), self.risk_manager._active_strategies, set(CONFIG.keys()), reason)
+        self.logger_db.log_decision(strat_id, "halt", f"HALTED: {reason}")
         try:
             if self.coordinator is not None and strat_id in getattr(self.coordinator, "desired", {}):
                 self.coordinator.halt(strat_id)       # zero desired book + unwind (attributes to strat)
@@ -932,9 +949,28 @@ class CentralExecutor(EClient, EWrapper):
         if not self._order_id_ready.wait(timeout=timeout):
             raise TimeoutError("Timed out waiting for nextValidId — connection may have failed")
         self.reqMarketDataType(3)
-        result = self.reconcile_and_log()      # ledger recovers positions
-        self.recover_open_orders()             # executor recovers open orders
+        result = self.reconcile_and_log()      # ledger recovers NET positions from broker
+        self.recover_open_orders()             # executor recovers open orders from IB
+        self._restore_persistent_state()       # restore per-strategy positions, P&L, halts
         return result
+
+    def _restore_persistent_state(self) -> None:
+        """Reload per-strategy positions, realized P&L, halted strategies and multipliers
+        from the SQLite database so the dashboard / risk manager have full state immediately."""
+        try:
+            self.ledger.restore_state(self.logger_db)
+        except Exception as e:
+            logger.error("failed to restore ledger state: %s", e)
+
+        # restore halted strategies
+        try:
+            halted = self.logger_db.load_halted_strategies()
+            for sid in halted:
+                if sid in self.risk_manager._active_strategies:
+                    self.risk_manager._active_strategies.discard(sid)
+                    logger.warning("restored halt for %s", sid)
+        except Exception as e:
+            logger.error("failed to restore halted strategies: %s", e)
         
     def shutdown(self, timeout: float = 5.0) -> None:
         """Cleanly tear down: disconnect from IB and wait for the socket thread to exit.

@@ -67,6 +67,10 @@ CONFIG = {
         "capital_allocation": 200_000.0,
         "max_drawdown": 0.15,
     },
+    "kalman_rrg_combined": {   # combined Kalman/RRG rotation (gated long-leg + naive risk parity)
+        "capital_allocation": 200_000.0,
+        "max_drawdown": 0.15,
+    },
     # --- halt-test strategies: tight 1% max_drawdown to exercise the drawdown -> halt path
     #     LIVE (RiskManager.check_drawdown -> halt_strategy -> is_active False -> subsequent
     #     orders rejected). Allocation fits one micro future (e.g. MCL ~$6.85k notional).
@@ -114,4 +118,21 @@ GLOBAL = {
     "auto_reconnect": True,
     "reconnect_max_attempts": 30,
     "reconnect_backoff_sec": 10.0,
+}
+
+
+# ---------------------------------------------------------------------------
+# ATR LIMIT-AT-PULLBACK execution layer.  When enabled, market-order intents
+# are converted to limit orders at  price - fraction * ATR(period).  The idea:
+# buy a little cheaper on a normal intraday pullback.  Unfilled orders are
+# cancelled before the close (POST /atr/cancel from day_scheduler).
+# ---------------------------------------------------------------------------
+ATR_EXECUTION = {
+    "enabled": False,                 # flip to True to activate
+    "atr_period": 14,                 # ATR lookback in daily bars
+    "atr_fraction": 0.5,             # limit = price - fraction * ATR
+    "cache_ttl_sec": 300,            # ATR cache lifetime (seconds)
+    "strategies": [],                # apply to these strategy_ids; [] = all
+    "skip_exits": True,              # never transform exit intents (target_qty == 0)
+    "cancel_before_close_min": 5,    # EOD cancel sweep (used by day_scheduler)
 }

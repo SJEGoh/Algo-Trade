@@ -70,6 +70,44 @@ class EventLogger:
                     equity      REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts);
+
+                -- Persistent strategy state: survives server restarts so the dashboard
+                -- shows positions / avg cost / realized P&L immediately.
+                CREATE TABLE IF NOT EXISTS strategy_state (
+                    strategy_id TEXT NOT NULL,
+                    symbol      TEXT NOT NULL,
+                    quantity    REAL NOT NULL,
+                    avg_cost    REAL NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    PRIMARY KEY (strategy_id, symbol)
+                );
+                CREATE TABLE IF NOT EXISTS strategy_pnl (
+                    strategy_id TEXT PRIMARY KEY,
+                    realized    REAL NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS halted_strategies (
+                    strategy_id TEXT PRIMARY KEY,
+                    halted_at   TEXT NOT NULL,
+                    reason      TEXT
+                );
+                CREATE TABLE IF NOT EXISTS strategy_multipliers (
+                    symbol     TEXT PRIMARY KEY,
+                    multiplier REAL NOT NULL
+                );
+
+                -- Trade/decision journal: every signal, weight, and rebalance decision
+                CREATE TABLE IF NOT EXISTS decision_journal (
+                    entry_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    event_type  TEXT NOT NULL,
+                    summary     TEXT,
+                    detail      TEXT,
+                    symbols     TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_journal_ts ON decision_journal(ts);
+                CREATE INDEX IF NOT EXISTS idx_journal_strat ON decision_journal(strategy_id);
             """)
             self._conn.commit()
 
@@ -190,6 +228,163 @@ class EventLogger:
             "VALUES (?, ?, ?, ?, ?)",
             (ts, strategy_id, realized, unrealized, equity),
         )
+
+    # ------------------------------------------------------------------
+    # Strategy state persistence (positions, avg cost, realized P&L, halts)
+    # ------------------------------------------------------------------
+    def save_strategy_positions(self, strategy_positions: dict, strategy_avg_cost: dict) -> None:
+        """Atomically snapshot all per-strategy positions + avg costs."""
+        now = self._now()
+        try:
+            with self._lock:
+                self._conn.execute("DELETE FROM strategy_state")
+                for sid, positions in strategy_positions.items():
+                    costs = strategy_avg_cost.get(sid, {})
+                    for sym, qty in positions.items():
+                        if qty != 0.0:
+                            self._conn.execute(
+                                "INSERT INTO strategy_state (strategy_id, symbol, quantity, avg_cost, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (sid, sym, qty, costs.get(sym, 0.0), now),
+                            )
+                self._conn.commit()
+        except Exception as e:
+            logger.error("save_strategy_positions failed: %s", e)
+
+    def save_realized_pnl(self, strategy_realized_pnl: dict) -> None:
+        now = self._now()
+        try:
+            with self._lock:
+                self._conn.execute("DELETE FROM strategy_pnl")
+                for sid, pnl in strategy_realized_pnl.items():
+                    self._conn.execute(
+                        "INSERT INTO strategy_pnl (strategy_id, realized, updated_at) VALUES (?, ?, ?)",
+                        (sid, pnl, now),
+                    )
+                self._conn.commit()
+        except Exception as e:
+            logger.error("save_realized_pnl failed: %s", e)
+
+    def save_halted_strategies(self, halted: set, active: set, config_keys: set, reason: str = "") -> None:
+        """Save which strategies are halted (= in config but NOT in the active set)."""
+        now = self._now()
+        try:
+            with self._lock:
+                self._conn.execute("DELETE FROM halted_strategies")
+                for sid in config_keys - active:
+                    self._conn.execute(
+                        "INSERT INTO halted_strategies (strategy_id, halted_at, reason) VALUES (?, ?, ?)",
+                        (sid, now, reason),
+                    )
+                self._conn.commit()
+        except Exception as e:
+            logger.error("save_halted_strategies failed: %s", e)
+
+    def save_multipliers(self, multipliers: dict) -> None:
+        try:
+            with self._lock:
+                self._conn.execute("DELETE FROM strategy_multipliers")
+                for sym, mult in multipliers.items():
+                    if mult != 1.0:
+                        self._conn.execute(
+                            "INSERT INTO strategy_multipliers (symbol, multiplier) VALUES (?, ?)",
+                            (sym, mult),
+                        )
+                self._conn.commit()
+        except Exception as e:
+            logger.error("save_multipliers failed: %s", e)
+
+    def load_strategy_positions(self) -> tuple:
+        """Returns (strategy_positions, strategy_avg_cost) dicts."""
+        positions = {}
+        avg_cost = {}
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id, symbol, quantity, avg_cost FROM strategy_state"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_strategy_positions failed: %s", e)
+            return positions, avg_cost
+        for sid, sym, qty, cost in rows:
+            positions.setdefault(sid, {})[sym] = qty
+            avg_cost.setdefault(sid, {})[sym] = cost
+        return positions, avg_cost
+
+    def load_realized_pnl(self) -> dict:
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id, realized FROM strategy_pnl"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_realized_pnl failed: %s", e)
+            return {}
+        return {sid: pnl for sid, pnl in rows}
+
+    def load_halted_strategies(self) -> set:
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id FROM halted_strategies"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_halted_strategies failed: %s", e)
+            return set()
+        return {row[0] for row in rows}
+
+    def load_multipliers(self) -> dict:
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT symbol, multiplier FROM strategy_multipliers"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_multipliers failed: %s", e)
+            return {}
+        return {sym: mult for sym, mult in rows}
+
+    # ------------------------------------------------------------------
+    # Trade / decision journal
+    # ------------------------------------------------------------------
+    def log_decision(self, strategy_id: str, event_type: str,
+                     summary: str, detail: str = "", symbols: list = None) -> None:
+        """Append one entry to the decision journal.
+        event_type examples: 'signal', 'rebalance', 'internal_cross', 'halt', 'reactivate'.
+        detail is a JSON string (or free text) with the full context; symbols is a
+        comma-separated list of tickers involved."""
+        import json as _json
+        sym_str = ",".join(symbols) if symbols else None
+        # Truncate detail to 10 KB to avoid bloating the DB with huge signal dumps
+        if isinstance(detail, dict):
+            detail = _json.dumps(detail, default=str)
+        if detail and len(detail) > 10_000:
+            detail = detail[:10_000] + "...(truncated)"
+        self._execute(
+            "INSERT INTO decision_journal (ts, strategy_id, event_type, summary, detail, symbols) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (self._now(), strategy_id, event_type, summary, detail, sym_str),
+        )
+
+    def get_journal(self, strategy_id: str = None, event_type: str = None,
+                    since: str = None, limit: int = 100) -> list:
+        """Query the decision journal with optional filters."""
+        q = "SELECT entry_id, ts, strategy_id, event_type, summary, detail, symbols FROM decision_journal"
+        conds, params = [], []
+        if strategy_id: conds.append("strategy_id = ?"); params.append(strategy_id)
+        if event_type:  conds.append("event_type = ?");  params.append(event_type)
+        if since:       conds.append("ts >= ?");         params.append(since)
+        if conds: q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY entry_id DESC LIMIT ?"
+        params.append(limit)
+        try:
+            with self._lock:
+                rows = self._conn.execute(q, tuple(params)).fetchall()
+        except Exception as e:
+            logger.error("get_journal failed: %s", e)
+            return []
+        cols = ["entry_id", "ts", "strategy_id", "event_type", "summary", "detail", "symbols"]
+        return [dict(zip(cols, r)) for r in rows]
 
     def get_equity_history(self, strategy_id=None, since=None) -> list:
         q = "SELECT ts, strategy_id, realized, unrealized, equity FROM equity_snapshots"

@@ -20,6 +20,10 @@ class FakeLoggerDB:
             "strategy_id": strategy_id, "expected_price": expected_price,
         })
 
+    def save_strategy_positions(self, *a, **kw): pass
+    def save_realized_pnl(self, *a, **kw): pass
+    def save_multipliers(self, *a, **kw): pass
+
 
 class FakeExecutor:
     def __init__(self, config):

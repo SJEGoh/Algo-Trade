@@ -54,6 +54,7 @@ ENABLE = {
     "ovn_volsurge": True,   # overnight vol-surge — exit at the open, enter near the close
     "orb_breakout": True,   # intraday opening-range breakout — every ORB_EVERY_MIN
     "vecm":         True,   # Kalman VECM (futures) — once after the close
+    "rrg":          True,   # Kalman/RRG combined rotation — weekly rebalance, Thursday EOD
 }
 ORB_EVERY_MIN = 30              # cadence of the ORB runner through the session
 ORB_START_AFTER_OPEN_MIN = 30   # wait for the opening range to form before the first ORB
@@ -62,6 +63,10 @@ ENTER_BEFORE_CLOSE_MIN = 2      # ovn_volsurge enter, near the close (today's vo
 EXIT_AFTER_OPEN_MIN = 60         # ovn_volsurge exit, at the open
 VECM_AFTER_CLOSE_MIN = 5        # VECM EOD run, after the close
 ORB_STOP_BEFORE_CLOSE_MIN = 15  # last ORB fire this long before the close
+RRG_BEFORE_CLOSE_MIN = 10       # Kalman/RRG rotation rebalance, Thursday only, before close
+PREMARKET_BEFORE_OPEN_MIN = 30  # Telegram briefing before the open
+POSTMARKET_AFTER_CLOSE_MIN = 10 # Telegram summary after the close
+ATR_CANCEL_BEFORE_CLOSE_MIN = 5 # cancel unfilled ATR limit orders before close
 RECONCILE_EVERY_MIN = 60        # POST /reconcile this often through the session (0 disables)
 GRACE_MIN = 10                  # run an event up to this late; older -> skip
 
@@ -84,6 +89,12 @@ def build_events(o, c):
     kind='reconcile' -> payload is None (POST /reconcile)."""
     ev = []
     R = lambda name: str(_ROOT / name)
+    T = lambda name: str(_ROOT / "tools" / name)
+
+    # Pre-market briefing (before any strategy fires)
+    ev.append((o - timedelta(minutes=PREMARKET_BEFORE_OPEN_MIN),
+               "pre-market Telegram briefing", "run", [T("premarket_briefing.py")]))
+
     if ENABLE["ovn_volsurge"]:
         ev.append((o + timedelta(minutes=EXIT_AFTER_OPEN_MIN),
                    "ovn_volsurge exit (flatten overnight book)", "run",
@@ -103,9 +114,20 @@ def build_events(o, c):
         ev.append((c - timedelta(minutes=ENTER_BEFORE_CLOSE_MIN),
                    "ovn_volsurge enter (buy volume-surge names for overnight)", "run",
                    [R("run_equity.py"), "ovn_volsurge", "enter"]))
+    if ENABLE["rrg"] and o.weekday() == 3:  # Thursday only
+        ev.append((c - timedelta(minutes=RRG_BEFORE_CLOSE_MIN),
+                   "rrg rotation weekly rebalance (Thursday EOD)", "run",
+                   [R("run_rrg.py")]))
+    # ATR pullback: cancel unfilled limit orders before close
+    ev.append((c - timedelta(minutes=ATR_CANCEL_BEFORE_CLOSE_MIN),
+               "ATR cancel unfilled limit orders", "atr_cancel", None))
     if ENABLE["vecm"]:
         ev.append((c + timedelta(minutes=VECM_AFTER_CLOSE_MIN),
                    "VECM EOD run", "run", [R("run_vecm.py")]))
+    # Post-market briefing (after strategies finish, before reconcile)
+    ev.append((c + timedelta(minutes=POSTMARKET_AFTER_CLOSE_MIN),
+               "post-market Telegram summary", "run", [T("postmarket_briefing.py")]))
+
     if RECONCILE_EVERY_MIN > 0:
         t = o + timedelta(minutes=RECONCILE_EVERY_MIN)
         while t < c:
@@ -145,6 +167,21 @@ def run_event(label, cmd):
         print("    !! timed out after 300s")
     except Exception as e:
         print(f"    !! error: {e}")
+
+
+def run_atr_cancel():
+    stamp = datetime.now(ET).strftime("%H:%M:%S")
+    print(f"\n[{stamp} ET] ▶ ATR cancel unfilled limit orders")
+    try:
+        r = requests.post(f"{BASE}/atr/cancel", headers={"X-API-Key": KEY}, timeout=30)
+        j = r.json()
+        n = j.get("count", 0)
+        if n:
+            print(f"    cancelled {n} unfilled ATR limit order(s)")
+        else:
+            print("    no unfilled ATR orders to cancel")
+    except Exception as e:
+        print(f"    !! ATR cancel error: {e}")
 
 
 def run_reconcile():
@@ -210,6 +247,8 @@ def main():
                 sleep_until(when)
             if kind == "reconcile":
                 run_reconcile()
+            elif kind == "atr_cancel":
+                run_atr_cancel()
             else:
                 run_event(label, payload)
         print(f"\n[{datetime.now(ET):%H:%M:%S} ET] day complete — all scheduled events done.")

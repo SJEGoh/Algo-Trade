@@ -116,6 +116,34 @@ class PositionLedger:
             self.current_positions = dict(broker)
         return {"matched": not discrepancies, "discrepancies": discrepancies}
 
+    # ------------------------------------------------------------------
+    # Persistence — save / restore strategy-level state across restarts
+    # ------------------------------------------------------------------
+    def save_state(self, logger_db) -> None:
+        """Persist per-strategy positions, avg costs, realized P&L, and multipliers
+        to the EventLogger's SQLite database. Called after every fill and periodically."""
+        with self._lock:
+            logger_db.save_strategy_positions(
+                dict(self.strategy_positions), dict(self.strategy_avg_cost)
+            )
+            logger_db.save_realized_pnl(dict(self.strategy_realized_pnl))
+            logger_db.save_multipliers(dict(self.multipliers))
+
+    def restore_state(self, logger_db) -> None:
+        """Reload per-strategy positions, avg costs, realized P&L, and multipliers
+        from the database. Called once at startup, AFTER reconcile has set
+        current_positions from the broker."""
+        positions, avg_cost = logger_db.load_strategy_positions()
+        realized = logger_db.load_realized_pnl()
+        multipliers = logger_db.load_multipliers()
+        with self._lock:
+            self.strategy_positions = positions
+            self.strategy_avg_cost = avg_cost
+            self.strategy_realized_pnl = realized
+            self.multipliers.update(multipliers)
+        logger.info("restored strategy state: %d strategies, %d symbols, %d multipliers",
+                    len(positions), sum(len(p) for p in positions.values()), len(multipliers))
+
     def equity_snapshot(self, marks: Dict[str, float]) -> Dict[str, dict]:
         """Per-strategy realized + unrealized (mark-to-market) + cumulative total.
         (mark - avg_cost) * qty is sign-correct for long and short. Missing mark

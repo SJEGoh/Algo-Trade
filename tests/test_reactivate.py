@@ -13,14 +13,22 @@ AUTH = {"X-API-Key": API_KEY}
 class FakeRM:
     def __init__(self):
         self.reactivated = []
+        self._active_strategies = set()
 
     def reactivate_strategy(self, sid):
         self.reactivated.append(sid)
+        self._active_strategies.add(sid)
+
+
+class FakeLoggerDB:
+    def save_halted_strategies(self, *a, **kw): pass
+    def log_decision(self, *a, **kw): pass
 
 
 class FakeExecutor:
     def __init__(self):
         self.risk_manager = FakeRM()
+        self.logger_db = FakeLoggerDB()
 
 
 @pytest.fixture

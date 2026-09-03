@@ -205,6 +205,8 @@ class NettingCoordinator:
             logger.info("InternalCross %s: crossed %.1f shares @ %.2f (%d buyers, %d sellers)",
                         sym, crossable, price, len(buyers), len(sellers))
 
+        if crosses:
+            self.ex.ledger.save_state(self.ex.logger_db)  # persist after internal crosses
         return crosses
 
     # ---------------- rebalance to net ----------------
