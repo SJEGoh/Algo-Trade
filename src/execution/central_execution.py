@@ -202,6 +202,23 @@ class CentralExecutor(EClient, EWrapper):
         self._order_id_ready.set()
         logger.info("Next valid order ID: %s", orderId)
 
+    def error(self, reqId: int, errorCode: int, errorString: str,
+              advancedOrderRejectJson: str = "") -> None:
+        """IB API error / warning callback. Logs everything; order-specific
+        errors (reqId matches an open order) are tagged so they stand out."""
+        if reqId in self.order_status:
+            sym = self.order_status[reqId].get("symbol", "?")
+            logger.error("IB ORDER ERROR  orderId=%s  sym=%s  code=%s  %s  %s",
+                         reqId, sym, errorCode, errorString,
+                         advancedOrderRejectJson or "")
+        elif errorCode in (2104, 2106, 2158):
+            # data-farm connection messages — informational
+            logger.debug("IB info  code=%s  %s", errorCode, errorString)
+        else:
+            logger.warning("IB error  reqId=%s  code=%s  %s  %s",
+                           reqId, errorCode, errorString,
+                           advancedOrderRejectJson or "")
+
     def get_next_order_id(self, timeout: float = 5.0) -> int:
         if not self._order_id_ready.wait(timeout=timeout):
             raise TimeoutError("Timed out waiting for nextValidId — did connect() actually succeed?")
