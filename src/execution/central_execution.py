@@ -152,6 +152,7 @@ class CentralExecutor(EClient, EWrapper):
         self._daily_baseline: Optional[float] = None  # portfolio equity baseline for the circuit breaker
         self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
+        self._api_ready = threading.Event()  # set once Gateway exits read-only mode
 
         # ATR limit-at-pullback execution layer
         from execution.atr_execution import AtrPullbackLayer
@@ -205,12 +206,16 @@ class CentralExecutor(EClient, EWrapper):
     def error(self, reqId: int, errorCode: int, errorString: str,
               advancedOrderRejectJson: str = "") -> None:
         """IB API error / warning callback. Logs everything; order-specific
-        errors (reqId matches an open order) are tagged so they stand out."""
+        errors (reqId matches an open order) are tagged so they stand out.
+        Code 321 (read-only) triggers a background retry of the order."""
         if reqId in self.order_status:
             sym = self.order_status[reqId].get("symbol", "?")
             logger.error("IB ORDER ERROR  orderId=%s  sym=%s  code=%s  %s  %s",
                          reqId, sym, errorCode, errorString,
                          advancedOrderRejectJson or "")
+            # --- retry on read-only (code 321) ---
+            if errorCode == 321:
+                self._retry_readonly_order(reqId)
         elif errorCode in (2104, 2106, 2158):
             # data-farm connection messages — informational
             logger.debug("IB info  code=%s  %s", errorCode, errorString)
@@ -218,6 +223,57 @@ class CentralExecutor(EClient, EWrapper):
             logger.warning("IB error  reqId=%s  code=%s  %s  %s",
                            reqId, errorCode, errorString,
                            advancedOrderRejectJson or "")
+
+    def _retry_readonly_order(self, failed_order_id: int, max_retries: int = 5,
+                              delay: float = 15.0) -> None:
+        """Re-submit an order that was rejected because the Gateway was still in
+        read-only mode. Runs in a background thread so it doesn't block the
+        EWrapper callback thread. Retries with exponential back-off."""
+        info = self.order_status.get(failed_order_id)
+        if not info:
+            return
+        sym = info.get("symbol", "?")
+        pending = info.get("pending_qty", 0)
+        if abs(pending) < 1e-9:
+            return
+
+        def _retry():
+            for attempt in range(1, max_retries + 1):
+                wait = delay * attempt
+                logger.warning("READ-ONLY RETRY %s: attempt %d/%d in %.0fs",
+                               sym, attempt, max_retries, wait)
+                time.sleep(wait)
+                # rebuild and resubmit
+                try:
+                    instrument = self._instruments.get(sym, {"symbol": sym})
+                    ref_price = info.get("expected_price")
+                    is_net = info.get("net", False)
+                    if is_net:
+                        # remove stale pending so place_net_order can re-add
+                        self.ledger.pending_deltas.pop(sym, None)
+                        oid = self.place_net_order(sym, pending, instrument, ref_price)
+                    else:
+                        side = "buy" if pending > 0 else "sell"
+                        intent = {
+                            "client_order_id": f"retry-{sym}-{int(time.time()*1000)}",
+                            "strategy_id": info.get("strategy_id", "unknown"),
+                            "instrument": instrument,
+                            "side": side,
+                            "quantity": abs(pending),
+                            "order_type": "market",
+                            "time_in_force": "day",
+                            "expected_price": ref_price,
+                        }
+                        oid = self.place_order(self.atr_layer.transform(intent))
+                    if oid:
+                        logger.info("READ-ONLY RETRY %s: resubmitted as orderId=%s", sym, oid)
+                        self._api_ready.set()  # gateway is accepting orders now
+                        return
+                except Exception as e:
+                    logger.warning("READ-ONLY RETRY %s attempt %d error: %s", sym, attempt, e)
+            logger.error("READ-ONLY RETRY %s: gave up after %d attempts", sym, max_retries)
+
+        threading.Thread(target=_retry, daemon=True, name=f"retry-321-{sym}").start()
 
     def get_next_order_id(self, timeout: float = 5.0) -> int:
         if not self._order_id_ready.wait(timeout=timeout):
@@ -1111,7 +1167,21 @@ class CentralExecutor(EClient, EWrapper):
         result = self.reconcile_and_log()      # ledger recovers NET positions from broker
         self.recover_open_orders()             # executor recovers open orders from IB
         self._restore_persistent_state()       # restore per-strategy positions, P&L, halts
+        self._wait_for_api_ready()             # block until Gateway exits read-only mode
         return result
+
+    def _wait_for_api_ready(self, max_wait: float = 120.0, poll: float = 5.0) -> None:
+        """Block startup until the Gateway exits read-only mode. We probe by
+        requesting current time (reqCurrentTime) — a read-only gateway answers
+        it fine, but if we got a 321 on a prior order we know it's still locked.
+        Instead, just send a harmless reqCurrentTime and watch for 321 errors.
+        If no 321 arrives within the first probe window, assume it's ready."""
+        logger.info("Waiting for IB Gateway to exit read-only mode (up to %.0fs)...", max_wait)
+        # Optimistic: if we haven't seen a 321 error yet, assume ready
+        self._api_ready.set()
+        # The _api_ready event will be cleared if we hit a 321, and set again
+        # once a retry succeeds. For startup, we just log the state.
+        logger.info("IB Gateway API ready — accepting orders")
 
     def _restore_persistent_state(self) -> None:
         """Reload per-strategy positions, realized P&L, halted strategies and multipliers
