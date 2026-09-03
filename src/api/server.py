@@ -240,6 +240,47 @@ def kill(req: KillRequest):
     )
     return {"killed": True, "flattened": req.flatten}
 
+@app.post("/flatten", dependencies=[Depends(require_api_key)])
+def flatten_all():
+    """Cancel open orders and flatten every position WITHOUT setting the kill switch.
+    Strategies remain active and can resume trading on the next signal."""
+    # 1. cancel open orders
+    cancelled = []
+    for oid, status in list(executor.order_status.items()):
+        if status.get("status") in ("PreSubmitted", "Submitted"):
+            try:
+                executor.cancelOrder(oid)
+                cancelled.append(oid)
+            except Exception:
+                pass
+
+    # 2. flatten every net position via direct place_order (bypasses risk/dedup)
+    import time as _time
+    flattened = []
+    for symbol, qty in list(executor.ledger.current_positions.items()):
+        if qty == 0:
+            continue
+        flat_intent = {
+            "strategy_id": "flatten_all",
+            "client_order_id": f"flatten-{symbol}-{_time.time()}",
+            "instrument": {"symbol": symbol, "asset_class": "equity", "exchange": "SMART"},
+            "intent_type": "delta",
+            "side": "sell" if qty > 0 else "buy",
+            "quantity": abs(qty),
+            "order_type": "market",
+            "time_in_force": "day",
+            "schema_version": "1.0",
+            "timestamp": "",
+        }
+        executor.place_order(flat_intent)
+        flattened.append({"symbol": symbol, "qty": qty})
+    _alert(
+        f"💨 FLATTEN ALL: cancelled {len(cancelled)} orders, flattening {len(flattened)} positions (kill switch NOT set)",
+        topic="orders",
+    )
+    return {"cancelled_orders": len(cancelled), "flattened_positions": flattened, "kill_switch": False}
+
+
 @app.get("/strategies/{strategy_id}/status")
 def strategy_status(strategy_id: str):
     if strategy_id not in CONFIG:
