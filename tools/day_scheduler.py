@@ -68,7 +68,7 @@ PREMARKET_BEFORE_OPEN_MIN = 30  # Telegram briefing before the open
 POSTMARKET_AFTER_CLOSE_MIN = 10 # Telegram summary after the close
 ATR_CANCEL_BEFORE_CLOSE_MIN = 5 # cancel unfilled ATR limit orders before close
 RECONCILE_EVERY_MIN = 60        # POST /reconcile this often through the session (0 disables)
-GRACE_MIN = 10                  # run an event up to this late; older -> skip
+GRACE_MIN = 15                  # run an event up to this late; older -> skip
 
 
 def session_today():
@@ -94,6 +94,8 @@ def build_events(o, c):
     # Pre-market briefing (before any strategy fires)
     ev.append((o - timedelta(minutes=PREMARKET_BEFORE_OPEN_MIN),
                "pre-market Telegram briefing", "run", [T("premarket_briefing.py")]))
+
+    ev.append
 
     if ENABLE["ovn_volsurge"]:
         ev.append((o + timedelta(minutes=EXIT_AFTER_OPEN_MIN),
@@ -127,14 +129,14 @@ def build_events(o, c):
     # Post-market briefing (after strategies finish, before reconcile)
     ev.append((c + timedelta(minutes=POSTMARKET_AFTER_CLOSE_MIN),
                "post-market Telegram summary", "run", [T("postmarket_briefing.py")]))
-
+    t = o
     if RECONCILE_EVERY_MIN > 0:
-        t = o + timedelta(minutes=RECONCILE_EVERY_MIN)
         while t < c:
             ev.append((t, "reconcile (broker vs ledger)", "reconcile", None))
             t += timedelta(minutes=RECONCILE_EVERY_MIN)
         ev.append((c + timedelta(minutes=VECM_AFTER_CLOSE_MIN + 2),
                    "reconcile (post-close)", "reconcile", None))
+        t = o + timedelta(minutes=RECONCILE_EVERY_MIN)
     ev.sort(key=lambda e: e[0])
     return ev
 
