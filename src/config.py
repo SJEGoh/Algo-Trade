@@ -130,11 +130,11 @@ GLOBAL = {
 ATR_EXECUTION = {
     "enabled": True,                 # flip to True to activate
     "atr_period": 14,                 # ATR lookback in intraday bars
-    "atr_fraction": 1.0,             # limit = price - fraction * ATR
+    "atr_fraction": 0.5,             # limit = price - fraction * ATR
     "bar_size": "5 mins",            # IBKR bar size (e.g. "1 min", "5 mins", "15 mins")
     "duration": "2 D",               # IBKR lookback duration (must cover atr_period+1 bars)
     "cache_ttl_sec": 300,            # ATR cache lifetime (seconds)
-    "strategies": [],                # apply to these strategy_ids; [] = all
+    "strategies": ["orb_breakout"],   # only orb_breakout uses ATR; rest go market
     "skip_exits": True,              # never transform exit intents (target_qty == 0)
     "cancel_before_close_min": 5,    # EOD cancel sweep (used by day_scheduler)
 }

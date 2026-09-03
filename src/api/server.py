@@ -392,15 +392,38 @@ def dashboard():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+_INTERNAL_STRATS = {"__net__", "flatten_all", "kill_switch"}
+
+
 @app.get("/orders")
 def list_orders():
     # live, session-scoped view from in-memory order_status (richest: filled/remaining)
-    return {"orders": [{"order_id": oid, **st} for oid, st in executor.order_status.items()]}
+    # Enrich __net__ orders with the contributing strategy names so the dashboard
+    # shows something meaningful instead of "__net__"
+    orders = []
+    for oid, st in executor.order_status.items():
+        entry = {"order_id": oid, **st}
+        if st.get("strategy_id") == "__net__" and executor.coordinator:
+            sym = st.get("symbol")
+            contributors = [sid for sid, book in executor.coordinator.desired.items()
+                            if sym and sym in book and abs(book[sym]) > 1e-9]
+            if not contributors:
+                # desired already zeroed (post-flatten); check strategy_positions
+                contributors = [sid for sid, pos in executor.ledger.strategy_positions.items()
+                                if sid not in _INTERNAL_STRATS and sym
+                                and abs(pos.get(sym, 0)) > 1e-9]
+            entry["strategy_id"] = ", ".join(contributors) if contributors else "__net__"
+        orders.append(entry)
+    return {"orders": orders}
 
 
 @app.get("/fills")
 def list_fills(limit: int = 50):
-    return {"fills": executor.logger_db.get_recent_fills(limit)}
+    # Filter out internal pseudo-strategy fills server-side so the dashboard
+    # never sees them regardless of browser cache
+    all_fills = executor.logger_db.get_recent_fills(limit * 3)  # fetch extra to compensate for filtering
+    filtered = [f for f in all_fills if f.get("strategy_id") not in _INTERNAL_STRATS]
+    return {"fills": filtered[:limit]}
 
 
 @app.get("/strategies")

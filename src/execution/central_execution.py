@@ -414,9 +414,25 @@ class CentralExecutor(EClient, EWrapper):
             "expected_price": ref_price,
         }
         # --- ATR execution layer: transform market -> limit-at-pullback ---
-        # Skip ATR for urgent orders (flatten / kill_switch) — must close at market
+        # Skip ATR for urgent orders (flatten / kill_switch) — must close at market.
+        # For pooled orders (strategy_id == "__net__"), the ATR layer's strategy filter
+        # would never match, so we check if any CONTRIBUTING strategy is ATR-eligible
+        # and temporarily swap the strategy_id so the filter passes.
         if not urgent:
-            intent = self.atr_layer.transform(intent)
+            atr_strats = set(self.atr_layer.strategies)
+            if atr_strats and self.coordinator:
+                # Find which strategies are driving this symbol's delta
+                contributors = {sid for sid, book in self.coordinator.desired.items()
+                                if sym in book and abs(book.get(sym, 0)) > 1e-9}
+                eligible = contributors & atr_strats
+                if eligible:
+                    intent["strategy_id"] = next(iter(eligible))
+                    intent = self.atr_layer.transform(intent)
+                    intent["strategy_id"] = "__net__"
+                # else: no ATR-eligible strategy contributes → stays market
+            else:
+                # No strategy filter (empty list = all) → apply to everything
+                intent = self.atr_layer.transform(intent)
 
         if instrument.get("sec_type", "STK") == "FUT":
             contract = self.get_future_contract(
