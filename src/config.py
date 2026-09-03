@@ -128,7 +128,7 @@ GLOBAL = {
 # cancelled before the close (POST /atr/cancel from day_scheduler).
 # ---------------------------------------------------------------------------
 ATR_EXECUTION = {
-    "enabled": False,                 # flip to True to activate
+    "enabled": True,                 # flip to True to activate
     "atr_period": 14,                 # ATR lookback in daily bars
     "atr_fraction": 0.5,             # limit = price - fraction * ATR
     "cache_ttl_sec": 300,            # ATR cache lifetime (seconds)
