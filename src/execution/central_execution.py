@@ -882,23 +882,22 @@ class CentralExecutor(EClient, EWrapper):
             if status["status"] in ("PreSubmitted", "Submitted"):
                 self.cancelOrder(order_id)
 
-        # 2. optionally flatten every position — privileged path, bypasses risk + dedup
+        # 2. optionally flatten every position — per-strategy so fills attribute correctly
         if flatten:
-            for symbol, qty in list(self.ledger.current_positions.items()):
-                if qty != 0:
-                    flat_intent = {
-                        "strategy_id": "kill_switch",
-                        "client_order_id": f"flatten-{symbol}-{time.time()}",
-                        "instrument": {"symbol": symbol, "asset_class": "equity", "exchange": "SMART"},
-                        "intent_type": "delta",
-                        "side": "sell" if qty > 0 else "buy",
-                        "quantity": abs(qty),
-                        "order_type": "market",
-                        "time_in_force": "day",
-                        "schema_version": "1.0",
-                        "timestamp": "",
-                    }
-                    self.place_order(flat_intent)  # deliberately direct, not process_intent
+            # Zero out the coordinator's desired books so it won't re-trade
+            if getattr(self, "coordinator", None) is not None:
+                for sid in list(self.coordinator.desired):
+                    self.coordinator.desired[sid] = {}
+                self.coordinator._save()
+            # Flatten each strategy's positions individually (skip internal pseudo-strategies)
+            _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
+            flattened_strats = set()
+            for sid, positions in list(self.ledger.strategy_positions.items()):
+                if sid in _INTERNAL:
+                    continue
+                if any(abs(q) > 1e-9 for q in positions.values()):
+                    self._flatten_direct(sid)
+                    flattened_strats.add(sid)
     
     def reconcile_and_log(self) -> dict:
         result = self.ledger.reconcile()

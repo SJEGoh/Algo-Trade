@@ -149,6 +149,12 @@ function renderHeader() {
     ? `updated ${Math.round(ageMs / 1000)}s ago` : "no data yet";
 }
 
+// Internal pseudo-strategies to hide from the UI
+const _HIDDEN_STRATS = new Set(["__net__", "flatten_all", "kill_switch",
+  "test_suite", "test_suite_small_alloc", "test_suite_drawdown_breached",
+  "halt_test_1", "halt_test_2", "halt_test_3"]);
+const _isVisible = (sid) => !_HIDDEN_STRATS.has(sid);
+
 const _expandedStrategies = new Set();
 function toggleStrategy(sid) { 
   if (_expandedStrategies.has(sid)) _expandedStrategies.delete(sid);
@@ -158,7 +164,7 @@ function toggleStrategy(sid) {
 
 function renderStrategies() {
   panel("strategies", () => {
-    const strats = (state.data.strategies?.strategies) || [];
+    const strats = ((state.data.strategies?.strategies) || []).filter(s => _isVisible(s.strategy_id));
     const pnl = (state.data.pnl?.realized_pnl) || {};
     const stratPos = (state.data.positions?.strategy_positions) || {};
     const stratCost = (state.data.positions?.strategy_avg_cost) || {};
@@ -199,6 +205,10 @@ function renderPositions() {
   panel("positions", () => {
     const cur = (state.data.positions?.current_positions) || {};
     const rows = Object.entries(cur).filter(([, q]) => q !== 0).map(([sym, q]) => ({ sym, q }));
+    // Filter hidden strategies from per-strategy position breakdown
+    const filteredStratPos = Object.fromEntries(
+      Object.entries((state.data.positions?.strategy_positions) || {}).filter(([sid]) => _isVisible(sid))
+    );
     return table([
       { label: "Symbol", get: r => r.sym },
       { label: "Quantity", cls: r => signClass(r.q), get: r => num(r.q) },
@@ -314,10 +324,10 @@ function renderEquity() {
     if (typeof uPlot === "undefined") {
       box.innerHTML = `<div class="err">uPlot failed to load (CDN blocked?)</div>`; return;
     }
-    const rows = (state.data.equityhist?.history) || [];
+    const rows = ((state.data.equityhist?.history) || []).filter(r => _isVisible(r.strategy_id));
     if (!rows.length) { box.innerHTML = `<div class="empty">no snapshots yet</div>`; return; }
     const ts = [...new Set(rows.map(r => r.ts))].sort();
-    const strats = [...new Set(rows.map(r => r.strategy_id))].sort();
+    const strats = [...new Set(rows.map(r => r.strategy_id))].filter(_isVisible).sort();
     const byTs = {}; rows.forEach(r => (byTs[r.ts] ??= {})[r.strategy_id] = r.equity);
     const x = ts.map(t => Date.parse(t) / 1000);
     const overall = ts.map(t => strats.reduce((s, st) => s + (byTs[t][st] ?? 0), 0));

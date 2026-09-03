@@ -254,26 +254,26 @@ def flatten_all():
             except Exception:
                 pass
 
-    # 2. flatten every net position via direct place_order (bypasses risk/dedup)
-    import time as _time
+    # 2. flatten per-strategy so fills attribute to the correct strategy
+    # Zero out the coordinator's desired books so it won't re-trade
+    if getattr(executor, "coordinator", None) is not None:
+        for sid in list(executor.coordinator.desired):
+            executor.coordinator.desired[sid] = {}
+        executor.coordinator._save()
+
+    # Flatten each strategy's positions individually (skip internal pseudo-strategies)
+    _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
     flattened = []
-    for symbol, qty in list(executor.ledger.current_positions.items()):
-        if qty == 0:
+    for sid, positions in list(executor.ledger.strategy_positions.items()):
+        if sid in _INTERNAL:
             continue
-        flat_intent = {
-            "strategy_id": "flatten_all",
-            "client_order_id": f"flatten-{symbol}-{_time.time()}",
-            "instrument": {"symbol": symbol, "asset_class": "equity", "exchange": "SMART"},
-            "intent_type": "delta",
-            "side": "sell" if qty > 0 else "buy",
-            "quantity": abs(qty),
-            "order_type": "market",
-            "time_in_force": "day",
-            "schema_version": "1.0",
-            "timestamp": "",
-        }
-        executor.place_order(flat_intent)
-        flattened.append({"symbol": symbol, "qty": qty})
+        for symbol, qty in list(positions.items()):
+            if abs(qty) < 1e-9:
+                continue
+            flattened.append({"strategy_id": sid, "symbol": symbol, "qty": qty})
+        if any(abs(q) > 1e-9 for q in positions.values()):
+            executor._flatten_direct(sid)
+
     _alert(
         f"💨 FLATTEN ALL: cancelled {len(cancelled)} orders, flattening {len(flattened)} positions (kill switch NOT set)",
         topic="orders",
@@ -395,7 +395,10 @@ def _equity_sampler(interval: float = 60.0):
             snap = executor.ledger.equity_snapshot(marks)
             for sid in CONFIG:  # ensure every configured strategy has a point, even flat
                 snap.setdefault(sid, {"realized": 0.0, "unrealized": 0.0, "equity": 0.0})
+            _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
             for strat, v in snap.items():
+                if strat in _INTERNAL:
+                    continue
                 executor.logger_db.log_equity(ts, strat, v["realized"], v["unrealized"], v["equity"])
             # portfolio circuit breaker on total equity (realized + unrealized across all strategies)
             total_equity = sum(v.get("equity", 0.0) for v in snap.values())
