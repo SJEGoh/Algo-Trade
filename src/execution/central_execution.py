@@ -160,6 +160,8 @@ class CentralExecutor(EClient, EWrapper):
 
         # ATR limit-at-pullback execution layer
         from execution.atr_execution import AtrPullbackLayer
+
+        # make meta class to replace this like self.execution_strat 
         self.atr_layer = AtrPullbackLayer(ATR_EXECUTION, executor=self)
 
         # Historical data infrastructure (used by ATR layer)
@@ -422,6 +424,8 @@ class CentralExecutor(EClient, EWrapper):
         # For pooled orders (strategy_id == "__net__"), the ATR layer's strategy filter
         # would never match, so we check if any CONTRIBUTING strategy is ATR-eligible
         # and temporarily swap the strategy_id so the filter passes.
+
+        # change this when I add more execution strats
         if not urgent:
             atr_strats = set(self.atr_layer.strategies)
             if atr_strats and self.coordinator:
@@ -438,6 +442,7 @@ class CentralExecutor(EClient, EWrapper):
                 # No strategy filter (empty list = all) → apply to everything
                 intent = self.atr_layer.transform(intent)
 
+        # need to adapt this for more asset classes as well
         if instrument.get("sec_type", "STK") == "FUT":
             contract = self.get_future_contract(
                 sym, exchange=instrument.get("exchange", "NYMEX"),
