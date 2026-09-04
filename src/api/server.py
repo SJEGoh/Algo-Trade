@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
     app.state.alerter = alerter
 
     executor = CentralExecutor()
+    executor._alerter = alerter  # give executor access for read-only probe Telegram alerts
     recon = executor.start(host=IB_HOST, port=IB_PORT, client_id=SERVER_CLIENT_ID)
     executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()

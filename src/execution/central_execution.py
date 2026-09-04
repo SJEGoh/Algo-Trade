@@ -156,6 +156,7 @@ class CentralExecutor(EClient, EWrapper):
         self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
         self._api_ready = threading.Event()  # set once Gateway exits read-only mode
+        self._alerter = None                 # set by server lifespan (Alerter instance for Telegram DMs)
 
         # ATR limit-at-pullback execution layer
         from execution.atr_execution import AtrPullbackLayer
@@ -1304,18 +1305,62 @@ class CentralExecutor(EClient, EWrapper):
         self._wait_for_api_ready()             # block until Gateway exits read-only mode
         return result
 
-    def _wait_for_api_ready(self, max_wait: float = 120.0, poll: float = 5.0) -> None:
-        """Block startup until the Gateway exits read-only mode. We probe by
-        requesting current time (reqCurrentTime) — a read-only gateway answers
-        it fine, but if we got a 321 on a prior order we know it's still locked.
-        Instead, just send a harmless reqCurrentTime and watch for 321 errors.
-        If no 321 arrives within the first probe window, assume it's ready."""
-        logger.info("Waiting for IB Gateway to exit read-only mode (up to %.0fs)...", max_wait)
-        # Optimistic: if we haven't seen a 321 error yet, assume ready
+    def _wait_for_api_ready(self, max_wait: float = 300.0, poll: float = 10.0) -> None:
+        """Block startup until the Gateway exits read-only mode. Probes by sending
+        a whatIf order (no real execution) for 1 share of AAPL. If the probe gets
+        a 321 error, the gateway is still read-only — retry after `poll` seconds.
+        Once the probe succeeds (or times out), set _api_ready and send a Telegram
+        alert so you know orders will go through."""
+        logger.info("Probing IB Gateway read-only status (up to %.0fs)...", max_wait)
+        self._api_ready.clear()
+
+        probe_intent = {
+            "client_order_id": "readonly_probe",
+            "strategy_id": "__probe__",
+            "instrument": {"symbol": "AAPL", "sec_type": "STK", "exchange": "SMART"},
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "market",
+            "time_in_force": "day",
+            "expected_price": 1.0,
+        }
+
+        start = time.time()
+        attempt = 0
+        while time.time() - start < max_wait:
+            attempt += 1
+            try:
+                # whatIf order: no real order placed. If gateway is read-only, the
+                # error callback fires code 321 and margin_whatif returns None.
+                result = self.margin_whatif(probe_intent, timeout=10.0)
+                if result is not None:
+                    # Gateway accepted the whatIf probe — it's writable
+                    elapsed = time.time() - start
+                    logger.info("IB Gateway API ready — exited read-only mode after %.1fs (%d probes)",
+                                elapsed, attempt)
+                    self._api_ready.set()
+                    # Telegram alert
+                    if self._alerter:
+                        self._alerter.send(
+                            f"✅ IB Gateway exited read-only mode (took {elapsed:.0f}s, {attempt} probes) — orders will go through",
+                        )
+                    return
+                else:
+                    logger.warning("Read-only probe %d: whatIf returned None (gateway may still be read-only), "
+                                   "retrying in %.0fs...", attempt, poll)
+            except Exception as e:
+                logger.warning("Read-only probe %d error: %s — retrying in %.0fs...", attempt, e, poll)
+            time.sleep(poll)
+
+        # Timed out — set ready anyway (orders will get 321 and retry individually)
+        logger.warning("Read-only probe timed out after %.0fs (%d probes) — setting ready anyway, "
+                       "individual orders will retry on 321", max_wait, attempt)
         self._api_ready.set()
-        # The _api_ready event will be cleared if we hit a 321, and set again
-        # once a retry succeeds. For startup, we just log the state.
-        logger.info("IB Gateway API ready — accepting orders")
+        if self._alerter:
+            self._alerter.send(
+                f"⚠️ IB Gateway still in read-only after {max_wait:.0f}s — orders may be rejected (321 retry active)",
+                topic="errors",
+            )
 
     def _restore_persistent_state(self) -> None:
         """Reload per-strategy positions, realized P&L, halted strategies and multipliers
