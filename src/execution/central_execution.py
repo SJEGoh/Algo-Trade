@@ -1302,7 +1302,9 @@ class CentralExecutor(EClient, EWrapper):
         result = self.reconcile_and_log()      # ledger recovers NET positions from broker
         self.recover_open_orders()             # executor recovers open orders from IB
         self._restore_persistent_state()       # restore per-strategy positions, P&L, halts
-        self._wait_for_api_ready()             # block until Gateway exits read-only mode
+        # Run read-only probe in background so it doesn't block server startup / health checks
+        threading.Thread(target=self._wait_for_api_ready, daemon=True,
+                         name="readonly-probe").start()
         return result
 
     def _wait_for_api_ready(self, max_wait: float = 300.0, poll: float = 10.0) -> None:
