@@ -138,6 +138,9 @@ class CentralExecutor(EClient, EWrapper):
         self._paper_mkt_refcount: Dict[str, int] = {}  # symbol -> count of pending orders
 
         self._open_orders_ready = threading.Event()                           # base, kept away from order IDs
+        self._reconcile_mode = False                                             # open-order reconcile flag
+        self._reconcile_ib_orders: Dict[int, dict] = {}                          # temp: orderId -> {contract, order, state}
+        self._reconcile_orders_done = threading.Event()                          # signalled by openOrderEnd in reconcile mode
 
         # EventLogger
         self.logger_db = EventLogger()
@@ -1089,6 +1092,108 @@ class CentralExecutor(EClient, EWrapper):
         self.logger_db.log_reconciliation(result["matched"], result["discrepancies"])
         if not result["matched"]:
             logger.warning("reconciliation found discrepancies: %s", result["discrepancies"])
+
+        # also reconcile open orders
+        order_result = self.reconcile_open_orders()
+        result["order_reconcile"] = order_result
+        return result
+
+    def reconcile_open_orders(self, timeout: float = 5.0) -> dict:
+        """Compare executor's order_status against IBKR's live open orders.
+        Removes stale entries (orders we think are open but IBKR doesn't),
+        adds missing ones (orders IBKR reports but we don't track), and
+        returns a summary of discrepancies."""
+
+        # 1. snapshot current order_status IDs that are "live" (not final)
+        _LIVE = {"PreSubmitted", "Submitted", "PendingSubmit", "PendingCancel"}
+        local_live = {
+            oid for oid, st in self.order_status.items()
+            if st.get("status") in _LIVE
+        }
+
+        # 2. ask IBKR for all open orders
+        self._reconcile_ib_orders = {}          # temp dict: orderId -> {contract, order, state}
+        self._reconcile_orders_done = threading.Event()
+        self._reconcile_mode = True             # flag so openOrder routes to reconcile dict
+        self._reconcile_orders_done.clear()
+        self.reqAllOpenOrders()
+        if not self._reconcile_orders_done.wait(timeout=timeout):
+            logger.warning("open-order reconcile: reqAllOpenOrders timed out")
+            self._reconcile_mode = False
+            return {"timed_out": True}
+        self._reconcile_mode = False
+
+        ib_live = set(self._reconcile_ib_orders.keys())
+
+        # 3. stale: in our order_status as live, but IBKR doesn't report them
+        stale = local_live - ib_live
+        stale_details = []
+        for oid in stale:
+            st = self.order_status.get(oid, {})
+            stale_details.append({
+                "order_id": oid,
+                "symbol": st.get("symbol"),
+                "strategy_id": st.get("strategy_id"),
+                "local_status": st.get("status"),
+            })
+            # mark as dead — set status so it's no longer treated as live
+            self.order_status[oid]["status"] = "Reconciled_Stale"
+            # clear any pending delta the ledger is holding for this order
+            sym = st.get("symbol")
+            pending_qty = st.get("pending_qty", 0)
+            if sym and abs(pending_qty) > 1e-9:
+                # reverse the pending delta by recording the negated amount
+                self.ledger.record_pending(sym, -pending_qty, st.get("strategy_id", "?"))
+            logger.warning("reconcile: removed stale order %s (%s %s) — not in IBKR",
+                           oid, st.get("symbol"), st.get("strategy_id"))
+
+        # 4. missing: IBKR reports open but we don't track them at all
+        missing = ib_live - set(self.order_status.keys())
+        missing_details = []
+        for oid in missing:
+            info = self._reconcile_ib_orders[oid]
+            contract, order, state = info["contract"], info["order"], info["state"]
+            signed_qty = order.totalQuantity if order.action == "BUY" else -order.totalQuantity
+            original = self.logger_db.get_order(oid)
+            strategy_id = original["strategy_id"] if original else "recovered"
+            client_order_id = original["client_order_id"] if original else f"recovered-{oid}"
+            self.order_status[oid] = {
+                "client_order_id": client_order_id,
+                "strategy_id": strategy_id,
+                "symbol": contract.symbol,
+                "status": state.status,
+                "filled": 0,
+                "remaining": order.totalQuantity,
+                "pending_qty": signed_qty,
+                "expected_price": original["expected_price"] if original else None,
+            }
+            self.ledger.record_pending(contract.symbol, signed_qty, strategy_id)
+            missing_details.append({
+                "order_id": oid,
+                "symbol": contract.symbol,
+                "action": order.action,
+                "qty": order.totalQuantity,
+                "strategy_id": strategy_id,
+            })
+            logger.warning("reconcile: recovered missing order %s: %s %s %s",
+                           oid, order.action, order.totalQuantity, contract.symbol)
+
+        # clean up temp state
+        self._reconcile_ib_orders = {}
+
+        matched = len(stale) == 0 and len(missing) == 0
+        result = {
+            "matched": matched,
+            "stale_removed": stale_details,
+            "missing_recovered": missing_details,
+            "local_live_count": len(local_live),
+            "ib_live_count": len(ib_live),
+        }
+        if not matched:
+            logger.warning("open-order reconcile discrepancies: %s stale, %s missing",
+                           len(stale_details), len(missing_details))
+        else:
+            logger.info("open-order reconcile: all %d orders match", len(ib_live))
         return result
 
     def recover_open_orders(self, timeout: float = 5.0) -> None:
@@ -1112,6 +1217,16 @@ class CentralExecutor(EClient, EWrapper):
             }
             self._whatif_events[orderId].set()
             return
+
+        # reconcile mode: collect IBKR's view into temp dict, don't modify order_status
+        if getattr(self, "_reconcile_mode", False):
+            self._reconcile_ib_orders[orderId] = {
+                "contract": contract,
+                "order": order,
+                "state": orderState,
+            }
+            return
+
         # rebuild order_status from what IB reports as live
         if orderId not in self.order_status:
             original = self.logger_db.get_order(orderId)  # you'd add this method
@@ -1136,6 +1251,9 @@ class CentralExecutor(EClient, EWrapper):
                         orderId, order.action, order.totalQuantity, contract.symbol)
 
     def openOrderEnd(self):
+        # signal reconcile if in reconcile mode
+        if getattr(self, "_reconcile_mode", False):
+            self._reconcile_orders_done.set()
         self._open_orders_ready.set()
 
     def _should_pool(self, intent: OrderIntent) -> bool:

@@ -243,8 +243,11 @@ def kill(req: KillRequest):
 @app.post("/flatten", dependencies=[Depends(require_api_key)])
 def flatten_all():
     """Cancel open orders and flatten every position WITHOUT setting the kill switch.
-    Strategies remain active and can resume trading on the next signal."""
-    # 1. cancel open orders
+    Strategies remain active and can resume trading on the next signal.
+    If the market is CLOSED, only cancels open orders (no new closing orders placed)."""
+    market_open = is_market_open()
+
+    # 1. cancel open orders (always, regardless of market hours)
     cancelled = []
     for oid, status in list(executor.order_status.items()):
         if status.get("status") in ("PreSubmitted", "Submitted"):
@@ -254,65 +257,73 @@ def flatten_all():
             except Exception:
                 pass
 
-    # 2. flatten per-strategy so fills attribute to the correct strategy
+    # 2. flatten per-strategy — ONLY when market is open
     _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
     flattened = []
 
-    # Collect what we're about to flatten (for the response)
-    for sid, positions in list(executor.ledger.strategy_positions.items()):
-        if sid in _INTERNAL:
-            continue
-        for symbol, qty in list(positions.items()):
-            if abs(qty) < 1e-9:
-                continue
-            flattened.append({"strategy_id": sid, "symbol": symbol, "qty": qty})
-
-    if getattr(executor, "coordinator", None) is not None:
-        # Coordinator path: zero out desired books and rebalance — the coordinator
-        # internally crosses offsetting legs and sends net residual to IB.  Fills
-        # flow back through attribute_fill, correctly updating each strategy.
-        all_syms = set()
-        for sid in list(executor.coordinator.desired):
-            all_syms |= set(executor.coordinator.desired[sid])
-            executor.coordinator.desired[sid] = {}
-        # Also include symbols from strategy_positions (desired may already be empty
-        # from a previous flatten, but positions still need closing)
-        for sid, positions in executor.ledger.strategy_positions.items():
-            if sid in _INTERNAL:
-                continue
-            all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
-        executor.coordinator._save()
-        if all_syms:
-            executor.coordinator._rebalance(all_syms, urgent=True)
-    else:
-        # No coordinator: flatten each strategy directly
+    if market_open:
+        # Collect what we're about to flatten (for the response)
         for sid, positions in list(executor.ledger.strategy_positions.items()):
             if sid in _INTERNAL:
                 continue
-            if any(abs(q) > 1e-9 for q in positions.values()):
-                executor._flatten_direct(sid)
+            for symbol, qty in list(positions.items()):
+                if abs(qty) < 1e-9:
+                    continue
+                flattened.append({"strategy_id": sid, "symbol": symbol, "qty": qty})
 
-    # Clean up stale strategy positions for symbols already flat at the broker.
-    # This handles leftover state from before per-strategy attribution was added.
-    broker_flat = {s for s, q in executor.ledger.current_positions.items() if abs(q) < 1e-9}
-    cleaned = []
-    for sid, positions in list(executor.ledger.strategy_positions.items()):
-        if sid in _INTERNAL:
-            continue
-        for sym in list(positions):
-            if sym in broker_flat and abs(positions.get(sym, 0.0)) > 1e-9:
-                cleaned.append({"strategy_id": sid, "symbol": sym, "was": positions[sym]})
-                positions[sym] = 0.0
-                executor.ledger.strategy_avg_cost.get(sid, {})[sym] = 0.0
-    if cleaned:
-        executor.ledger.save_state(executor.logger_db)
-        logging.getLogger("executor").info("Flatten cleanup: zeroed stale strategy positions: %s", cleaned)
+        if getattr(executor, "coordinator", None) is not None:
+            # Coordinator path: zero out desired books and rebalance — the coordinator
+            # internally crosses offsetting legs and sends net residual to IB.  Fills
+            # flow back through attribute_fill, correctly updating each strategy.
+            all_syms = set()
+            for sid in list(executor.coordinator.desired):
+                all_syms |= set(executor.coordinator.desired[sid])
+                executor.coordinator.desired[sid] = {}
+            # Also include symbols from strategy_positions (desired may already be empty
+            # from a previous flatten, but positions still need closing)
+            for sid, positions in executor.ledger.strategy_positions.items():
+                if sid in _INTERNAL:
+                    continue
+                all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
+            executor.coordinator._save()
+            if all_syms:
+                executor.coordinator._rebalance(all_syms, urgent=True)
+        else:
+            # No coordinator: flatten each strategy directly
+            for sid, positions in list(executor.ledger.strategy_positions.items()):
+                if sid in _INTERNAL:
+                    continue
+                if any(abs(q) > 1e-9 for q in positions.values()):
+                    executor._flatten_direct(sid)
 
+        # Clean up stale strategy positions for symbols already flat at the broker.
+        # This handles leftover state from before per-strategy attribution was added.
+        broker_flat = {s for s, q in executor.ledger.current_positions.items() if abs(q) < 1e-9}
+        cleaned = []
+        for sid, positions in list(executor.ledger.strategy_positions.items()):
+            if sid in _INTERNAL:
+                continue
+            for sym in list(positions):
+                if sym in broker_flat and abs(positions.get(sym, 0.0)) > 1e-9:
+                    cleaned.append({"strategy_id": sid, "symbol": sym, "was": positions[sym]})
+                    positions[sym] = 0.0
+                    executor.ledger.strategy_avg_cost.get(sid, {})[sym] = 0.0
+        if cleaned:
+            executor.ledger.save_state(executor.logger_db)
+            logging.getLogger("executor").info("Flatten cleanup: zeroed stale strategy positions: %s", cleaned)
+
+    action = "cancelled orders + flattened positions" if market_open else "cancelled orders only (market closed)"
     _alert(
-        f"💨 FLATTEN ALL: cancelled {len(cancelled)} orders, flattening {len(flattened)} positions (kill switch NOT set)",
+        f"💨 FLATTEN ALL: cancelled {len(cancelled)} orders, flattening {len(flattened)} positions — {action} (kill switch NOT set)",
         topic="orders",
     )
-    return {"cancelled_orders": len(cancelled), "flattened_positions": flattened, "kill_switch": False}
+    return {
+        "cancelled_orders": len(cancelled),
+        "flattened_positions": flattened,
+        "market_open": market_open,
+        "note": "cancel-only mode, market is closed" if not market_open else None,
+        "kill_switch": False,
+    }
 
 
 @app.get("/strategies/{strategy_id}/status")
@@ -364,18 +375,22 @@ _last_reconcile = {"matched": None, "discrepancies": [], "ts": None}
 @app.post("/reconcile", dependencies=[Depends(require_api_key)])
 def reconcile():
     try:
-        result = executor.reconcile_and_log()   # pulls reqPositions, corrects ledger to broker
+        result = executor.reconcile_and_log()   # pulls reqPositions, corrects ledger to broker + open orders
     except TimeoutError as e:
         raise HTTPException(status_code=503, detail=f"reconcile timed out talking to IB: {e}")
+
+    order_recon = result.get("order_reconcile", {})
     _last_reconcile.update({
-        "matched": result["matched"],
+        "matched": result["matched"] and order_recon.get("matched", True),
         "discrepancies": result["discrepancies"],
+        "order_reconcile": order_recon,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
     return {
         "matched": result["matched"],
         "discrepancies": result["discrepancies"],
         "positions": dict(executor.ledger.current_positions),
+        "order_reconcile": order_recon,
     }
 
 
