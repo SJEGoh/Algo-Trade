@@ -32,7 +32,14 @@ class FakeLedger:
     def __init__(self):
         self.current_positions = {"AAPL": 100.0, "MSFT": -50.0}
         self.strategy_positions = {KNOWN_STRAT: {"AAPL": 100.0, "MSFT": -50.0}}
+        self.strategy_avg_cost = {KNOWN_STRAT: {"AAPL": 90.0, "MSFT": 400.0}}
         self.strategy_realized_pnl = {KNOWN_STRAT: 1234.5}
+        self.strategy_cash = {KNOWN_STRAT: 11_000.0}
+        self.starting_cash = {KNOWN_STRAT: 10_000.0}
+        self.multipliers = {}
+
+    def cash_book(self):
+        return dict(self.strategy_cash)
 
 
 class FakeRiskManager:
@@ -168,6 +175,9 @@ def test_positions(client):
     body = client.get("/positions").json()
     assert body["current_positions"]["AAPL"] == 100.0
     assert body["strategy_positions"][KNOWN_STRAT]["MSFT"] == -50.0
+    # cash is a position: the balance and the capital basis both ship with the book
+    assert body["strategy_cash"][KNOWN_STRAT] == 11_000.0
+    assert body["starting_cash"][KNOWN_STRAT] == 10_000.0
 
 
 def test_pnl(client):

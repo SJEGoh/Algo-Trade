@@ -60,7 +60,7 @@ This gives the system one place to manage:
 - Interactive Brokers connectivity
 - order submission and status tracking
 - client-order identifiers and deduplication
-- internal position / average-cost state
+- internal position / average-cost state (cash included, as a position per strategy)
 - startup reconciliation against broker state
 - strategy-level risk state
 - account-level safety controls
@@ -82,9 +82,11 @@ Strategies communicate with the executor through HTTP. The main execution endpoi
 - `GET /orders` — current live order state
 - `GET /orders/{order_id}` — inspect a specific order
 - `GET /pnl` — realized P&L by strategy
+- `GET /equity` — latest balance sheet: cash, position value and NAV per strategy, plus portfolio totals
 - `GET /net` — inspect pooled net exposure and desired strategy books
 - `GET /strategies/{strategy_id}/status` — strategy risk status
 - `GET /strategies/{strategy_id}/allocation` — strategy capital allocation and drawdown limit
+- `GET /strategies/{strategy_id}/book` — the strategy's holdings, cash first
 
 Write endpoints are protected by an API key passed through the `X-API-Key` header.
 
@@ -95,6 +97,14 @@ Risk controls are applied centrally rather than being left entirely to individua
 ### Strategy-level controls
 
 Each configured strategy has a capital allocation and maximum drawdown. Strategy IDs are explicitly allow-listed; intents from unknown strategies are rejected rather than implicitly trusted.
+
+Every strategy is also funded: cash is held as a position in the ledger alongside its instruments, starting at the strategy's `starting_cash` (defaulting to its `capital_allocation`) and moving by `-signed_qty * price * multiplier` on every fill, internal cross included. A strategy's NAV is therefore
+
+```
+nav = cash + market value of positions == starting_cash + realized + unrealized
+```
+
+and the dashboard's equity curve is that NAV summed across every strategy. Drawdown limits are still measured against P&L (`realized + unrealized`) as a fraction of allocation, not against NAV. Cash balances persist in `strategy_cash` and survive restarts.
 
 The risk layer also supports strategy halting and reactivation, allowing a strategy to be stopped after a drawdown breach without taking down the entire executor.
 

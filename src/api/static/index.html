@@ -51,6 +51,10 @@
   .strat-table { font-size:12px; }
   .strat-table th { font-size:10px; padding:3px 8px; }
   .strat-table td { padding:3px 8px; }
+  .strat-table tr.cash-row td { color:var(--accent); border-bottom:1px solid var(--border); }
+  .nav-bar { display:flex; gap:18px; flex-wrap:wrap; align-items:center; padding:8px 14px;
+             font-size:12px; border-bottom:1px solid var(--border); }
+  .nav-bar .k { color:var(--muted); margin-right:5px; }
   details { border-top:1px solid var(--border); }
   details > summary { cursor:pointer; padding:10px 14px; color:var(--muted); font-size:12px;
                       font-weight:600; text-transform:uppercase; letter-spacing:.8px;
@@ -73,7 +77,11 @@
 </header>
 
 <main>
-  <section><h2>Equity Curve (total)</h2><div class="body"><div id="equity" style="padding:8px"></div></div></section>
+  <section>
+    <h2>Equity Curve — portfolio NAV (cash + positions, all strategies)</h2>
+    <div id="nav-bar" class="nav-bar" hidden></div>
+    <div class="body"><div id="equity" style="padding:8px"></div></div>
+  </section>
   <section><h2>Strategies</h2><div class="body" id="strategies"></div></section>
   <section>
     <h2>Positions</h2>
@@ -104,6 +112,7 @@ const api = {
   positions()  { return this._get("/positions"); },
   orders()     { return this._get("/orders"); },
   fills()      { return this._get("/fills"); },
+  equity()     { return this._get("/equity"); },
 };
 
 // ---------- state: single source of truth ----------
@@ -168,6 +177,11 @@ function renderStrategies() {
     const pnl = (state.data.pnl?.realized_pnl) || {};
     const stratPos = (state.data.positions?.strategy_positions) || {};
     const stratCost = (state.data.positions?.strategy_avg_cost) || {};
+    const stratCash = (state.data.positions?.strategy_cash) || {};
+    const startCash = (state.data.positions?.starting_cash) || {};
+    const mults = (state.data.positions?.multipliers) || {};
+    const marks = (state.data.equity?.marks) || {};
+    const book = (state.data.equity?.strategies) || {};   // last sampled balance sheet
     if (!strats.length) return `<div class="empty">none configured</div>`;
     return `<div class="cards">` + strats.map(s => {
       const sid = s.strategy_id;
@@ -176,25 +190,43 @@ function renderStrategies() {
       const positions = stratPos[sid] || {};
       const costs = stratCost[sid] || {};
       const held = Object.entries(positions).filter(([, q]) => q !== 0);
+      const b = book[sid] || {};
+      // Fall back to the live cash book + mark-to-cost if no sample has landed yet.
+      const cash = b.cash ?? stratCash[sid] ?? startCash[sid] ?? 0;
+      const valueOf = ([sym, qty]) => ((marks[sym] ?? costs[sym] ?? 0) * qty * (mults[sym] ?? 1));
+      const posValue = b.position_value ?? held.reduce((t, e) => t + valueOf(e), 0);
+      const nav = b.nav ?? (cash + posValue);
+      const basis = b.starting_cash ?? startCash[sid] ?? s.capital_allocation;
+      const totalPnl = b.equity ?? (nav - basis);
       const expanded = _expandedStrategies.has(sid);
+      // Cash is the first line of the book — a position like any other.
+      const cashRow = `<tr class="cash-row"><td>CASH</td><td class="dim">—</td>`
+        + `<td class="dim">—</td><td class="${signClass(cash)}">${money(cash)}</td></tr>`;
       const holdingsHtml = expanded
-        ? `<div class="strat-holdings">${held.length === 0
-            ? '<div class="strat-flat">flat</div>'
-            : '<table class="strat-table"><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th></tr></thead><tbody>'
-              + held.map(([sym, qty]) => {
-                  const cost = costs[sym];
-                  return `<tr><td>${sym}</td><td class="${signClass(qty)}">${num(qty)}</td><td class="dim">${cost ? "$" + num(cost, 2) : "—"}</td></tr>`;
-                }).join("")
-              + '</tbody></table>'
-          }</div>`
+        ? `<div class="strat-holdings">`
+          + '<table class="strat-table"><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Value</th></tr></thead><tbody>'
+          + cashRow
+          + held.map(([sym, qty]) => {
+              const cost = costs[sym];
+              const val = valueOf([sym, qty]);
+              return `<tr><td>${sym}</td><td class="${signClass(qty)}">${num(qty)}</td>`
+                + `<td class="dim">${cost ? "$" + num(cost, 2) : "—"}</td>`
+                + `<td class="${signClass(val)}">${money(val)}</td></tr>`;
+            }).join("")
+          + `<tr><td class="dim">NAV</td><td></td><td></td><td>${money(nav)}</td></tr>`
+          + '</tbody></table></div>'
         : '';
       return `<div class="card strat-card${expanded ? ' expanded' : ''}" onclick="toggleStrategy('${sid}')">
         <div class="name">${sid}
           <span class="pill ${active ? "ok" : "bad"}">${active ? "active" : "HALTED"}</span></div>
+        <div class="row"><span>NAV</span><span>${money(nav)}</span></div>
+        <div class="row"><span>cash</span><span class="${signClass(cash)}">${money(cash)}</span></div>
+        <div class="row"><span>positions</span><span class="${signClass(posValue)}">${money(posValue)}</span></div>
+        <div class="row"><span>total P&amp;L</span><span class="${signClass(totalPnl)}">${money(totalPnl)}</span></div>
+        <div class="row"><span>realized P&amp;L</span><span class="${signClass(p)}">${money(p)}</span></div>
         <div class="row"><span>allocation</span><span>${money(s.capital_allocation)}</span></div>
         <div class="row"><span>max drawdown</span><span>${(s.max_drawdown * 100).toFixed(0)}%</span></div>
-        <div class="row"><span>realized P&amp;L</span><span class="${signClass(p)}">${money(p)}</span></div>
-        <div class="row"><span>holdings</span><span class="dim">${held.length === 0 ? "flat" : held.length + " name" + (held.length > 1 ? "s" : "")}</span></div>
+        <div class="row"><span>holdings</span><span class="dim">${held.length === 0 ? "cash only" : held.length + " name" + (held.length > 1 ? "s" : "")}</span></div>
         ${holdingsHtml}
       </div>`;
     }).join("") + `</div>`;
@@ -204,16 +236,35 @@ function renderStrategies() {
 function renderPositions() {
   panel("positions", () => {
     const cur = (state.data.positions?.current_positions) || {};
-    const rows = Object.entries(cur).filter(([, q]) => q !== 0).map(([sym, q]) => ({ sym, q }));
-    // Filter hidden strategies from per-strategy position breakdown
-    const filteredStratPos = Object.fromEntries(
-      Object.entries((state.data.positions?.strategy_positions) || {}).filter(([sid]) => _isVisible(sid))
-    );
+    const mults = (state.data.positions?.multipliers) || {};
+    const marks = (state.data.equity?.marks) || {};
+    const rows = Object.entries(cur).filter(([, q]) => q !== 0)
+      .map(([sym, q]) => ({ sym, q, mark: marks[sym] ?? null,
+                            val: marks[sym] == null ? null : marks[sym] * q * (mults[sym] ?? 1) }));
     return table([
       { label: "Symbol", get: r => r.sym },
       { label: "Quantity", cls: r => signClass(r.q), get: r => num(r.q) },
+      { label: "Mark", cls: () => "dim", get: r => num(r.mark, 2) },
+      { label: "Market Value", cls: r => signClass(r.val ?? 0), get: r => r.val == null ? "—" : money(r.val) },
     ], rows);
   });
+}
+
+function renderNavBar() {
+  const bar = el("nav-bar");
+  const t = state.data.equity?.totals;
+  if (!t) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const pnl = t.equity ?? 0;
+  const ret = t.starting_cash ? (pnl / t.starting_cash) * 100 : null;
+  bar.innerHTML = [
+    `<span><span class="k">NAV</span><b>${money(t.nav)}</b></span>`,
+    `<span><span class="k">cash</span>${money(t.cash)}</span>`,
+    `<span><span class="k">positions</span>${money(t.position_value)}</span>`,
+    `<span><span class="k">P&L</span><span class="${signClass(pnl)}">${money(pnl)}` +
+      (ret == null ? "" : ` (${ret >= 0 ? "+" : ""}${ret.toFixed(2)}%)`) + `</span></span>`,
+    `<span><span class="k">capital</span><span class="dim">${money(t.starting_cash)}</span></span>`,
+  ].join("");
 }
 
 function renderOpenOrders() {
@@ -318,7 +369,17 @@ function renderFills() {
 }
 
 let uplot = null;
+let uplotKey = "";   // series signature — remount when the strategy set changes
 const PALETTE = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf"];
+
+// A snapshot row's NAV = cash + market value of positions. Rows written before cash
+// became a position carry only P&L, so fall back to (capital basis + P&L) — the same
+// level the cash book would have produced.
+function rowNav(r, basis) {
+  if (r.nav != null) return r.nav;
+  return (basis ?? 0) + (r.equity ?? 0);
+}
+
 function renderEquity() {
   const box = el("equity");
   try {
@@ -327,18 +388,46 @@ function renderEquity() {
     }
     const rows = ((state.data.equityhist?.history) || []).filter(r => _isVisible(r.strategy_id));
     if (!rows.length) { box.innerHTML = `<div class="empty">no snapshots yet</div>`; return; }
+    // capital basis per strategy: live cash book first, else its configured allocation
+    const startCash = (state.data.positions?.starting_cash) || {};
+    const alloc = {};
+    ((state.data.strategies?.strategies) || []).forEach(s => (alloc[s.strategy_id] = s.capital_allocation));
+    const basisOf = (sid) => startCash[sid] ?? alloc[sid] ?? 0;
+
     const ts = [...new Set(rows.map(r => r.ts))].sort();
-    const strats = [...new Set(rows.map(r => r.strategy_id))].filter(_isVisible).sort();
-    const byTs = {}; rows.forEach(r => (byTs[r.ts] ??= {})[r.strategy_id] = r.equity);
+    const strats = [...new Set(rows.map(r => r.strategy_id))].sort();
+    const byTs = {}; rows.forEach(r => (byTs[r.ts] ??= {})[r.strategy_id] = rowNav(r, basisOf(r.strategy_id)));
     const x = ts.map(t => Date.parse(t) / 1000);
-    const overall = ts.map(t => strats.reduce((s, st) => s + (byTs[t][st] ?? 0), 0));
-    const data = [x, overall, ...strats.map(st => ts.map(t => byTs[t][st] ?? null))];
-    if (!uplot) {
-      box.innerHTML = "";  // clear any placeholder text before mounting the chart
-      const series = [{}, { label: "OVERALL", stroke: "#e6edf3", width: 2 },
+
+    // NAV is a level, not an event: carry the last known value forward across timestamps
+    // where a strategy wasn't sampled, starting from its capital basis. Then OVERALL is
+    // the sum of every strategy's positions + cash at each point.
+    const last = Object.fromEntries(strats.map(sid => [sid, basisOf(sid)]));
+    const series = Object.fromEntries(strats.map(sid => [sid, []]));
+    const overall = [];
+    ts.forEach(t => {
+      let total = 0;
+      strats.forEach(sid => {
+        const v = byTs[t][sid];
+        if (v != null) last[sid] = v;
+        series[sid].push(last[sid]);
+        total += last[sid];
+      });
+      overall.push(total);
+    });
+
+    const data = [x, overall, ...strats.map(sid => series[sid])];
+    const key = strats.join("|");
+    if (!uplot || uplotKey !== key) {
+      box.innerHTML = "";  // clear any placeholder text (or the previous chart) before mounting
+      uplotKey = key;
+      const cfgSeries = [{}, { label: "OVERALL", stroke: "#e6edf3", width: 2 },
         ...strats.map((st, i) => ({ label: st, stroke: PALETTE[i % PALETTE.length], width: 1 }))];
-      uplot = new uPlot({ width: box.clientWidth || 900, height: 260, series,
-        axes: [{ stroke: "#8b949e" }, { stroke: "#8b949e" }] }, data, box);
+      uplot = new uPlot({ width: box.clientWidth || 900, height: 260, series: cfgSeries,
+        axes: [{ stroke: "#8b949e" },
+               { stroke: "#8b949e",
+                 values: (u, vals) => vals.map(v => "$" + v.toLocaleString(undefined, { maximumFractionDigits: 0 })) }] },
+        data, box);
     } else {
       uplot.setData(data);
     }
@@ -349,10 +438,14 @@ function renderEquity() {
 }
 
 function renderAll() {
-  renderHeader(); renderStrategies(); renderPositions(); renderReconBar(); renderOpenOrders(); renderRecentFills(); renderOrders(); renderFills(); renderEquity();
+  renderHeader(); renderNavBar(); renderStrategies(); renderPositions(); renderReconBar();
+  renderOpenOrders(); renderRecentFills(); renderOrders(); renderFills(); renderEquity();
 }
 
 // ---------- poll loop: fetch -> state -> render (error-isolated per panel) ----------
+// [key, fetcher, panelId, everyMs] — everyMs throttles a feed below the 3s cycle. The
+// equity history is only written once per sampler cycle (60s) and is by far the largest
+// payload, so it doesn't need re-fetching on every tick.
 const FEEDS = [
   ["health", api.health.bind(api), null],
   ["strategies", api.strategies.bind(api), "strategies"],
@@ -360,15 +453,22 @@ const FEEDS = [
   ["positions", api.positions.bind(api), "positions"],
   ["orders", api.orders.bind(api), "orders"],
   ["fills", api.fills.bind(api), "fills"],
-  ["equityhist", () => api._get("/pnl/history"), null],
-  ["reconcile", () => api._get("/reconcile/status"), null],   // <-- add this line
+  ["equity", api.equity.bind(api), null],
+  ["equityhist", () => api._get("/pnl/history"), null, 30000],
+  ["reconcile", () => api._get("/reconcile/status"), null],
 ];
 
+const _lastFetch = {};   // feed key -> ms timestamp of its last attempt
+
 async function poll() {
-  const results = await Promise.allSettled(FEEDS.map(([, fn]) => fn()));
+  const now = Date.now();
+  const due = FEEDS.filter(([key, , , everyMs]) =>
+    !everyMs || !_lastFetch[key] || now - _lastFetch[key] >= everyMs);
+  due.forEach(([key]) => (_lastFetch[key] = now));
+  const results = await Promise.allSettled(due.map(([, fn]) => fn()));
   let allOk = true;
   results.forEach((res, i) => {
-    const [key, , panelId] = FEEDS[i];
+    const [key, , panelId] = due[i];
     if (res.status === "fulfilled") {
       state.data[key] = res.value;
       if (panelId) delete state.errors[panelId];

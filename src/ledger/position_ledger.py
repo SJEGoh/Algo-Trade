@@ -10,8 +10,12 @@ if TYPE_CHECKING:
 
 
 class PositionLedger:
-    def __init__(self, executor: "CentralExecutor"):
+    #: key used for the cash leg wherever positions are presented as a book
+    CASH_SYMBOL = "CASH"
+
+    def __init__(self, executor: "CentralExecutor", config: Optional[dict] = None):
         self._executor = executor  # needed to call reqPositions() via the live connection
+        self._config = config or {}
         self.current_positions: Dict[str, float] = {}
         self.pending_deltas: Dict[str, float] = {}
         self.broker_positions: Dict[str, float] = {}
@@ -22,6 +26,65 @@ class PositionLedger:
         self._lock = threading.Lock()
         self.strategy_pending: Dict[str, Dict[str, float]] = {}
         self.multipliers: Dict[str, float] = {}  # symbol -> contract multiplier (1 for equities); makes P&L dollar-denominated
+        # --- cash as a position -------------------------------------------------
+        # Each strategy holds CASH alongside its instruments: it starts at the strategy's
+        # capital basis (config `starting_cash`, else `capital_allocation`) and every fill
+        # moves it by -signed_qty * price * multiplier. Strategy NAV is then
+        #   cash + market value of positions  ==  starting_cash + realized + unrealized.
+        self.starting_cash: Dict[str, float] = {}   # strat -> capital basis (fixed)
+        self.strategy_cash: Dict[str, float] = {}   # strat -> live cash balance
+        for sid, cfg in self._config.items():
+            basis = self._basis_from_config(cfg)
+            self.starting_cash[sid] = basis
+            self.strategy_cash[sid] = basis
+
+    # ------------------------------------------------------------------
+    # Cash book
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _basis_from_config(cfg: dict) -> float:
+        """A strategy's capital basis: explicit `starting_cash`, else its allocation."""
+        if not isinstance(cfg, dict):
+            return 0.0
+        basis = cfg.get("starting_cash")
+        if basis is None:
+            basis = cfg.get("capital_allocation", 0.0)
+        try:
+            return float(basis)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _basis(self, strat_id: str) -> float:
+        """Capital basis for a strategy (memoised). Unknown strategies start at 0.0, so
+        their NAV is just P&L."""
+        if strat_id not in self.starting_cash:
+            self.starting_cash[strat_id] = self._basis_from_config(self._config.get(strat_id, {}))
+        return self.starting_cash[strat_id]
+
+    def _cash(self, strat_id: str) -> float:
+        """Live cash for a strategy, seeded from its basis. Caller holds the lock."""
+        if strat_id not in self.strategy_cash:
+            self.strategy_cash[strat_id] = self._basis(strat_id)
+        return self.strategy_cash[strat_id]
+
+    def cash(self, strat_id: str) -> float:
+        """Public, thread-safe read of one strategy's cash position."""
+        with self._lock:
+            return self._cash(strat_id)
+
+    def cash_book(self) -> Dict[str, float]:
+        """Snapshot of every strategy's cash position."""
+        with self._lock:
+            return dict(self.strategy_cash)
+
+    def set_cash(self, strat_id: str, amount: float, reset_basis: bool = False) -> None:
+        """Overwrite a strategy's cash balance (e.g. reconciling against the broker or
+        funding a new strategy). `reset_basis` also moves the capital basis, so the
+        starting point of the NAV curve follows."""
+        with self._lock:
+            self.strategy_cash[strat_id] = float(amount)
+            if reset_basis:
+                self.starting_cash[strat_id] = float(amount)
 
     def record_fill(self, symbol: str, signed_qty: float, price: float, strat_id: str) -> None:
         with self._lock:
@@ -73,6 +136,11 @@ class PositionLedger:
         strat_pos = self.strategy_positions.setdefault(strat_id, {})
         strat_cost = self.strategy_avg_cost.setdefault(strat_id, {})
         self.strategy_realized_pnl.setdefault(strat_id, 0.0)
+        mult = self.multipliers.get(symbol, 1.0)   # dollar-denominate (futures multiplier)
+
+        # Cash leg: a buy pays out, a sell takes in. Zero-sum on internal crosses, and it
+        # keeps  cash + market value == starting_cash + realized + unrealized  exact.
+        self.strategy_cash[strat_id] = self._cash(strat_id) - signed_qty * price * mult
 
         prev_qty = strat_pos.get(symbol, 0.0)
         prev_cost = strat_cost.get(symbol, 0.0)
@@ -86,7 +154,6 @@ class PositionLedger:
         else:
             closed_qty = min(abs(signed_qty), abs(prev_qty))
             direction = 1 if prev_qty > 0 else -1
-            mult = self.multipliers.get(symbol, 1.0)   # dollar-denominate (futures multiplier)
             self.strategy_realized_pnl[strat_id] += (price - prev_cost) * closed_qty * direction * mult
 
             if abs(signed_qty) > abs(prev_qty):
@@ -95,6 +162,23 @@ class PositionLedger:
                 strat_cost[symbol] = 0.0
 
         strat_pos[symbol] = new_qty
+
+    def write_off_position(self, strat_id: str, symbol: str) -> float:
+        """Repair path: drop a strategy position that is already flat at the broker,
+        crediting its cost basis back to cash. Books NO P&L (the exit price is unknown),
+        which keeps  nav == starting_cash + realized + unrealized  exact — the strategy
+        simply stops carrying an unrealized mark it never really had.
+        Returns the quantity written off."""
+        with self._lock:
+            qty = self.strategy_positions.get(strat_id, {}).get(symbol, 0.0)
+            if abs(qty) < 1e-9:
+                return 0.0
+            cost = self.strategy_avg_cost.get(strat_id, {}).get(symbol, 0.0)
+            mult = self.multipliers.get(symbol, 1.0)
+            self.strategy_cash[strat_id] = self._cash(strat_id) + cost * qty * mult
+            self.strategy_positions[strat_id][symbol] = 0.0
+            self.strategy_avg_cost.setdefault(strat_id, {})[symbol] = 0.0
+            return qty
 
     def fetch_broker_positions(self, timeout: float = 5.0) -> Dict[str, float]:
         self.broker_positions = {}
@@ -128,6 +212,7 @@ class PositionLedger:
             )
             logger_db.save_realized_pnl(dict(self.strategy_realized_pnl))
             logger_db.save_multipliers(dict(self.multipliers))
+            logger_db.save_strategy_cash(dict(self.strategy_cash), dict(self.starting_cash))
 
     def restore_state(self, logger_db) -> None:
         """Reload per-strategy positions, avg costs, realized P&L, and multipliers
@@ -136,37 +221,97 @@ class PositionLedger:
         positions, avg_cost = logger_db.load_strategy_positions()
         realized = logger_db.load_realized_pnl()
         multipliers = logger_db.load_multipliers()
+        cash, basis = logger_db.load_strategy_cash()
         with self._lock:
             self.strategy_positions = positions
             self.strategy_avg_cost = avg_cost
             self.strategy_realized_pnl = realized
             self.multipliers.update(multipliers)
-        logger.info("restored strategy state: %d strategies, %d symbols, %d multipliers",
-                    len(positions), sum(len(p) for p in positions.values()), len(multipliers))
+            # Cash survives restarts; a strategy with no saved row keeps the basis seeded
+            # from config (a newly added strategy starts fully in cash).
+            self.starting_cash.update(basis)
+            self.strategy_cash.update(cash)
+        logger.info("restored strategy state: %d strategies, %d symbols, %d multipliers, "
+                    "%d cash balances",
+                    len(positions), sum(len(p) for p in positions.values()), len(multipliers),
+                    len(cash))
 
     def equity_snapshot(self, marks: Dict[str, float]) -> Dict[str, dict]:
-        """Per-strategy realized + unrealized (mark-to-market) + cumulative total.
-        (mark - avg_cost) * qty is sign-correct for long and short. Missing mark
-        -> that leg contributes 0. Read under lock for a torn-free snapshot."""
+        """Per-strategy P&L *and* NAV, treating cash as one more position.
+
+        Keys per strategy:
+          realized / unrealized / equity   P&L only (`equity` = realized + unrealized) —
+                                           this is what the drawdown checks consume.
+          cash / position_value / nav      the balance-sheet view: nav = cash + position_value
+                                           = starting_cash + realized + unrealized.
+        (mark - avg_cost) * qty is sign-correct for long and short. A symbol with no mark
+        contributes 0 unrealized and is valued at cost, so NAV stays consistent. Read under
+        lock for a torn-free snapshot."""
         out = {}
         with self._lock:
-            strats = set(self.strategy_positions) | set(self.strategy_realized_pnl)
+            strats = (set(self.strategy_positions) | set(self.strategy_realized_pnl)
+                      | set(self.strategy_cash) | set(self.starting_cash))
             for strat in strats:
                 positions = self.strategy_positions.get(strat, {})
                 costs = self.strategy_avg_cost.get(strat, {})
                 realized = self.strategy_realized_pnl.get(strat, 0.0)
+                cash = self._cash(strat)
                 unrealized = 0.0
+                position_value = 0.0
+                stale = []
                 for sym, qty in positions.items():
-                    mark = marks.get(sym)
-                    if qty == 0 or mark is None:
+                    if qty == 0:
                         continue
-                    unrealized += (mark - costs.get(sym, 0.0)) * qty * self.multipliers.get(sym, 1.0)
-                out[strat] = {"realized": realized, "unrealized": unrealized,
-                              "equity": realized + unrealized}
+                    mult = self.multipliers.get(sym, 1.0)
+                    cost = costs.get(sym, 0.0)
+                    mark = marks.get(sym)
+                    if mark is None:
+                        stale.append(sym)          # value at cost -> contributes 0 unrealized
+                        position_value += cost * qty * mult
+                        continue
+                    unrealized += (mark - cost) * qty * mult
+                    position_value += mark * qty * mult
+                out[strat] = {
+                    "realized": realized,
+                    "unrealized": unrealized,
+                    "equity": realized + unrealized,          # P&L (unchanged meaning)
+                    "cash": cash,
+                    "position_value": position_value,
+                    "nav": cash + position_value,
+                    "starting_cash": self._basis(strat),
+                    "unmarked": stale,
+                }
         return out
-    
+
+    def strategy_book(self, strat_id: str, marks: Dict[str, float] = None) -> list:
+        """One strategy's holdings as a book of positions with CASH as the first line —
+        [{symbol, quantity, avg_cost, mark, multiplier, market_value, unrealized}, ...].
+        Cash has quantity == market_value and no cost basis."""
+        marks = marks or {}
+        with self._lock:
+            rows = [{
+                "symbol": self.CASH_SYMBOL, "quantity": self._cash(strat_id),
+                "avg_cost": None, "mark": None, "multiplier": 1.0,
+                "market_value": self._cash(strat_id), "unrealized": 0.0, "is_cash": True,
+            }]
+            for sym, qty in sorted(self.strategy_positions.get(strat_id, {}).items()):
+                if qty == 0:
+                    continue
+                mult = self.multipliers.get(sym, 1.0)
+                cost = self.strategy_avg_cost.get(strat_id, {}).get(sym, 0.0)
+                mark = marks.get(sym)
+                px = cost if mark is None else mark
+                rows.append({
+                    "symbol": sym, "quantity": qty, "avg_cost": cost, "mark": mark,
+                    "multiplier": mult, "market_value": px * qty * mult,
+                    "unrealized": 0.0 if mark is None else (mark - cost) * qty * mult,
+                    "is_cash": False,
+                })
+        return rows
+
 if __name__ == "__main__":
-    led = PositionLedger(executor=None)  # no connection needed to test attribution
+    led = PositionLedger(executor=None, config={"s1": {"capital_allocation": 100_000.0},
+                                               "s2": {"capital_allocation": 100_000.0}})
 
     # long side
     led.record_fill("AAPL", +100, 50.0, "s1")   # open long 100 @ 50
@@ -183,3 +328,11 @@ if __name__ == "__main__":
     print("realized:", led.strategy_realized_pnl["s2"])   # expect (280-300)*100*(-1) = +2000
     print("position:", led.strategy_positions["s2"]["TSLA"])  # expect +50.0
     print("avg cost:", led.strategy_avg_cost["s2"]["TSLA"])   # expect 280.0 (new long leg)
+
+    # cash as a position: NAV = cash + market value == starting cash + realized + unrealized
+    snap = led.equity_snapshot({"AAPL": 72.0, "TSLA": 285.0})
+    for sid, v in sorted(snap.items()):
+        print(f"{sid}: cash={v['cash']:,.2f} positions={v['position_value']:,.2f} "
+              f"nav={v['nav']:,.2f} (start {v['starting_cash']:,.0f} + pnl {v['equity']:,.2f})")
+        assert abs(v["nav"] - (v["starting_cash"] + v["equity"])) < 1e-6
+    print("book s1:", led.strategy_book("s1", {"AAPL": 72.0}))

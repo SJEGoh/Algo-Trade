@@ -127,7 +127,7 @@ class CentralExecutor(EClient, EWrapper):
         self._instruments = {}          # symbol -> instrument dict (to rebuild a contract when flattening)
 
         # --- position/risk state (owned by their components, NOT duplicated here) ---
-        self.ledger = PositionLedger(self)
+        self.ledger = PositionLedger(self, CONFIG)   # CONFIG seeds each strategy's cash position
         self.risk_manager = RiskManager(self.ledger, CONFIG, GLOBAL)
         self._pending_price_reqs: Dict[int, threading.Event] = {}   # reqId -> event fired when price arrives
         self._price_results: Dict[int, float] = {}                   # reqId -> price received

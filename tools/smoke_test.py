@@ -51,12 +51,18 @@ check("not in kill state", hj.get("killed") is False)
 check("GET /health reports market_open", "market_open" in hj, f"market_open={hj.get('market_open')}")
 
 # 2. read endpoints
-for path in ["/strategies", "/positions", "/pnl", "/orders", "/fills", "/pnl/history"]:
+for path in ["/strategies", "/positions", "/pnl", "/equity", "/orders", "/fills", "/pnl/history"]:
     try:
         r = get(path)
         check(f"GET {path} 200", r.status_code == 200)
     except Exception as e:
         check(f"GET {path} 200", False, str(e))
+# cash is a position: every strategy carries a balance and a capital basis
+pos = get("/positions").json()
+check("/positions exposes the cash book",
+      isinstance(pos.get("strategy_cash"), dict) and isinstance(pos.get("starting_cash"), dict),
+      str(list(pos)))
+
 strats = get("/strategies").json().get("strategies", [])
 check("cross_sectional_momentum configured",
       any(s["strategy_id"] == "cross_sectional_momentum" for s in strats))

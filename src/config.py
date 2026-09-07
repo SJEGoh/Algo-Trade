@@ -6,6 +6,10 @@ Minimal risk configuration for testing the CentralExecutor.
 Shape: strategy_id -> {
     "capital_allocation": float,   # max gross notional this strategy may hold
     "max_drawdown_pct":  float,    # halt strategy when realized loss / allocation >= this
+    "starting_cash":     float,    # OPTIONAL: cash the strategy is funded with (defaults to
+                                   # capital_allocation). Cash is held as a position in the
+                                   # ledger, so strategy NAV = cash + positions, and the
+                                   # dashboard equity curve is that summed across strategies.
 }
 
 Only strategy_ids listed here are on the allowlist — any intent from a

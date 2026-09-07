@@ -91,6 +91,13 @@ class EventLogger:
                     halted_at   TEXT NOT NULL,
                     reason      TEXT
                 );
+                -- Cash held as a position by each strategy (basis = capital at inception)
+                CREATE TABLE IF NOT EXISTS strategy_cash (
+                    strategy_id   TEXT PRIMARY KEY,
+                    cash          REAL NOT NULL,
+                    starting_cash REAL NOT NULL,
+                    updated_at    TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS strategy_multipliers (
                     symbol     TEXT PRIMARY KEY,
                     multiplier REAL NOT NULL
@@ -109,6 +116,12 @@ class EventLogger:
                 CREATE INDEX IF NOT EXISTS idx_journal_ts ON decision_journal(ts);
                 CREATE INDEX IF NOT EXISTS idx_journal_strat ON decision_journal(strategy_id);
             """)
+            # Columns added after the first release — migrate in place so an existing
+            # db/executor.db keeps its history (old rows simply have NULL nav).
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(equity_snapshots)")}
+            for col in ("cash", "position_value", "nav"):
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE equity_snapshots ADD COLUMN {col} REAL")
             self._conn.commit()
 
     @staticmethod
@@ -222,11 +235,15 @@ class EventLogger:
                 "expected_price", "quantity", "strategy_id", "filled_at"]
         return [dict(zip(cols, r)) for r in rows]
 
-    def log_equity(self, ts, strategy_id, realized, unrealized, equity) -> None:
+    def log_equity(self, ts, strategy_id, realized, unrealized, equity,
+                   cash=None, position_value=None, nav=None) -> None:
+        """`equity` is P&L (realized + unrealized); `nav` is the balance-sheet value
+        (cash + position_value). Both are stored so the dashboard can plot either."""
         self._execute(
-            "INSERT INTO equity_snapshots (ts, strategy_id, realized, unrealized, equity) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (ts, strategy_id, realized, unrealized, equity),
+            "INSERT INTO equity_snapshots "
+            "(ts, strategy_id, realized, unrealized, equity, cash, position_value, nav) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, strategy_id, realized, unrealized, equity, cash, position_value, nav),
         )
 
     # ------------------------------------------------------------------
@@ -264,6 +281,36 @@ class EventLogger:
                 self._conn.commit()
         except Exception as e:
             logger.error("save_realized_pnl failed: %s", e)
+
+    def save_strategy_cash(self, strategy_cash: dict, starting_cash: dict) -> None:
+        """Snapshot every strategy's cash position + capital basis."""
+        now = self._now()
+        try:
+            with self._lock:
+                for sid, cash in strategy_cash.items():
+                    self._conn.execute(
+                        "INSERT INTO strategy_cash (strategy_id, cash, starting_cash, updated_at) "
+                        "VALUES (?, ?, ?, ?) ON CONFLICT(strategy_id) DO UPDATE SET "
+                        "cash = excluded.cash, starting_cash = excluded.starting_cash, "
+                        "updated_at = excluded.updated_at",
+                        (sid, cash, starting_cash.get(sid, cash), now),
+                    )
+                self._conn.commit()
+        except Exception as e:
+            logger.error("save_strategy_cash failed: %s", e)
+
+    def load_strategy_cash(self) -> tuple:
+        """Returns (strategy_cash, starting_cash) dicts."""
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id, cash, starting_cash FROM strategy_cash"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_strategy_cash failed: %s", e)
+            return {}, {}
+        return ({sid: cash for sid, cash, _ in rows},
+                {sid: basis for sid, _, basis in rows})
 
     def save_halted_strategies(self, halted: set, active: set, config_keys: set, reason: str = "") -> None:
         """Save which strategies are halted (= in config but NOT in the active set)."""
@@ -387,7 +434,8 @@ class EventLogger:
         return [dict(zip(cols, r)) for r in rows]
 
     def get_equity_history(self, strategy_id=None, since=None) -> list:
-        q = "SELECT ts, strategy_id, realized, unrealized, equity FROM equity_snapshots"
+        q = ("SELECT ts, strategy_id, realized, unrealized, equity, cash, position_value, nav "
+             "FROM equity_snapshots")
         conds, params = [], []
         if strategy_id: conds.append("strategy_id = ?"); params.append(strategy_id)
         if since:       conds.append("ts >= ?");         params.append(since)
@@ -399,5 +447,6 @@ class EventLogger:
         except Exception as e:
             logger.error("get_equity_history failed: %s", e)
             return []
-        cols = ["ts", "strategy_id", "realized", "unrealized", "equity"]
+        cols = ["ts", "strategy_id", "realized", "unrealized", "equity",
+                "cash", "position_value", "nav"]
         return [dict(zip(cols, r)) for r in rows]

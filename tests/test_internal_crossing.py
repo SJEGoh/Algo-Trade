@@ -23,11 +23,12 @@ class FakeLoggerDB:
     def save_strategy_positions(self, *a, **kw): pass
     def save_realized_pnl(self, *a, **kw): pass
     def save_multipliers(self, *a, **kw): pass
+    def save_strategy_cash(self, *a, **kw): pass
 
 
 class FakeExecutor:
     def __init__(self, config):
-        self.ledger = PositionLedger(None)
+        self.ledger = PositionLedger(None, config)
         self.risk_manager = RiskManager(self.ledger, config)
         self.logger_db = FakeLoggerDB()
         self.placed = []

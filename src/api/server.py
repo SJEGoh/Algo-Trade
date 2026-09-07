@@ -217,11 +217,31 @@ def get_positions():
         "strategy_avg_cost": {
             sid: dict(costs) for sid, costs in executor.ledger.strategy_avg_cost.items()
         },
+        # cash is a position too — one balance per strategy, plus its capital basis
+        "strategy_cash": executor.ledger.cash_book(),
+        "starting_cash": dict(executor.ledger.starting_cash),
+        "multipliers": dict(executor.ledger.multipliers),
     }
 
 @app.get("/pnl")
 def get_pnl():
     return {"realized_pnl": dict(executor.ledger.strategy_realized_pnl)}
+
+
+@app.get("/equity")
+def get_equity():
+    """Latest sampled balance sheet: per-strategy cash + position value + NAV, and the
+    portfolio totals. Served from the sampler's cache so a dashboard poll never triggers
+    a market-data round trip."""
+    return _last_equity
+
+
+@app.get("/strategies/{strategy_id}/book")
+def strategy_book(strategy_id: str):
+    """One strategy's holdings with CASH as the first line, marked at the last sampled
+    prices."""
+    return {"strategy_id": strategy_id,
+            "book": executor.ledger.strategy_book(strategy_id, _last_equity.get("marks", {}))}
 
 @app.get("/health")
 def health():
@@ -306,9 +326,11 @@ def flatten_all():
                 continue
             for sym in list(positions):
                 if sym in broker_flat and abs(positions.get(sym, 0.0)) > 1e-9:
-                    cleaned.append({"strategy_id": sid, "symbol": sym, "was": positions[sym]})
-                    positions[sym] = 0.0
-                    executor.ledger.strategy_avg_cost.get(sid, {})[sym] = 0.0
+                    # write_off_position returns the cost basis to cash, so the strategy's
+                    # NAV stays consistent instead of losing the phantom leg's value
+                    was = executor.ledger.write_off_position(sid, sym)
+                    if was:
+                        cleaned.append({"strategy_id": sid, "symbol": sym, "was": was})
         if cleaned:
             executor.ledger.save_state(executor.logger_db)
             logging.getLogger("executor").info("Flatten cleanup: zeroed stale strategy positions: %s", cleaned)
@@ -456,6 +478,10 @@ def list_strategies():
 
 _sampler_stop = threading.Event()
 
+# Latest sampled balance sheet, refreshed by _equity_sampler and served by GET /equity.
+_last_equity: dict = {"ts": None, "strategies": {}, "totals": {}, "marks": {}}
+
+
 def _equity_sampler(interval: float = 60.0):
     log = logging.getLogger("executor")
     while not _sampler_stop.is_set():
@@ -467,15 +493,37 @@ def _equity_sampler(interval: float = 60.0):
             ts = datetime.now(timezone.utc).isoformat()
             snap = executor.ledger.equity_snapshot(marks)
             for sid in CONFIG:  # ensure every configured strategy has a point, even flat
-                snap.setdefault(sid, {"realized": 0.0, "unrealized": 0.0, "equity": 0.0})
+                basis = executor.ledger.starting_cash.get(sid, 0.0)
+                snap.setdefault(sid, {"realized": 0.0, "unrealized": 0.0, "equity": 0.0,
+                                      "cash": basis, "position_value": 0.0, "nav": basis,
+                                      "starting_cash": basis, "unmarked": []})
             _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
+            visible = {}
             for strat, v in snap.items():
                 if strat in _INTERNAL:
                     continue
-                executor.logger_db.log_equity(ts, strat, v["realized"], v["unrealized"], v["equity"])
-            # portfolio circuit breaker on total equity (realized + unrealized across all strategies)
-            total_equity = sum(v.get("equity", 0.0) for v in snap.values())
-            executor.enforce_daily_loss(total_equity)
+                visible[strat] = v
+                executor.logger_db.log_equity(
+                    ts, strat, v["realized"], v["unrealized"], v["equity"],
+                    cash=v.get("cash"), position_value=v.get("position_value"),
+                    nav=v.get("nav"),
+                )
+            # Portfolio balance sheet: NAV is the sum of every position of every strategy,
+            # cash included. Cached for the dashboard (GET /equity).
+            totals = {
+                "cash": sum(v.get("cash", 0.0) for v in visible.values()),
+                "position_value": sum(v.get("position_value", 0.0) for v in visible.values()),
+                "nav": sum(v.get("nav", 0.0) for v in visible.values()),
+                "starting_cash": sum(v.get("starting_cash", 0.0) for v in visible.values()),
+                "realized": sum(v.get("realized", 0.0) for v in visible.values()),
+                "unrealized": sum(v.get("unrealized", 0.0) for v in visible.values()),
+                "equity": sum(v.get("equity", 0.0) for v in visible.values()),
+            }
+            _last_equity.update({"ts": ts, "strategies": visible, "totals": totals,
+                                 "marks": {k: v for k, v in marks.items() if v is not None}})
+            # portfolio circuit breaker on total equity (cash + positions across all strategies;
+            # the baseline is a same-basis level, so the loss it measures is unchanged)
+            executor.enforce_daily_loss(sum(v.get("nav", 0.0) for v in snap.values()))
             # per-strategy total-equity drawdown; SKIP a strategy if any held symbol's mark is
             # stale/missing (don't halt+flatten on incomplete unrealized data — realized fast
             # path still guards it).
@@ -484,6 +532,8 @@ def _equity_sampler(interval: float = 60.0):
                 if held and not all(executor.mark_is_fresh(s) for s in held):
                     log.warning("total-drawdown check skipped for %s (stale/missing mark)", sid)
                     continue
+                # "equity" here is P&L (realized + unrealized) — the drawdown limit is a
+                # fraction of allocation, not of NAV.
                 executor.enforce_drawdown(sid, snap.get(sid, {}).get("equity", 0.0), "total")
         except Exception as e:
             log.error("equity sampler error: %s", e)
