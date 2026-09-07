@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+import time
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,7 +20,31 @@ class EventLogger:
         self._conn.execute("PRAGMA synchronous = NORMAL")
         self._init_schema()
 
-    def _init_schema(self) -> None:
+    def _init_schema(self, attempts: int = 3, delay: float = 2.0) -> None:
+        """Create any missing tables, retrying a locked database.
+
+        `docker compose up` can start the new executor while the old one still holds the
+        DB on the shared volume; schema statements take a write lock, so a single attempt
+        turns that race into a failed startup ("database is locked" -> container Error)."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self._create_tables()
+                break
+            except Exception as e:
+                logger.warning("schema init attempt %d/%d failed: %s", attempt, attempts, e)
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                if attempt == attempts:
+                    raise
+                time.sleep(delay)
+        # Columns added after the first release — migrated separately because, unlike the
+        # CREATE TABLE IF NOT EXISTS statements above, ALTER TABLE must never be able to
+        # stop the executor from starting.
+        self._has_nav_cols = self._migrate_equity_nav_columns()
+
+    def _create_tables(self) -> None:
         with self._lock:
             self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS orders (
@@ -116,13 +141,42 @@ class EventLogger:
                 CREATE INDEX IF NOT EXISTS idx_journal_ts ON decision_journal(ts);
                 CREATE INDEX IF NOT EXISTS idx_journal_strat ON decision_journal(strategy_id);
             """)
-            # Columns added after the first release — migrate in place so an existing
-            # db/executor.db keeps its history (old rows simply have NULL nav).
-            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(equity_snapshots)")}
-            for col in ("cash", "position_value", "nav"):
-                if col not in cols:
-                    self._conn.execute(f"ALTER TABLE equity_snapshots ADD COLUMN {col} REAL")
             self._conn.commit()
+
+    NAV_COLUMNS = ("cash", "position_value", "nav")
+
+    def _migrate_equity_nav_columns(self, attempts: int = 3, delay: float = 1.0) -> bool:
+        """Add cash / position_value / nav to an existing equity_snapshots table.
+
+        NEVER fatal. A concurrent writer (a still-shutting-down executor, the scheduler,
+        a tool) holds the write lock and this raises `database is locked` — losing the NAV
+        columns is a degraded dashboard, but failing here would take down trading. On
+        failure we fall back to writing the legacy P&L columns (the dashboard rebases rows
+        with no NAV onto each strategy's capital basis) and retry on the next restart."""
+        for attempt in range(1, attempts + 1):
+            try:
+                with self._lock:
+                    cols = {r[1] for r in self._conn.execute("PRAGMA table_info(equity_snapshots)")}
+                    missing = [c for c in self.NAV_COLUMNS if c not in cols]
+                    if not missing:
+                        return True
+                    for col in missing:
+                        self._conn.execute(f"ALTER TABLE equity_snapshots ADD COLUMN {col} REAL")
+                    self._conn.commit()
+                logger.info("equity_snapshots migrated: added %s", ", ".join(missing))
+                return True
+            except Exception as e:
+                logger.warning("equity_snapshots NAV migration attempt %d/%d failed: %s",
+                               attempt, attempts, e)
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                if attempt < attempts:
+                    time.sleep(delay)
+        logger.error("equity_snapshots NAV migration failed — logging P&L columns only "
+                     "(dashboard will rebase); retried on next restart")
+        return False
 
     @staticmethod
     def _now() -> str:
@@ -238,7 +292,15 @@ class EventLogger:
     def log_equity(self, ts, strategy_id, realized, unrealized, equity,
                    cash=None, position_value=None, nav=None) -> None:
         """`equity` is P&L (realized + unrealized); `nav` is the balance-sheet value
-        (cash + position_value). Both are stored so the dashboard can plot either."""
+        (cash + position_value). Both are stored so the dashboard can plot either — unless
+        the NAV migration couldn't run, in which case only the P&L columns are written."""
+        if not self._has_nav_cols:
+            self._execute(
+                "INSERT INTO equity_snapshots (ts, strategy_id, realized, unrealized, equity) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, strategy_id, realized, unrealized, equity),
+            )
+            return
         self._execute(
             "INSERT INTO equity_snapshots "
             "(ts, strategy_id, realized, unrealized, equity, cash, position_value, nav) "
@@ -434,8 +496,10 @@ class EventLogger:
         return [dict(zip(cols, r)) for r in rows]
 
     def get_equity_history(self, strategy_id=None, since=None) -> list:
-        q = ("SELECT ts, strategy_id, realized, unrealized, equity, cash, position_value, nav "
-             "FROM equity_snapshots")
+        cols = ["ts", "strategy_id", "realized", "unrealized", "equity"]
+        if self._has_nav_cols:
+            cols += list(self.NAV_COLUMNS)
+        q = f"SELECT {', '.join(cols)} FROM equity_snapshots"
         conds, params = [], []
         if strategy_id: conds.append("strategy_id = ?"); params.append(strategy_id)
         if since:       conds.append("ts >= ?");         params.append(since)
@@ -447,6 +511,4 @@ class EventLogger:
         except Exception as e:
             logger.error("get_equity_history failed: %s", e)
             return []
-        cols = ["ts", "strategy_id", "realized", "unrealized", "equity",
-                "cash", "position_value", "nav"]
         return [dict(zip(cols, r)) for r in rows]

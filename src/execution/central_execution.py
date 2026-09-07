@@ -1294,15 +1294,40 @@ class CentralExecutor(EClient, EWrapper):
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
-    def start(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 5, timeout: float = 5.0) -> dict:
+    def start(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 5,
+              timeout: float = 5.0, attempts: int = 5, retry_delay: float = 3.0) -> dict:
+        """Connect to IB and recover state. Retries the nextValidId handshake: IB Gateway
+        accepts socket connections (and passes its container healthcheck) seconds before
+        its API is ready to answer, so a single 5s wait turns a cold `docker compose up`
+        into a failed startup — the app exits, and compose reports the executor unhealthy.
+        Same pattern as _reconnect_loop. Worst case here is ~37s, inside the 45s
+        healthcheck start_period."""
         self._shutting_down = False
         self._conn = {"host": host, "port": port, "client_id": client_id}
-        self.connect(host, port, client_id)
-        self._api_thread = threading.Thread(target=self.run, daemon=True)  # store the handle
-        self._api_thread.start()
 
-        if not self._order_id_ready.wait(timeout=timeout):
-            raise TimeoutError("Timed out waiting for nextValidId — connection may have failed")
+        for attempt in range(1, attempts + 1):
+            self._order_id_ready.clear()
+            self.connect(host, port, client_id)
+            self._api_thread = threading.Thread(target=self.run, daemon=True)  # store the handle
+            self._api_thread.start()
+            if self._order_id_ready.wait(timeout=timeout):
+                if attempt > 1:
+                    logger.info("IB connected on attempt %d/%d", attempt, attempts)
+                break
+            logger.warning("no nextValidId within %.0fs (attempt %d/%d) — Gateway API not "
+                           "ready yet; retrying in %.0fs", timeout, attempt, attempts, retry_delay)
+            try:
+                self.disconnect()               # drop the half-open socket before retrying
+            except Exception:
+                pass
+            if self._api_thread.is_alive():
+                self._api_thread.join(timeout=2.0)
+            if attempt == attempts:
+                raise TimeoutError(
+                    f"Timed out waiting for nextValidId after {attempts} attempts — "
+                    f"connection to {host}:{port} may have failed")
+            time.sleep(retry_delay)
+
         self.reqMarketDataType(3)
         result = self.reconcile_and_log()      # ledger recovers NET positions from broker
         self.recover_open_orders()             # executor recovers open orders from IB
