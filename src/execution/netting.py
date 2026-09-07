@@ -15,6 +15,7 @@ Invariant maintained:  sum_over_strategies(strategy_positions[*][sym]) == net po
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -55,11 +56,106 @@ class NettingCoordinator:
 
     # ---------------- helpers ----------------
     def _mult(self, sym):
-        return float((self.instrument.get(sym) or {}).get("multiplier") or 1.0)
+        """Contract multiplier, or None when a futures leg's multiplier is unknown —
+        defaulting a future to 1.0 understates its notional by the multiplier (1,000x on
+        CL), which is a hole in the allocation cap, not a harmless default."""
+        inst = self.instrument.get(sym) or {}
+        m = inst.get("multiplier")
+        if m is None:
+            m = getattr(self.ex.ledger, "multipliers", {}).get(sym)   # learned from IB contracts
+        if m is None:
+            return None if inst.get("sec_type") == "FUT" else 1.0
+        try:
+            m = float(m)
+        except (TypeError, ValueError):
+            return None
+        return m if math.isfinite(m) and m > 0 else None
+
+    def _unit(self, sym):
+        """Value of ONE unit of `sym` (price * multiplier), or None if it can't be valued.
+        None must never be read as zero: an unpriced leg counted as $0 of notional is an
+        allocation cap that any order size passes."""
+        px = self.ref_price.get(sym)
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(px) or px <= 0:
+            return None
+        mult = self._mult(sym)
+        return None if mult is None else px * mult
+
+    def _exposure(self, sid):
+        """(gross_notional, unvaluable_symbols) for a strategy.
+
+        Counts every symbol the strategy WANTS or still HOLDS, at the larger of the two
+        quantities. Held positions matter because a desired book that was reset — lost
+        netting.json, a fresh container volume, a restart before the first resync — looks
+        empty while the strategy is still carrying the risk, so checking the book alone
+        lets it re-book a full allocation on top of what it already owns."""
+        want = self.desired.get(sid, {}) or {}
+        held = (getattr(self.ex.ledger, "strategy_positions", {}) or {}).get(sid, {}) or {}
+        gross, unvaluable = 0.0, []
+        for sym in set(want) | set(held):
+            qty = max(abs(float(want.get(sym, 0.0))), abs(float(held.get(sym, 0.0))))
+            if qty <= _EPS:
+                continue
+            unit = self._unit(sym)
+            if unit is None:
+                unvaluable.append(sym)
+                continue
+            gross += qty * unit
+        return gross, sorted(unvaluable)
 
     def _gross(self, sid):
-        return sum(abs(q) * self.ref_price.get(s, 0.0) * self._mult(s)
-                   for s, q in self.desired.get(sid, {}).items())
+        """Gross notional a strategy is exposed to (unvaluable legs excluded — callers
+        must check `_exposure` for those rather than trusting this number alone)."""
+        return self._exposure(sid)[0]
+
+    def _check_allocation(self, sid):
+        """The pooled path's allocation gate. Returns a rejection dict, or None to accept.
+        Fails closed: a leg that can't be valued is a rejection, never a free pass."""
+        gross, unvaluable = self._exposure(sid)
+        if unvaluable:
+            return {"accepted": False,
+                    "reason": f"{sid}: cannot value {', '.join(unvaluable)} — missing/invalid "
+                              f"reference price or contract multiplier; order rejected"}
+        if not math.isfinite(gross):
+            return {"accepted": False, "reason": f"{sid}: gross notional is not a number"}
+        alloc = float(self.config[sid]["capital_allocation"])
+        if gross > alloc:
+            return {"accepted": False,
+                    "reason": f"{sid} desired gross {gross:,.0f} exceeds allocation {alloc:,.0f}"}
+
+        # Same portfolio-wide cap /orders enforces — pooled books were never checked against it.
+        max_gross = None
+        rm = getattr(self.ex, "risk_manager", None)
+        if rm is not None and hasattr(rm, "max_gross_exposure"):
+            max_gross = rm.max_gross_exposure()
+        if max_gross is not None:
+            total = 0.0
+            for other in set(self.desired) | set(getattr(self.ex.ledger, "strategy_positions", {})):
+                g, u = self._exposure(other)
+                if u:
+                    return {"accepted": False,
+                            "reason": f"cannot value {', '.join(u)} for {other} — "
+                                      "portfolio gross check failed closed"}
+                total += g
+            if total > float(max_gross):
+                return {"accepted": False,
+                        "reason": f"portfolio gross {total:,.0f} exceeds GLOBAL "
+                                  f"max_gross_exposure {float(max_gross):,.0f}"}
+        return None
+
+    def _set_ref_price(self, sym, price) -> None:
+        """Record a reference price ONLY if it can actually value the leg. Storing 0.0 (or
+        NaN) for a missing price is what let an unpriced book pass the allocation cap."""
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(px) and px > 0:
+            self.ref_price[sym] = px
 
     def net(self) -> dict:
         out = {}
@@ -76,22 +172,21 @@ class NettingCoordinator:
                 return {"accepted": False, "reason": f"{sid} not active"}
             if instrument is not None:
                 self.instrument[symbol] = instrument
-            if price is not None:
-                self.ref_price[symbol] = float(price)
+            self._set_ref_price(symbol, price)
             book = self.desired.setdefault(sid, {})
             prev = book.get(symbol)
             if qty == 0:
                 book.pop(symbol, None)
             else:
                 book[symbol] = float(qty)
-            alloc = self.config[sid]["capital_allocation"]
-            if self._gross(sid) > alloc:
+            # Exits always pass: closing risk can't be blocked by a missing price.
+            rejection = None if qty == 0 else self._check_allocation(sid)
+            if rejection is not None:
                 if prev is None:
                     book.pop(symbol, None)
                 else:
                     book[symbol] = prev
-                return {"accepted": False,
-                        "reason": f"{sid} desired gross exceeds allocation {alloc:.0f}"}
+                return rejection
             self._save()
             rebal = self._rebalance({symbol})
             return {"accepted": True, **rebal}
@@ -105,17 +200,19 @@ class NettingCoordinator:
             for it in intents:
                 sym = it["instrument"]["symbol"]
                 self.instrument[sym] = it["instrument"]
-                self.ref_price[sym] = float(it.get("expected_price") or it.get("limit_price") or 0.0)
+                # NOT `or 0.0` — an absent price must stay absent so the allocation check
+                # can reject the book, instead of valuing the leg at zero and passing it.
+                self._set_ref_price(sym, it.get("expected_price") if it.get("expected_price")
+                                    is not None else it.get("limit_price"))
                 q = float(it["target_quantity"])
                 if q != 0:
                     new_book[sym] = q
             old = self.desired.get(sid, {})
             self.desired[sid] = new_book
-            alloc = self.config[sid]["capital_allocation"]
-            if self._gross(sid) > alloc:
+            rejection = self._check_allocation(sid)
+            if rejection is not None:
                 self.desired[sid] = old
-                return {"accepted": False,
-                        "reason": f"{sid} desired gross exceeds allocation {alloc:.0f}"}
+                return rejection
             self._save()
             rebal = self._rebalance(set(old) | set(new_book))
             return {"accepted": True, **rebal}

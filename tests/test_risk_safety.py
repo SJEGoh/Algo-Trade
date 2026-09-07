@@ -47,10 +47,26 @@ def test_order_over_allocation_rejected():
     assert "allocation" in r["reason"]
 
 
-def test_missing_price_skips_notional_check():
+@pytest.mark.parametrize("bad_price", [None, 0, 0.0, -5.0, float("nan"), float("inf"), "abc"])
+def test_unpriceable_order_is_rejected_not_waved_through(bad_price):
+    """An order that can't be valued must FAIL CLOSED.
+
+    This used to approve unconditionally ("notional check skipped"), which waives the
+    allocation cap entirely — the way an oversized order gets past a small allocation.
+    NaN matters too: every comparison against a limit is False, so a NaN gross passes."""
     _, rm = make(alloc=1_000)  # tiny cap
-    # no reference price -> notional check skipped (schema normally guarantees one)
-    assert rm.check_order(intent("AAA"), resolved_delta=99_999, price=None)["approved"] is True
+    r = rm.check_order(intent("AAA"), resolved_delta=99_999, price=bad_price)
+    assert r["approved"] is False
+    assert "reference price" in r["reason"] or "not a number" in r["reason"]
+
+
+def test_nan_multiplier_cannot_hide_a_position():
+    """A NaN unit value makes projected gross NaN, and NaN > alloc is False."""
+    _, rm = make(alloc=1_000)
+    r = rm.check_order(intent("AAA"), resolved_delta=99_999, price=100.0,
+                       multiplier=float("nan"))
+    assert r["approved"] is False
+    assert "not a number" in r["reason"]
 
 
 # ---------------------------------------------------------------------------

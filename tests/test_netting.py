@@ -27,7 +27,7 @@ class FakeExecutor:
     def _cancel_open_orders_for_symbol(self, sym):
         pass  # tests fill promptly, so no stale in-flight orders
 
-    def place_net_order(self, sym, delta, instrument, price):
+    def place_net_order(self, sym, delta, instrument, price, urgent=False):
         self.ledger.record_net_pending(sym, delta)
         oid = len(self.placed) + 1
         self.placed.append({"symbol": sym, "delta": delta, "price": price})

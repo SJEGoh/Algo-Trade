@@ -1,9 +1,20 @@
 from ledger.position_ledger import PositionLedger
+import math
 import threading
 from typing import Dict, Optional, Literal
 
 import logging
 logger = logging.getLogger("executor")
+
+def _is_priceable(price) -> bool:
+    """A price usable for a notional check: a real, finite, strictly positive number.
+    None / NaN / 0 / negative all mean "cannot value" — never "no limit"."""
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(p) and p > 0
+
 
 class RiskManager:
     def __init__(self, ledger, config: dict, global_config: dict = None):
@@ -19,9 +30,12 @@ class RiskManager:
         if strategy_id not in self._active_strategies:
             return {"approved": False, "reason": f"strategy {strategy_id} is not active"}
 
-        if price is None:
-            logger.warning("No reference price for %s — notional check skipped", strategy_id)
-            return {"approved": True}
+        # FAIL CLOSED. An unpriced order can't be valued, so approving it waives the
+        # allocation cap entirely — that is how an oversized order gets through.
+        if not _is_priceable(price):
+            logger.warning("No usable reference price for %s (%r) — order REJECTED", strategy_id, price)
+            return {"approved": False,
+                    "reason": f"no usable reference price ({price!r}) — cannot value order"}
 
         alloc = self._config[strategy_id]["capital_allocation"]
         symbol = intent["instrument"]["symbol"]
@@ -34,7 +48,15 @@ class RiskManager:
 
         eff = self._ledger.strategy_effective_positions(strategy_id)
         eff[symbol] = eff.get(symbol, 0.0) + resolved_delta
-        projected_gross = sum(abs(q) * unit.get(s, price * float(multiplier)) for s, q in eff.items())
+        fallback = price * float(multiplier)
+        projected_gross = sum(abs(q) * self._unit_value(strategy_id, s, unit, fallback)
+                              for s, q in eff.items())
+
+        # A NaN gross compares False against every limit, so it would silently pass.
+        if not math.isfinite(projected_gross):
+            return {"approved": False,
+                    "reason": f"projected gross notional is not a number ({projected_gross!r}) "
+                              "— a leg has a bad price or multiplier"}
 
         if projected_gross > alloc:
             return {"approved": False,
@@ -49,11 +71,36 @@ class RiskManager:
                 if other_sid == strategy_id:
                     eff_other[symbol] = eff_other.get(symbol, 0.0) + resolved_delta
                 for s, q in eff_other.items():
-                    total_gross += abs(q) * unit.get(s, price * float(multiplier))
+                    total_gross += abs(q) * self._unit_value(other_sid, s, unit, fallback)
+            if not math.isfinite(total_gross):
+                return {"approved": False,
+                        "reason": "portfolio gross notional is not a number — a leg has a bad price"}
             if total_gross > max_gross:
                 return {"approved": False,
                         "reason": f"order would exceed GLOBAL gross exposure: projected {total_gross:.0f} > {max_gross:.0f}"}
         return {"approved": True}
+
+    def _unit_value(self, strat_id: str, symbol: str, unit: dict, fallback: float) -> float:
+        """Value of one unit of `symbol` for the gross-notional sum.
+
+        `unit` holds real traded references (price * multiplier) for symbols this session
+        has priced. It is EMPTY for a symbol never traded since the last restart, while
+        positions in that symbol restore from the database — so falling straight back to
+        the incoming order's price valued an existing $338k holding at whatever the new
+        order happened to cost. The strategy's own average cost is a far better estimate,
+        and it's already in the ledger."""
+        if symbol in unit:
+            return unit[symbol]
+        try:
+            cost = (getattr(self._ledger, "strategy_avg_cost", {}) or {}).get(strat_id, {}).get(symbol)
+            if cost:
+                mult = float((getattr(self._ledger, "multipliers", {}) or {}).get(symbol, 1.0))
+                value = abs(float(cost)) * mult
+                if math.isfinite(value) and value > 0:
+                    return value
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return fallback
 
     def _strategy_gross_notional(self, strat_id: str, price: float) -> float:
         positions = self._ledger.strategy_positions.get(strat_id, {})
@@ -95,6 +142,11 @@ class RiskManager:
             return {"breached": False, "drawdown_pct": 0.0, "max_dd": max_dd or 0.0}
         dd = (-pnl / alloc) if pnl < 0 else 0.0
         return {"breached": dd >= max_dd, "drawdown_pct": dd, "max_dd": max_dd}
+
+    def max_gross_exposure(self):
+        """Portfolio-wide gross-notional cap, or None if unset. Public so the netting
+        coordinator can enforce the same limit on pooled books."""
+        return self._global.get("max_gross_exposure")
 
     def is_active(self, strategy_id: str) -> bool:
         with self._lock:
