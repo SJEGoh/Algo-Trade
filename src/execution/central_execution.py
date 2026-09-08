@@ -155,6 +155,7 @@ class CentralExecutor(EClient, EWrapper):
         self._whatif_events: Dict[int, threading.Event] = {}
         self._startup_degraded = False   # True if startup reconciliation never succeeded
         self._flatten_retry_ts: Dict[str, float] = {}  # strat -> last flatten retry (ensure_flat)
+        self._readonly_retries: Dict[str, int] = {}    # symbol -> read-only retries this episode
         self._daily_baseline: Optional[float] = None  # portfolio equity baseline for the circuit breaker
         self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
@@ -233,11 +234,23 @@ class CentralExecutor(EClient, EWrapper):
                            reqId, errorCode, errorString,
                            advancedOrderRejectJson or "")
 
-    def _retry_readonly_order(self, failed_order_id: int, max_retries: int = 5,
-                              delay: float = 15.0) -> None:
-        """Re-submit an order that was rejected because the Gateway was still in
-        read-only mode. Runs in a background thread so it doesn't block the
-        EWrapper callback thread. Retries with exponential back-off."""
+    #: read-only resubmissions allowed per symbol, per episode. Counted across the whole
+    #: chain rather than per order — see _retry_readonly_order.
+    READONLY_MAX_RETRIES = 2
+
+    def _retry_readonly_order(self, failed_order_id: int, delay: float = 15.0) -> None:
+        """Resubmit an order IB rejected with code 321 (gateway in read-only mode).
+
+        The cap is per SYMBOL and spans the whole chain, which is the only thing that
+        actually bounds this. Counting per order does not: the resubmission gets a new
+        order id, IB rejects that one too, and ITS error callback starts a fresh chain with
+        a fresh budget. What looks like "at most N retries" is then an unbounded loop that
+        only a process restart clears — orders accumulate every `delay` seconds for as long
+        as the gateway stays read-only.
+
+        Giving up is CRITICAL rather than a warning: the order was never placed, so silence
+        here means a position the strategy believes it has and does not.
+        """
         info = self.order_status.get(failed_order_id)
         if not info:
             return
@@ -246,43 +259,57 @@ class CentralExecutor(EClient, EWrapper):
         if abs(pending) < 1e-9:
             return
 
+        attempts = self._readonly_retries.get(sym, 0)
+        if attempts >= self.READONLY_MAX_RETRIES:
+            logger.critical(
+                "READ-ONLY GIVE UP %s: %d/%d retries used and the gateway is still "
+                "refusing orders. %s %g %s was NOT placed and will not be retried — fix the "
+                "gateway's read-only setting, then resubmit.",
+                sym, attempts, self.READONLY_MAX_RETRIES,
+                "sell" if pending < 0 else "buy", abs(pending), sym)
+            return
+        self._readonly_retries[sym] = attempts + 1
+
         def _retry():
-            for attempt in range(1, max_retries + 1):
-                wait = delay * attempt
-                logger.warning("READ-ONLY RETRY %s: attempt %d/%d in %.0fs",
-                               sym, attempt, max_retries, wait)
-                time.sleep(wait)
-                # rebuild and resubmit
-                try:
-                    instrument = self._instruments.get(sym, {"symbol": sym})
-                    ref_price = info.get("expected_price")
-                    is_net = info.get("net", False)
-                    if is_net:
-                        # remove stale pending so place_net_order can re-add
-                        self.ledger.pending_deltas.pop(sym, None)
-                        oid = self.place_net_order(sym, pending, instrument, ref_price)
-                    else:
-                        side = "buy" if pending > 0 else "sell"
-                        intent = {
-                            "client_order_id": f"retry-{sym}-{int(time.time()*1000)}",
-                            "strategy_id": info.get("strategy_id", "unknown"),
-                            "instrument": instrument,
-                            "side": side,
-                            "quantity": abs(pending),
-                            "order_type": "market",
-                            "time_in_force": "day",
-                            "expected_price": ref_price,
-                        }
-                        oid = self.place_order(self.atr_layer.transform(intent))
-                    if oid:
-                        logger.info("READ-ONLY RETRY %s: resubmitted as orderId=%s", sym, oid)
-                        self._api_ready.set()  # gateway is accepting orders now
-                        return
-                except Exception as e:
-                    logger.warning("READ-ONLY RETRY %s attempt %d error: %s", sym, attempt, e)
-            logger.error("READ-ONLY RETRY %s: gave up after %d attempts", sym, max_retries)
+            logger.warning("READ-ONLY RETRY %s: attempt %d/%d in %.0fs",
+                           sym, attempts + 1, self.READONLY_MAX_RETRIES, delay)
+            time.sleep(delay)
+            try:
+                instrument = self._instruments.get(sym, {"symbol": sym})
+                ref_price = info.get("expected_price")
+                if info.get("net", False):
+                    # remove stale pending so place_net_order can re-add it
+                    self.ledger.pending_deltas.pop(sym, None)
+                    oid = self.place_net_order(sym, pending, instrument, ref_price)
+                else:
+                    intent = {
+                        "client_order_id": f"retry-{sym}-{int(time.time() * 1000)}",
+                        "strategy_id": info.get("strategy_id", "unknown"),
+                        "instrument": instrument,
+                        "side": "buy" if pending > 0 else "sell",
+                        "quantity": abs(pending),
+                        "order_type": "market",
+                        "time_in_force": "day",
+                        "expected_price": ref_price,
+                    }
+                    oid = self.place_order(self.atr_layer.transform(intent))
+                if oid:
+                    logger.info("READ-ONLY RETRY %s: resubmitted as orderId=%s", sym, oid)
+            except Exception as e:
+                logger.warning("READ-ONLY RETRY %s attempt %d error: %s",
+                               sym, attempts + 1, e)
 
         threading.Thread(target=_retry, daemon=True, name=f"retry-321-{sym}").start()
+
+    def clear_readonly_retries(self, symbol: str = None) -> None:
+        """Forget the retry budget — the gateway is accepting orders again.
+
+        Called on every fill, so a read-only episode months from now starts from a full
+        budget instead of being suppressed by a counter left over from this one."""
+        if symbol is None:
+            self._readonly_retries.clear()
+        else:
+            self._readonly_retries.pop(symbol, None)
 
     def get_next_order_id(self, timeout: float = 5.0) -> int:
         if not self._order_id_ready.wait(timeout=timeout):
@@ -763,6 +790,10 @@ class CentralExecutor(EClient, EWrapper):
     def execDetails(self, reqId: int, contract: Contract, execution: Execution) -> None:
         order_info = self.order_status.get(execution.orderId, {})
         strategy_id = order_info.get("strategy_id", "unknown")
+        # A fill proves the gateway is accepting orders, so this symbol's read-only budget
+        # goes back to full. Without a reset the cap is one-shot for the life of the
+        # process: the next read-only episode would be refused on a stale counter.
+        self.clear_readonly_retries(contract.symbol)
         signed_qty = execution.shares if execution.side == "BOT" else -execution.shares
         if getattr(contract, "multiplier", None):
             try:
