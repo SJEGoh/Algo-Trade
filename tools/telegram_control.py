@@ -202,6 +202,9 @@ def cmd_help(args, ctx) -> str:
         "  /allocate <strategy> <amount>  re-allocate capital *\n"
         "        150k sets it, -40k takes it out; add 'equal' to split a\n"
         "        sell-down evenly instead of pro-rata\n"
+        "  /addstrategy <id> <amount> [dd]  put a new strategy on the\n"
+        "        allowlist, e.g. /addstrategy pairs_v2 150k 10%  *\n"
+        "  /delstrategy <id>              remove one (must be flat) *\n"
         "  /reconcile                     resync with the broker\n"
         "  /reset_daily                   reset the daily loss baseline\n"
         "\n* needs /confirm <token> within "
@@ -469,6 +472,96 @@ def cmd_allocate(args, ctx) -> str:
     return text
 
 
+ADDSTRATEGY_USAGE = (
+    "usage: /addstrategy <strategy_id> <allocation> [max_drawdown]\n"
+    "  /addstrategy pairs_v2 150k        $150k, 15% drawdown halt (the default)\n"
+    "  /addstrategy pairs_v2 150k 10%    halt it at a 10% loss instead\n"
+    "\nThe id is what your strategy sends as strategy_id — it must match exactly, and it\n"
+    "cannot be one that already exists (use /allocate to re-capitalise those).")
+
+DEFAULT_MAX_DRAWDOWN = 0.15
+
+
+def _parse_drawdown(text: str) -> float:
+    """'10%' and '0.10' both mean the same thing; '10' means 10%, not 1000%.
+
+    Guessing here is deliberate — the alternative is a fat-fingered `10` installing a halt
+    that can never trigger, which is exactly the failure you would not notice until it
+    mattered."""
+    raw = text.strip().rstrip("%")
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"could not read a drawdown from {text!r} — try 15% or 0.15")
+    if value > 1:
+        value /= 100.0
+    if not 0 < value <= 1:
+        raise ValueError(f"max_drawdown must be between 0 and 100% (got {text!r})")
+    return value
+
+
+def _addstrategy_body(args) -> dict:
+    if len(args) < 2:
+        raise ValueError(ADDSTRATEGY_USAGE)
+    sid = args[0].strip()
+    amount, is_delta = _parse_amount(args[1])
+    if is_delta:
+        raise ValueError("a new strategy needs an absolute allocation, not +/- a delta")
+    drawdown = _parse_drawdown(args[2]) if len(args) > 2 else DEFAULT_MAX_DRAWDOWN
+    return {"strategy_id": sid, "capital_allocation": amount,
+            "max_drawdown": drawdown}
+
+
+def preview_addstrategy(args, ctx) -> str:
+    """Shown in the confirmation prompt. There is no server-side dry run for this one, so
+    the preview is built locally — it exists so the id is read back before it is created:
+    a typo'd id creates a SECOND strategy rather than failing, and the strategy sending
+    that id would then trade against an allowlist entry nobody meant to make."""
+    body = _addstrategy_body(args)
+    existing = {s["strategy_id"] for s in api_get("/strategies").get("strategies", [])}
+    if body["strategy_id"] in existing:
+        raise ValueError(f"{body['strategy_id']} already exists — /allocate changes its "
+                         "capital, /addstrategy only creates new ones")
+    return (f"create strategy {body['strategy_id']}\n"
+            f"allocation   {money(body['capital_allocation'])}\n"
+            f"drawdown halt at {body['max_drawdown']:.0%} "
+            f"({money(body['capital_allocation'] * body['max_drawdown'])} of loss)\n"
+            f"starting cash {money(body['capital_allocation'])}")
+
+
+def cmd_addstrategy(args, ctx) -> str:
+    body = _addstrategy_body(args)
+    body["created_by"] = ctx.get("user", "telegram")
+    r = api_post("/strategies", body)
+    return (f"\u2705 {r['strategy_id']} created\n"
+            f"allocation {money(r['capital_allocation'])}, "
+            f"halt at {r['max_drawdown']:.0%}\n"
+            f"cash {money(r['starting_cash'])}\n"
+            f"It is active now and survives a restart. Point your strategy at "
+            f"strategy_id={r['strategy_id']}.")
+
+
+def preview_delstrategy(args, ctx) -> str:
+    if not args:
+        raise ValueError("usage: /delstrategy <strategy_id>")
+    sid = args[0].strip()
+    positions = api_get("/positions").get("strategy_positions", {}).get(sid, {})
+    held = ", ".join(f"{s} {q:g}" for s, q in positions.items() if q) or "nothing"
+    return (f"remove strategy {sid}\n"
+            f"currently holding: {held}\n"
+            "Only runtime-added strategies can be removed, and only while flat.")
+
+
+def cmd_delstrategy(args, ctx) -> str:
+    if not args:
+        raise ValueError("usage: /delstrategy <strategy_id>")
+    sid = args[0].strip()
+    r = requests.delete(f"{EXECUTOR_URL}/strategies/{sid}",
+                        headers={"X-API-Key": API_KEY}, timeout=30)
+    r.raise_for_status()
+    return f"\U0001f5d1 {sid} removed from the allowlist."
+
+
 def _int_arg(args, default):
     try:
         return max(1, min(50, int(args[0])))
@@ -504,6 +597,12 @@ COMMANDS = {
     "unkill":      Command(cmd_unkill, restricted=True, confirm=True),
     "allocate":    Command(cmd_allocate, restricted=True, confirm=True,
                            preview=preview_allocate),
+    # adding to the allowlist is what lets a strategy trade at all, so it gets the same
+    # speed bump as moving money
+    "addstrategy": Command(cmd_addstrategy, restricted=True, confirm=True,
+                           preview=preview_addstrategy),
+    "delstrategy": Command(cmd_delstrategy, restricted=True, confirm=True,
+                           preview=preview_delstrategy),
 }
 
 # token -> (command, args, user_id, expires_at)

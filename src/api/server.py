@@ -581,6 +581,108 @@ def list_fills(limit: int = 50):
     return {"fills": filtered[:limit]}
 
 
+class NewStrategyRequest(BaseModel):
+    """A strategy to add to the allowlist at runtime.
+
+    `max_drawdown` is a FRACTION of the allocation (0.15 = halt at a 15% loss), and it is
+    required rather than defaulted because a strategy without one has its drawdown halt
+    silently disabled — see validate_config in config.py."""
+    strategy_id: str = Field(..., min_length=1, max_length=64)
+    capital_allocation: float = Field(..., gt=0)
+    max_drawdown: float = Field(..., gt=0, le=1)
+    starting_cash: Optional[float] = Field(None, ge=0)
+    created_by: str = ""
+
+
+@app.post("/strategies", dependencies=[Depends(require_api_key)])
+def add_strategy(req: NewStrategyRequest):
+    """Register a new strategy on the allowlist without a restart.
+
+    CONFIG is fail-closed — an intent from an unknown strategy_id is rejected — and the
+    ledger and risk manager both hold a reference to that same dict, so adding the entry
+    here is what makes the strategy tradeable. Two things make this safe to expose:
+
+      * it PERSISTS BEFORE it takes effect. A strategy live in memory but missing from the
+        database vanishes at the next restart, and its orders start being rejected in the
+        middle of a session with nothing to explain why;
+      * it refuses to touch an id that already exists. Overwriting a live strategy's
+        allocation is what /strategies/{id}/allocation is for — that path knows how to
+        raise cash by selling, this one would just move the cap out from under an open book.
+    """
+    sid = req.strategy_id.strip()
+    if not sid:
+        raise HTTPException(status_code=422, detail="strategy_id required")
+    if not all(c.isalnum() or c in "_-" for c in sid):
+        raise HTTPException(status_code=422,
+                            detail="strategy_id may only contain letters, digits, _ and -")
+    if sid in CONFIG:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{sid} already exists — use POST /strategies/{sid}/allocation to change "
+                   "its capital")
+
+    entry = {"capital_allocation": float(req.capital_allocation),
+             "max_drawdown": float(req.max_drawdown)}
+    if req.starting_cash is not None:
+        entry["starting_cash"] = float(req.starting_cash)
+
+    problems = validate_config({sid: entry})
+    if problems:
+        raise HTTPException(status_code=422, detail="; ".join(problems))
+
+    # Persist FIRST. If this raises, nothing has been mutated and the caller gets a clean
+    # failure, rather than a strategy that trades today and disappears tomorrow.
+    try:
+        executor.logger_db.save_runtime_strategy(
+            sid, entry["capital_allocation"], entry["max_drawdown"],
+            entry.get("starting_cash"), req.created_by)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"could not persist {sid}, so it was NOT added: {e}")
+
+    CONFIG[sid] = entry                       # shared with the ledger and the risk manager
+    executor.risk_manager._active_strategies.add(sid)
+    basis = executor.ledger._basis(sid)       # seeds cash from the entry we just installed
+
+    executor.logger_db.log_decision(
+        sid, "add_strategy",
+        f"Strategy {sid} added: allocation {entry['capital_allocation']:,.0f}, "
+        f"max_drawdown {entry['max_drawdown']:.0%}",
+        detail=f"created_by={req.created_by or 'api'}, starting_cash={basis:,.2f}")
+    _alert(f"\U0001f195 Strategy added: {sid} — allocation {entry['capital_allocation']:,.0f}, "
+           f"max drawdown {entry['max_drawdown']:.0%}", topic="orders")
+
+    return {"strategy_id": sid, "active": True, "starting_cash": basis, **entry}
+
+
+@app.delete("/strategies/{strategy_id}", dependencies=[Depends(require_api_key)])
+def remove_strategy(strategy_id: str):
+    """Remove a runtime-added strategy. Refuses while it still holds anything — removing a
+    strategy with an open book would orphan those positions: the executor would keep them at
+    the broker with no allowlist entry to reconcile, halt, or flatten them through."""
+    if strategy_id not in CONFIG:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {strategy_id}")
+    if strategy_id not in executor.logger_db.load_runtime_strategies():
+        raise HTTPException(status_code=409,
+                            detail=f"{strategy_id} is defined in config.py, not at runtime — "
+                                   "remove it there and restart")
+    open_names = {sym: qty for sym, qty
+                  in (executor.ledger.strategy_positions.get(strategy_id) or {}).items()
+                  if qty}
+    if open_names:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{strategy_id} still holds {', '.join(open_names)} — flatten it first")
+
+    executor.logger_db.delete_runtime_strategy(strategy_id)
+    CONFIG.pop(strategy_id, None)
+    executor.risk_manager._active_strategies.discard(strategy_id)
+    executor.logger_db.log_decision(strategy_id, "remove_strategy",
+                                    f"Strategy {strategy_id} removed")
+    _alert(f"\U0001f5d1 Strategy removed: {strategy_id}", topic="orders")
+    return {"strategy_id": strategy_id, "removed": True}
+
+
 @app.get("/strategies")
 def list_strategies():
     return {"strategies": [

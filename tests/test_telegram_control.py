@@ -342,3 +342,72 @@ def test_negative_money_reads_naturally(bot):
     assert bot.money(-50_000) == "-$50,000"
     assert bot.money(50_000) == "$50,000"
     assert bot.money(None) == "—"
+
+
+# ----------------------------------------------------------------- /addstrategy
+# Adding an id to the allowlist is what lets a strategy trade at all, so it carries the same
+# gates as moving money: allow-listed users only, and a /confirm token. The preview matters
+# as much as the gate — a typo'd id CREATES a second strategy rather than failing, and the
+# strategy sending that id then trades against an entry nobody meant to make.
+
+def test_addstrategy_is_restricted(bot):
+    bot.handle(msg("/addstrategy pairs_v2 150k", user_id=OWNER + 1))
+    assert not bot.posted
+    assert "not allow-listed" in bot.sent[-1][0]
+
+
+def test_addstrategy_needs_confirmation(bot, monkeypatch):
+    monkeypatch.setattr(bot, "api_get", lambda path, **kw: {"strategies": []})
+    bot.handle(msg("/addstrategy pairs_v2 150k"))
+    assert not bot.posted, "created the strategy without a confirmation"
+    assert "/confirm" in bot.sent[-1][0]
+
+
+def test_addstrategy_preview_shows_what_will_be_created(bot, monkeypatch):
+    monkeypatch.setattr(bot, "api_get", lambda path, **kw: {"strategies": []})
+    bot.handle(msg("/addstrategy pairs_v2 150k 10%"))
+
+    prompt = bot.sent[-1][0]
+    assert "pairs_v2" in prompt
+    assert "150,000" in prompt or "150k" in prompt.lower()
+    assert "10%" in prompt
+
+
+def test_addstrategy_posts_after_confirm(bot, monkeypatch):
+    monkeypatch.setattr(bot, "api_get", lambda path, **kw: {"strategies": []})
+    monkeypatch.setattr(bot, "api_post", lambda path, body=None: bot.posted.append(
+        (path, body)) or {"strategy_id": "pairs_v2", "capital_allocation": 150_000.0,
+                          "max_drawdown": 0.10, "starting_cash": 150_000.0})
+    bot.handle(msg("/addstrategy pairs_v2 150k 10%"))
+    token = bot.sent[-1][0].split("/confirm ")[1].split()[0].strip("`*_ \n")
+
+    bot.handle(msg(f"/confirm {token}"))
+    path, body = bot.posted[-1]
+    assert path == "/strategies"
+    assert body["strategy_id"] == "pairs_v2"
+    assert body["capital_allocation"] == 150_000.0
+    assert body["max_drawdown"] == 0.10
+
+
+def test_addstrategy_refuses_an_existing_id(bot, monkeypatch):
+    """/allocate re-capitalises an existing strategy — it knows how to raise cash by
+    selling. Routing that through /addstrategy would move the cap under an open book."""
+    monkeypatch.setattr(bot, "api_get",
+                        lambda path, **kw: {"strategies": [{"strategy_id": "ovn_volsurge"}]})
+    bot.handle(msg("/addstrategy ovn_volsurge 150k"))
+    assert not bot.posted
+    assert "already exists" in bot.sent[-1][0]
+
+
+def test_addstrategy_without_an_amount_shows_usage(bot):
+    bot.handle(msg("/addstrategy pairs_v2"))
+    assert not bot.posted
+    assert "usage:" in bot.sent[-1][0]
+
+
+def test_addstrategy_defaults_the_drawdown_halt(bot, monkeypatch):
+    """Omitting the drawdown must not mean 'no halt' — that is the one default that has to
+    be present rather than absent."""
+    monkeypatch.setattr(bot, "api_get", lambda path, **kw: {"strategies": []})
+    body = bot._addstrategy_body(["pairs_v2", "150k"])
+    assert body["max_drawdown"] == bot.DEFAULT_MAX_DRAWDOWN > 0

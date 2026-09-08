@@ -135,6 +135,18 @@ class EventLogger:
                     symbol     TEXT PRIMARY KEY,
                     multiplier REAL NOT NULL
                 );
+                -- Strategies registered at RUNTIME (via /strategies or Telegram) rather
+                -- than in config.py. CONFIG is a fail-closed allowlist, so without this
+                -- table a strategy added on a Tuesday silently stops existing at the next
+                -- restart and every one of its intents is rejected as "not active".
+                CREATE TABLE IF NOT EXISTS runtime_strategies (
+                    strategy_id        TEXT PRIMARY KEY,
+                    capital_allocation REAL NOT NULL,
+                    max_drawdown       REAL NOT NULL,
+                    starting_cash      REAL,
+                    created_at         TEXT NOT NULL,
+                    created_by         TEXT
+                );
 
                 -- Trade/decision journal: every signal, weight, and rebalance decision
                 CREATE TABLE IF NOT EXISTS decision_journal (
@@ -404,6 +416,51 @@ class EventLogger:
             logger.error("load_allocations failed: %s", e)
             return {}
         return {sid: alloc for sid, alloc in rows}
+
+    def save_runtime_strategy(self, strategy_id: str, capital_allocation: float,
+                              max_drawdown: float, starting_cash: float = None,
+                              created_by: str = "") -> None:
+        """Persist a strategy added at runtime. Raises on failure, and the caller must treat
+        that as "the strategy was NOT added" — a strategy live in CONFIG but missing here
+        disappears at the next restart, and its orders start being rejected mid-session."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO runtime_strategies (strategy_id, capital_allocation, "
+                "max_drawdown, starting_cash, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(strategy_id) DO UPDATE SET "
+                "capital_allocation = excluded.capital_allocation, "
+                "max_drawdown = excluded.max_drawdown, "
+                "starting_cash = excluded.starting_cash",
+                (strategy_id, float(capital_allocation), float(max_drawdown),
+                 None if starting_cash is None else float(starting_cash),
+                 self._now(), created_by),
+            )
+            self._conn.commit()
+
+    def load_runtime_strategies(self) -> dict:
+        """strategy_id -> config entry, in the shape config.CONFIG uses."""
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id, capital_allocation, max_drawdown, starting_cash "
+                    "FROM runtime_strategies"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_runtime_strategies failed: %s", e)
+            return {}
+        out = {}
+        for sid, alloc, dd, cash in rows:
+            entry = {"capital_allocation": alloc, "max_drawdown": dd}
+            if cash is not None:
+                entry["starting_cash"] = cash
+            out[sid] = entry
+        return out
+
+    def delete_runtime_strategy(self, strategy_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM runtime_strategies WHERE strategy_id = ?",
+                               (strategy_id,))
+            self._conn.commit()
 
     def save_halted_strategies(self, halted: set, active: set, config_keys: set, reason: str = "") -> None:
         """Save which strategies are halted (= in config but NOT in the active set)."""

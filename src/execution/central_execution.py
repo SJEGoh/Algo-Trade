@@ -1745,6 +1745,23 @@ class CentralExecutor(EClient, EWrapper):
         except Exception as e:
             logger.error("failed to restore ledger state: %s", e)
 
+        # Strategies added at runtime come back FIRST: CONFIG is a fail-closed allowlist,
+        # and both the ledger and the risk manager hold a reference to that same dict, so
+        # putting the entry back here is what makes the strategy exist again. It has to
+        # happen before the allocation restore below, which only touches `sid in CONFIG`.
+        try:
+            for sid, entry in self.logger_db.load_runtime_strategies().items():
+                if sid in CONFIG:
+                    continue                     # config.py wins if the id was since added there
+                CONFIG[sid] = dict(entry)
+                self.risk_manager._active_strategies.add(sid)
+                logger.warning("restored runtime strategy %s (allocation %s)",
+                               sid, f"{entry['capital_allocation']:,.0f}")
+        except Exception as e:
+            # Loud: every intent from an unrestored strategy is rejected as "not active".
+            logger.critical("failed to restore runtime strategies — any strategy added "
+                            "since the last restart will have its orders REJECTED: %s", e)
+
         # restore runtime allocation changes (CONFIG holds the defaults)
         try:
             for sid, alloc in self.logger_db.load_allocations().items():
