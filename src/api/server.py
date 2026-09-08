@@ -247,6 +247,27 @@ def get_positions():
         "multipliers": dict(executor.ledger.multipliers),
     }
 
+@app.get("/positions/orphans")
+def get_orphans():
+    """Broker positions no strategy claims — real risk the per-strategy views do not show.
+
+    The equity sampler values NAV from strategy attribution, so an orphan contributes
+    nothing to `position_value` while sitting at the broker. Worth checking after a flatten,
+    a kill, or any reconcile that adopted positions."""
+    orphans = executor.orphaned_positions()
+    marks = (_last_equity.get("marks") or {})
+    return {
+        "orphans": [
+            {"symbol": sym, "quantity": qty,
+             "mark": marks.get(sym),
+             "notional": (abs(qty) * marks[sym] * executor.ledger.multipliers.get(sym, 1.0))
+                         if marks.get(sym) else None}
+            for sym, qty in sorted(orphans.items())
+        ],
+        "count": len(orphans),
+    }
+
+
 @app.get("/pnl")
 def get_pnl():
     return {"realized_pnl": dict(executor.ledger.strategy_realized_pnl)}
@@ -379,6 +400,13 @@ def flatten_all():
                 if sid in _INTERNAL:
                     continue
                 all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
+            # ...and anything the BROKER holds that no strategy claims. Every set above is
+            # built from strategy attribution, so without this a position owned by nobody
+            # survives a flatten that reports success.
+            orphans = executor.orphaned_positions()
+            for sym, qty in orphans.items():
+                flattened.append({"strategy_id": None, "symbol": sym, "qty": qty})
+            all_syms |= set(orphans)
             executor.coordinator._save()
             if all_syms:
                 executor.coordinator._rebalance(all_syms, urgent=True)
@@ -389,6 +417,8 @@ def flatten_all():
                     continue
                 if any(abs(q) > 1e-9 for q in positions.values()):
                     executor._flatten_direct(sid)
+            for entry in executor._flatten_orphans():
+                flattened.append({"strategy_id": None, **entry})
 
         # Clean up stale strategy positions for symbols already flat at the broker.
         # This handles leftover state from before per-strategy attribution was added.

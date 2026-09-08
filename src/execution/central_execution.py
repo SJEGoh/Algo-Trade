@@ -1128,6 +1128,81 @@ class CentralExecutor(EClient, EWrapper):
             return {"retried": True, "ok": False, "error": str(e), "still_holding": book}
         return {"retried": True, "ok": True, "symbols": sorted(outstanding)}
 
+    #: ledger buckets that are bookkeeping, not strategies — a position whose only
+    #: attribution is one of these is owned by nobody
+    INTERNAL_SIDS = frozenset({"__net__", "flatten_all", "kill_switch"})
+
+    def orphaned_positions(self) -> Dict[str, float]:
+        """Broker positions that no real strategy claims — symbol -> signed quantity.
+
+        A position ends up here when its only ledger attribution is an internal bucket
+        (``__net__``, ``flatten_all``, ``kill_switch``) or nothing at all: a flatten that
+        left a residue, a fill attributed to the net pool, a reconcile that adopted a
+        position from the broker.
+
+        These used to be invisible AND unreachable. Every flatten path walks
+        ``strategy_positions`` and skips the internal buckets, so ``/flatten`` and the kill
+        switch both stepped straight over them — the emergency brake could not close a
+        position nobody owned. They are also missing from the equity sampler's NAV, so the
+        account can hold real risk that the dashboard values at zero.
+        """
+        claimed = set()
+        for sid, positions in self.ledger.strategy_positions.items():
+            if sid in self.INTERNAL_SIDS:
+                continue
+            claimed |= {s for s, q in positions.items() if abs(q) > 1e-9}
+        # A strategy that WANTS a symbol owns it even when the fill was attributed to the
+        # net pool — which is the normal outcome for a pooled order. Without this, every
+        # coordinator-traded position reads as orphaned the moment its fill lands on
+        # __net__, and the report cries wolf about positions a strategy is actively running.
+        # Flatten and kill are unaffected: they already sweep every desired symbol.
+        coordinator = getattr(self, "coordinator", None)
+        if coordinator is not None:
+            for sid, book in getattr(coordinator, "desired", {}).items():
+                if sid in self.INTERNAL_SIDS:
+                    continue
+                claimed |= {s for s, q in book.items() if abs(q) > 1e-9}
+        return {s: q for s, q in self.ledger.current_positions.items()
+                if abs(q) > 1e-9 and s not in claimed}
+
+    def _flatten_orphans(self, symbols: set = None) -> list:
+        """Close orphaned positions with market orders (non-pooled path).
+
+        The fill is attributed to ``flatten_all``, which is where most orphans already sit,
+        so closing one nets its bucket back to zero rather than inventing a new holding.
+        """
+        closed = []
+        for sym, qty in self.orphaned_positions().items():
+            if symbols is not None and sym not in symbols:
+                continue
+            inst = self._instruments.get(sym)
+            if inst is None:
+                # We never saw an instrument for this symbol — it came from the broker.
+                # A non-unit multiplier means it is a derivative, and guessing STK/SMART
+                # would send an order for a contract that does not exist. Say so instead.
+                mult = self.ledger.multipliers.get(sym, 1.0)
+                if mult and mult != 1.0:
+                    logger.error("ORPHAN %s: multiplier %s means this is not an equity and "
+                                 "no contract spec is known — close it manually", sym, mult)
+                    continue
+                inst = {"symbol": sym, "asset_class": "equity",
+                        "sec_type": "STK", "exchange": "SMART"}
+            intent = {
+                "client_order_id": f"orphan-{sym}-{int(time.time() * 1000)}",
+                "strategy_id": "flatten_all",
+                "instrument": inst,
+                "side": "sell" if qty > 0 else "buy",
+                "quantity": abs(qty),
+                "order_type": "market",
+                "time_in_force": "day",
+                "expected_price": self._ref_value.get(sym),
+            }
+            logger.warning("FLATTEN ORPHAN: %s %g %s (claimed by no strategy)",
+                           intent["side"], abs(qty), sym)
+            self.place_order(intent)
+            closed.append({"symbol": sym, "quantity": qty})
+        return closed
+
     def _flatten_direct(self, strat_id: str, symbols: set = None) -> None:
         """Close every non-flat position of a (non-pooled) strategy with market orders.
         Bypasses the active-strategy risk check by calling place_order directly — the
@@ -1397,6 +1472,14 @@ class CentralExecutor(EClient, EWrapper):
                     if sid in _INTERNAL:
                         continue
                     all_syms |= {s for s, q in positions.items() if abs(q) > 1e-9}
+                # ...and anything the BROKER holds that no strategy claims. Without this the
+                # kill switch steps over its own orphans: every set above is built from
+                # strategy attribution, so a position owned by nobody survives the kill.
+                orphans = self.orphaned_positions()
+                if orphans:
+                    logger.critical("KILL SWITCH: closing %d orphaned position(s) no strategy "
+                                    "claims: %s", len(orphans), orphans)
+                    all_syms |= set(orphans)
                 self.coordinator._save()
                 if all_syms:
                     self.coordinator._rebalance(all_syms, urgent=True)
@@ -1407,6 +1490,7 @@ class CentralExecutor(EClient, EWrapper):
                         continue
                     if any(abs(q) > 1e-9 for q in positions.values()):
                         self._flatten_direct(sid)
+                self._flatten_orphans()
     
     def reconcile_and_log(self) -> dict:
         result = self.ledger.reconcile()

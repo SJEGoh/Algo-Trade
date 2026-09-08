@@ -87,7 +87,11 @@ def test_a_stranger_can_still_read(bot, monkeypatch):
 def test_control_is_disabled_when_no_allowlist_is_configured(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", CHAT)
-    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    # Empty, not deleted: reloading the module re-runs load_dotenv(), which would read a
+    # real TELEGRAM_ALLOWED_USER_IDS back out of the developer's .env and make this test
+    # pass or fail depending on whose machine it runs on. load_dotenv does not override a
+    # variable that is already set, so "" survives the reload and means "no allowlist".
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "")
     import tools.telegram_control as tc
     tc = importlib.reload(tc)
     tc.sent, tc.posted = [], []
