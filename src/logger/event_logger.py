@@ -123,6 +123,14 @@ class EventLogger:
                     starting_cash REAL NOT NULL,
                     updated_at    TEXT NOT NULL
                 );
+                -- Runtime capital-allocation overrides. CONFIG in config.py is the default;
+                -- a row here wins, so a rebalance survives a restart instead of silently
+                -- snapping back (and taking the drawdown denominator with it).
+                CREATE TABLE IF NOT EXISTS strategy_allocations (
+                    strategy_id        TEXT PRIMARY KEY,
+                    capital_allocation REAL NOT NULL,
+                    updated_at         TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS strategy_multipliers (
                     symbol     TEXT PRIMARY KEY,
                     multiplier REAL NOT NULL
@@ -373,6 +381,29 @@ class EventLogger:
             return {}, {}
         return ({sid: cash for sid, cash, _ in rows},
                 {sid: basis for sid, _, basis in rows})
+
+    def save_allocation(self, strategy_id: str, capital_allocation: float) -> None:
+        """Persist a runtime allocation change. Raises on failure — the caller alerts,
+        because an unpersisted allocation reverts on the next restart."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO strategy_allocations (strategy_id, capital_allocation, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(strategy_id) DO UPDATE SET "
+                "capital_allocation = excluded.capital_allocation, updated_at = excluded.updated_at",
+                (strategy_id, float(capital_allocation), self._now()),
+            )
+            self._conn.commit()
+
+    def load_allocations(self) -> dict:
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id, capital_allocation FROM strategy_allocations"
+                ).fetchall()
+        except Exception as e:
+            logger.error("load_allocations failed: %s", e)
+            return {}
+        return {sid: alloc for sid, alloc in rows}
 
     def save_halted_strategies(self, halted: set, active: set, config_keys: set, reason: str = "") -> None:
         """Save which strategies are halted (= in config but NOT in the active set)."""

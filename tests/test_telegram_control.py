@@ -214,3 +214,131 @@ def test_a_botname_suffix_is_stripped(bot, monkeypatch):
     monkeypatch.setattr(bot, "api_get", lambda path, **kw: {"strategies": []})
     bot.handle(msg("/strategies@my_exec_bot"))
     assert "none configured" in bot.sent[-1][0]
+
+
+# ----------------------------------------------------------------- /allocate
+PLAN = {
+    "strategy_id": "ovn_volsurge", "method": "pro_rata",
+    "allocation_before": 100_000.0, "allocation_after": 60_000.0,
+    "cash_before": 20_000.0, "cash_after": -20_000.0, "cash_shortfall": 20_000.0,
+    "liquidations": [{"symbol": "AAPL", "from_quantity": 600.0, "to_quantity": 450.0,
+                      "dollars": 15_000.0, "freed": 15_000.0},
+                     {"symbol": "MSFT", "from_quantity": 200.0, "to_quantity": 150.0,
+                      "dollars": 5_000.0, "freed": 5_000.0}],
+    "orders": [], "valued_at_cost": [],
+}
+
+
+@pytest.fixture
+def alloc_bot(bot, monkeypatch):
+    """Record every allocation call and hand back a fixed plan."""
+    bot.calls = []
+
+    def api_post(path, body=None):
+        bot.calls.append((path, body))
+        return dict(PLAN)
+    monkeypatch.setattr(bot, "api_post", api_post)
+    return bot
+
+
+def test_allocate_previews_the_plan_before_asking_to_confirm(alloc_bot):
+    """The whole point of confirming a money move is seeing what it will sell."""
+    alloc_bot.handle(msg("/allocate ovn_volsurge 60k"))
+
+    path, body = alloc_bot.calls[0]
+    assert path == "/strategies/ovn_volsurge/allocation"
+    assert body["dry_run"] is True                       # nothing executed yet
+    reply = alloc_bot.sent[-1][0]
+    assert "PLAN (nothing changed yet)" in reply
+    assert "AAPL 600 -> 450" in reply and "MSFT 200 -> 150" in reply
+    assert "/confirm " in reply
+
+
+def test_allocate_executes_only_after_confirmation(alloc_bot):
+    alloc_bot.handle(msg("/allocate ovn_volsurge 60k"))
+    token = alloc_bot.sent[-1][0].split("/confirm ")[1].split("\n")[0].strip()
+    alloc_bot.handle(msg(f"/confirm {token}"))
+
+    assert [b["dry_run"] for _, b in alloc_bot.calls] == [True, False]
+    assert alloc_bot.calls[1][1]["capital_allocation"] == 60_000.0
+    assert "DONE" in alloc_bot.sent[-1][0]
+
+
+def test_a_rejected_plan_never_becomes_a_confirmation_token(bot, monkeypatch):
+    """If the executor would refuse it, don't offer to confirm it."""
+    class Response:
+        status_code = 422
+        def json(self): return {"detail": "cannot withdraw 99,999: its NAV is only 96,000"}
+
+    def rejected(path, body=None):
+        raise requests.HTTPError(response=Response())
+    monkeypatch.setattr(bot, "api_post", rejected)
+
+    bot.handle(msg("/allocate ovn_volsurge 1"))
+    assert "NAV is only" in bot.sent[-1][0]
+    assert "/confirm" not in bot.sent[-1][0]
+    with bot._pending_lock:
+        assert bot._pending == {}
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("150000", {"capital_allocation": 150_000.0}),
+    ("150k", {"capital_allocation": 150_000.0}),
+    ("1.2m", {"capital_allocation": 1_200_000.0}),
+    ("$150,000", {"capital_allocation": 150_000.0}),
+    ("-40k", {"delta": -40_000.0}),          # a sign means "change it by"
+    ("+25000", {"delta": 25_000.0}),
+])
+def test_amount_forms(alloc_bot, text, expected):
+    alloc_bot.handle(msg(f"/allocate ovn_volsurge {text}"))
+    _, body = alloc_bot.calls[0]
+    key = next(iter(expected))
+    assert body[key] == expected[key]
+
+
+def test_method_defaults_to_pro_rata_and_can_be_overridden(alloc_bot):
+    alloc_bot.handle(msg("/allocate ovn_volsurge -40k"))
+    assert alloc_bot.calls[-1][1]["method"] == "pro_rata"
+    alloc_bot.handle(msg("/allocate ovn_volsurge -40k equal"))
+    assert alloc_bot.calls[-1][1]["method"] == "equal"
+
+
+@pytest.mark.parametrize("command", [
+    "/allocate",                       # no arguments
+    "/allocate ovn_volsurge",          # no amount
+    "/allocate ovn_volsurge lots",     # unreadable amount
+    "/allocate ovn_volsurge 60k sideways",   # unknown method
+])
+def test_bad_allocate_arguments_are_explained_not_executed(alloc_bot, command):
+    alloc_bot.handle(msg(command))
+    assert alloc_bot.calls == []
+    assert "/confirm" not in alloc_bot.sent[-1][0]
+
+
+def test_allocate_is_allow_listed(alloc_bot):
+    alloc_bot.handle(msg("/allocate ovn_volsurge 60k", user_id=STRANGER))
+    assert alloc_bot.calls == []
+    assert "not allow-listed" in alloc_bot.sent[-1][0]
+
+
+def test_an_increase_reads_as_a_cash_move(alloc_bot, monkeypatch):
+    plan = dict(PLAN, liquidations=[], cash_shortfall=0.0,
+                allocation_after=140_000.0, cash_after=60_000.0)
+    monkeypatch.setattr(alloc_bot, "api_post", lambda path, body=None: dict(plan))
+    alloc_bot.handle(msg("/allocate ovn_volsurge +40k"))
+    reply = alloc_bot.sent[-1][0]
+    assert "+$40,000" in reply
+    assert "selling" not in reply
+
+
+def test_a_decrease_covered_by_cash_says_nothing_is_sold(alloc_bot, monkeypatch):
+    plan = dict(PLAN, liquidations=[], cash_shortfall=0.0, cash_after=-0.0)
+    monkeypatch.setattr(alloc_bot, "api_post", lambda path, body=None: dict(plan))
+    alloc_bot.handle(msg("/allocate ovn_volsurge 60k"))
+    assert "cash covers it — nothing to sell" in alloc_bot.sent[-1][0]
+
+
+def test_negative_money_reads_naturally(bot):
+    assert bot.money(-50_000) == "-$50,000"
+    assert bot.money(50_000) == "$50,000"
+    assert bot.money(None) == "—"

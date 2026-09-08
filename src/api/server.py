@@ -442,6 +442,50 @@ def strategy_allocation(strategy_id: str):
         "max_drawdown": cfg["max_drawdown"],
     }
 
+class AllocationRequest(BaseModel):
+    """Either an absolute `capital_allocation` or a `delta` to apply to the current one."""
+    capital_allocation: Optional[float] = None
+    delta: Optional[float] = None
+    method: str = Field("pro_rata", pattern="^(pro_rata|equal)$")
+    dry_run: bool = False
+
+
+@app.post("/strategies/{strategy_id}/allocation", dependencies=[Depends(require_api_key)])
+def set_allocation(strategy_id: str, req: AllocationRequest):
+    """Re-allocate capital to a strategy.
+
+    An increase goes straight to cash. A decrease comes out of cash first; anything cash
+    can't cover is raised by selling positions — `pro_rata` (default) shrinks every position
+    by the same fraction so the book keeps its shape, `equal` splits the amount evenly in
+    dollars and redistributes whatever a small position can't cover. `dry_run` returns the
+    plan without moving anything.
+    """
+    cfg = CONFIG.get(strategy_id)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {strategy_id}")
+    if (req.capital_allocation is None) == (req.delta is None):
+        raise HTTPException(status_code=422,
+                            detail="pass exactly one of capital_allocation or delta")
+    target = (req.capital_allocation if req.capital_allocation is not None
+              else cfg["capital_allocation"] + req.delta)
+    try:
+        result = executor.rebalance_allocation(strategy_id, target,
+                                               method=req.method, dry_run=req.dry_run)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not req.dry_run:
+        sells = result.get("liquidations") or []
+        _alert(
+            f"\U0001f4b0 Allocation {strategy_id}: {result['allocation_before']:,.0f} -> "
+            f"{result['allocation_after']:,.0f}"
+            + (f"\nSelling to raise {result.get('cash_shortfall', 0):,.0f}: "
+               + ", ".join(f"{c['symbol']} {c['from_quantity']:g}->{c['to_quantity']:g}"
+                           for c in sells) if sells else " (cash only)"),
+            topic="orders")
+    return result
+
+
 @app.post("/strategies/{strategy_id}/reactivate", dependencies=[Depends(require_api_key)])
 def reactivate_strategy(strategy_id: str):
     """Clear a halt: re-add the strategy to the active set (after reviewing a drawdown halt,

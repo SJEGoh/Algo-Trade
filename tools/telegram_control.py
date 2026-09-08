@@ -9,8 +9,10 @@ that talks to IB, and the bot survives the executor to tell you when it's down �
 serves as the watchdog, alerting when /health stops answering.
 
     /status /pnl /positions /orders /fills /strategies /journal   read-only, anyone in the chat
-    /halt /resume /flatten /kill /unkill /reconcile /reset_daily  allow-listed users only
-    /kill /unkill /flatten                                        also need /confirm <token>
+    /halt /resume /flatten /kill /unkill /allocate ...            allow-listed users only
+    /kill /unkill /flatten /allocate                              also need /confirm <token>
+                                                                  (/allocate shows the plan
+                                                                   in the prompt first)
 
 Where replies go
 ----------------
@@ -42,6 +44,7 @@ import os
 import secrets
 import threading
 import time
+from typing import NamedTuple
 from pathlib import Path
 
 import requests
@@ -163,10 +166,12 @@ def journal(user: str, command: str, result: str) -> None:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 def money(v) -> str:
+    """$1,234 / -$1,234 — the sign goes in front of the currency, not after it."""
     try:
-        return f"${float(v):,.0f}"
+        n = float(v)
     except (TypeError, ValueError):
         return "—"
+    return f"{'-' if n < 0 else ''}${abs(n):,.0f}"
 
 
 def _hidden(sid: str) -> bool:
@@ -194,6 +199,9 @@ def cmd_help(args, ctx) -> str:
         "  /flatten [strategy]            close a book, keep trading enabled *\n"
         "  /kill                          stop everything and flatten *\n"
         "  /unkill                        re-enable order flow *\n"
+        "  /allocate <strategy> <amount>  re-allocate capital *\n"
+        "        150k sets it, -40k takes it out; add 'equal' to split a\n"
+        "        sell-down evenly instead of pro-rata\n"
         "  /reconcile                     resync with the broker\n"
         "  /reset_daily                   reset the daily loss baseline\n"
         "\n* needs /confirm <token> within "
@@ -381,6 +389,86 @@ def cmd_reset_daily(args, ctx) -> str:
     return "daily loss baseline reset; circuit breaker cleared"
 
 
+def _parse_amount(text: str):
+    """'150k' -> (150000, absolute); '-40k' -> (40000 withdrawn, delta). A leading + or -
+    means "change it by this much", anything else means "set it to this"."""
+    raw = text.replace(",", "").replace("$", "").strip().lower()
+    is_delta = raw.startswith(("+", "-"))
+    factor = 1.0
+    if raw.endswith("k"):
+        factor, raw = 1_000.0, raw[:-1]
+    elif raw.endswith("m"):
+        factor, raw = 1_000_000.0, raw[:-1]
+    try:
+        return float(raw) * factor, is_delta
+    except ValueError:
+        raise ValueError(f"could not read an amount from {text!r} — try 150k, 1.2m or -40000")
+
+
+ALLOCATE_USAGE = ("usage: /allocate <strategy> <amount> [pro_rata|equal]\n"
+                  "  /allocate ovn_volsurge 150k        set the allocation to $150k\n"
+                  "  /allocate ovn_volsurge -40k        take $40k out\n"
+                  "  /allocate ovn_volsurge -40k equal  split the sell-down evenly")
+
+
+def _allocate_body(args, dry_run: bool) -> tuple:
+    if len(args) < 2:
+        raise ValueError(ALLOCATE_USAGE)
+    sid, method = args[0], (args[2] if len(args) > 2 else "pro_rata")
+    if method not in ("pro_rata", "equal"):
+        raise ValueError(f"unknown method {method!r} — use pro_rata or equal")
+    amount, is_delta = _parse_amount(args[1])
+    body = {"delta": amount} if is_delta else {"capital_allocation": amount}
+    body.update(method=method, dry_run=dry_run)
+    return sid, body
+
+
+def _format_allocation(r: dict) -> str:
+    """Render the plan the executor came back with — the same shape for a dry run and for
+    the real thing, so what you confirm is what you get."""
+    delta = r["allocation_after"] - r["allocation_before"]
+    lines = [f"{r['strategy_id']}",
+             f"allocation {money(r['allocation_before'])} -> {money(r['allocation_after'])}"
+             f"  ({'+' if delta >= 0 else '-'}{money(abs(delta))})"]
+    if r.get("cash_after") is not None:
+        lines.append(f"cash {money(r['cash_before'])} -> {money(r['cash_after'])}")
+    else:
+        lines.append(f"cash now {money(r['cash_before'])}")
+    cuts = r.get("liquidations") or []
+    if cuts:
+        lines.append(f"raising {money(r.get('cash_shortfall'))} by selling "
+                     f"({r.get('method')}):")
+        lines += [f"   {c['symbol']} {c['from_quantity']:g} -> {c['to_quantity']:g}"
+                  f"  ({money(abs(c['freed']))})" for c in cuts]
+        lines.append("cash goes negative until those fills settle — that is expected")
+    elif delta < 0:
+        lines.append("cash covers it — nothing to sell")
+    if r.get("valued_at_cost"):
+        lines.append("no live mark for " + ", ".join(r["valued_at_cost"]) + " (valued at cost)")
+    return "\n".join(lines)
+
+
+def preview_allocate(args, ctx) -> str:
+    """Dry-run the change so the confirmation prompt shows exactly what will be sold. A
+    plan that the executor would reject never reaches a confirmation token."""
+    sid, body = _allocate_body(args, dry_run=True)
+    return "PLAN (nothing changed yet)\n" + _format_allocation(
+        api_post(f"/strategies/{sid}/allocation", body))
+
+
+def cmd_allocate(args, ctx) -> str:
+    sid, body = _allocate_body(args, dry_run=False)
+    r = api_post(f"/strategies/{sid}/allocation", body)
+    if r.get("note") == "allocation unchanged":
+        return f"{sid} is already at {money(r['allocation_after'])}"
+    failed = [o for o in (r.get("orders") or []) if o.get("error")]
+    text = "DONE\n" + _format_allocation(r)
+    if failed:
+        text += "\nsome orders did NOT go through: " + ", ".join(
+            f"{o['symbol']} ({o['error']})" for o in failed)
+    return text
+
+
 def _int_arg(args, default):
     try:
         return max(1, min(50, int(args[0])))
@@ -388,24 +476,34 @@ def _int_arg(args, default):
         return default
 
 
-# name -> (handler, needs_allowlist, needs_confirmation)
+class Command(NamedTuple):
+    handler: object
+    restricted: bool = False    # allow-listed users only
+    confirm: bool = False       # needs /confirm <token>
+    preview: object = None      # optional dry run, shown in the confirmation prompt
+
+
 COMMANDS = {
-    "help":        (cmd_help, False, False),
-    "start":       (cmd_help, False, False),
-    "status":      (cmd_status, False, False),
-    "pnl":         (cmd_pnl, False, False),
-    "positions":   (cmd_positions, False, False),
-    "orders":      (cmd_orders, False, False),
-    "fills":       (cmd_fills, False, False),
-    "strategies":  (cmd_strategies, False, False),
-    "journal":     (cmd_journal, False, False),
-    "halt":        (cmd_halt, True, False),      # protective: no confirmation needed
-    "resume":      (cmd_resume, True, False),
-    "reconcile":   (cmd_reconcile, True, False),
-    "reset_daily": (cmd_reset_daily, True, False),
-    "flatten":     (cmd_flatten, True, True),
-    "kill":        (cmd_kill, True, True),
-    "unkill":      (cmd_unkill, True, True),
+    "help":        Command(cmd_help),
+    "start":       Command(cmd_help),
+    "status":      Command(cmd_status),
+    "pnl":         Command(cmd_pnl),
+    "positions":   Command(cmd_positions),
+    "orders":      Command(cmd_orders),
+    "fills":       Command(cmd_fills),
+    "strategies":  Command(cmd_strategies),
+    "journal":     Command(cmd_journal),
+    # protective: no confirmation, because a speed bump in front of de-risking is a bug
+    "halt":        Command(cmd_halt, restricted=True),
+    "resume":      Command(cmd_resume, restricted=True),
+    "reconcile":   Command(cmd_reconcile, restricted=True),
+    "reset_daily": Command(cmd_reset_daily, restricted=True),
+    # these move money or stop trading
+    "flatten":     Command(cmd_flatten, restricted=True, confirm=True),
+    "kill":        Command(cmd_kill, restricted=True, confirm=True),
+    "unkill":      Command(cmd_unkill, restricted=True, confirm=True),
+    "allocate":    Command(cmd_allocate, restricted=True, confirm=True,
+                           preview=preview_allocate),
 }
 
 # token -> (command, args, user_id, expires_at)
@@ -469,9 +567,8 @@ def handle(message: dict) -> None:
     if entry is None:
         say(f"unknown command /{name} — /help lists them", thread)
         return
-    _handler, needs_allow, needs_confirm = entry
 
-    if needs_allow:
+    if entry.restricted:
         if not ALLOWED:
             say("no TELEGRAM_ALLOWED_USER_IDS configured, so control commands are "
                 f"disabled. Add your id ({user_id}) to that variable and restart the "
@@ -482,35 +579,51 @@ def handle(message: dict) -> None:
             say(f"{user_name}, you are not allow-listed for control commands.", thread)
             return
 
-    if needs_confirm:
+    if entry.confirm:
+        preview = ""
+        if entry.preview is not None:
+            try:
+                preview = entry.preview(args, {"user": user_name, "user_id": user_id}) + "\n\n"
+            except Exception as e:
+                # A plan the executor would reject must never become a confirmation token
+                say(_describe_failure(e, f"/{name} {' '.join(args)}"), thread)
+                return
         token = _stash_confirmation(name, args, user_id)
-        say(f"/{name} {' '.join(args)}\nThis changes live trading. Reply with:\n"
+        say(f"{preview}/{name} {' '.join(args)}\nThis changes live trading. Reply with:\n"
             f"/confirm {token}\n(expires in {CONFIRM_TTL:.0f}s)", thread)
         return
 
     _run(name, args, user_id, user_name, thread)
 
 
+def _describe_failure(e: Exception, label: str) -> str:
+    """Turn an exception into something readable in a chat window."""
+    if isinstance(e, requests.HTTPError):
+        detail = ""
+        if e.response is not None:
+            try:
+                detail = e.response.json().get("detail", "")
+            except Exception:
+                detail = (e.response.text or "")[:300]
+            return f"executor rejected {label}: {e.response.status_code} {detail}"
+        return f"executor rejected {label}"
+    if isinstance(e, requests.RequestException):
+        return f"cannot reach the executor at {EXECUTOR_URL}: {e}"
+    return f"{label} failed: {e}"
+
+
 def _run(name, args, user_id, user_name, thread, confirmed=False) -> None:
-    handler = COMMANDS[name][0]
+    entry = COMMANDS[name]
     label = f"/{name} {' '.join(args)}".strip()
     try:
-        reply = handler(args, {"user": user_name, "user_id": user_id})
-    except requests.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            detail = (e.response.text or "")[:200] if e.response is not None else ""
-        reply = f"executor rejected {label}: {e.response.status_code} {detail}"
-    except requests.RequestException as e:
-        reply = f"cannot reach the executor at {EXECUTOR_URL}: {e}"
+        reply = entry.handler(args, {"user": user_name, "user_id": user_id})
     except Exception as e:
-        log.exception("handler %s failed", name)
-        reply = f"{label} failed: {e}"
+        if not isinstance(e, (requests.RequestException, ValueError)):
+            log.exception("handler %s failed", name)
+        reply = _describe_failure(e, label)
 
     say(reply, thread)
-    if COMMANDS[name][1]:                      # journal state-changing commands only
+    if entry.restricted:                       # journal state-changing commands only
         journal(user_name, label + (" (confirmed)" if confirmed else ""), reply)
     log.info("%s ran %s", user_name, label)
 

@@ -112,9 +112,14 @@ class NettingCoordinator:
         must check `_exposure` for those rather than trusting this number alone)."""
         return self._exposure(sid)[0]
 
-    def _check_allocation(self, sid):
+    def _check_allocation(self, sid, previous_gross=None):
         """The pooled path's allocation gate. Returns a rejection dict, or None to accept.
-        Fails closed: a leg that can't be valued is a rejection, never a free pass."""
+        Fails closed: a leg that can't be valued is a rejection, never a free pass.
+
+        `previous_gross` is the strategy's exposure BEFORE this book change. A book that
+        shrinks is always allowed, whatever the cap says — otherwise lowering a strategy's
+        allocation could never be carried out, because `_exposure` counts what it still
+        HOLDS: the reduction itself would be rejected for breaching the new, smaller cap."""
         gross, unvaluable = self._exposure(sid)
         if unvaluable:
             return {"accepted": False,
@@ -122,6 +127,8 @@ class NettingCoordinator:
                               f"reference price or contract multiplier; order rejected"}
         if not math.isfinite(gross):
             return {"accepted": False, "reason": f"{sid}: gross notional is not a number"}
+        if previous_gross is not None and gross <= previous_gross + _EPS:
+            return None                       # de-risking is never blocked
         alloc = float(self.config[sid]["capital_allocation"])
         if gross > alloc:
             return {"accepted": False,
@@ -173,6 +180,7 @@ class NettingCoordinator:
             if instrument is not None:
                 self.instrument[symbol] = instrument
             self._set_ref_price(symbol, price)
+            before_gross, before_unvaluable = self._exposure(sid)
             book = self.desired.setdefault(sid, {})
             prev = book.get(symbol)
             if qty == 0:
@@ -180,7 +188,8 @@ class NettingCoordinator:
             else:
                 book[symbol] = float(qty)
             # Exits always pass: closing risk can't be blocked by a missing price.
-            rejection = None if qty == 0 else self._check_allocation(sid)
+            rejection = None if qty == 0 else self._check_allocation(
+                sid, None if before_unvaluable else before_gross)
             if rejection is not None:
                 if prev is None:
                     book.pop(symbol, None)
@@ -208,8 +217,10 @@ class NettingCoordinator:
                 if q != 0:
                     new_book[sym] = q
             old = self.desired.get(sid, {})
+            before_gross, before_unvaluable = self._exposure(sid)
             self.desired[sid] = new_book
-            rejection = self._check_allocation(sid)
+            rejection = self._check_allocation(
+                sid, None if before_unvaluable else before_gross)
             if rejection is not None:
                 self.desired[sid] = old
                 return rejection

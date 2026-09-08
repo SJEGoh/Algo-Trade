@@ -130,18 +130,41 @@ def test_correctly_sized_futures_book_still_passes(co):
 
 
 # ---------------------------------------------------------------- held vs desired
-def test_holdings_count_against_the_cap_even_when_the_book_was_lost(co):
-    """A desired book reset (lost netting.json, fresh container volume, restart before
-    the first resync) looks empty while the strategy still carries the position — so
-    checking the book alone let it re-book a full allocation on top of what it owned."""
+def test_new_exposure_on_top_of_untracked_holdings_is_rejected(co):
+    """A desired book reset (lost netting.json, fresh container volume, restart before the
+    first resync) looks empty while the strategy still carries the position — so checking
+    the book alone let it book a fresh allocation ON TOP of what it already owned."""
     coord, ex = co
     ex.ledger.strategy_positions["xs_mom"] = {"GOOGL": 1700.0}     # ~$574k already held
     ex.ledger.strategy_avg_cost["xs_mom"] = {"GOOGL": 338.0}
     ex.ledger.current_positions["GOOGL"] = 1700.0
 
-    r = coord.submit_book("xs_mom", [book_intent("GOOGL", 294, price=338.0)])  # "only $99k"
+    # with no price for the held leg it fails closed: unvaluable, so unknown exposure
+    r = coord.submit_book("xs_mom", [book_intent("MSFT", 294, price=338.0)])  # "only $99k"
+    assert r["accepted"] is False
+    assert "cannot value" in r["reason"] and "GOOGL" in r["reason"]
+
+    # and once the held leg CAN be valued, on the cap itself: $574k + $99k vs $100k
+    coord.ref_price["GOOGL"] = 338.0
+    coord.instrument["GOOGL"] = {"symbol": "GOOGL", "sec_type": "STK"}
+    r = coord.submit_book("xs_mom", [book_intent("MSFT", 294, price=338.0)])
     assert r["accepted"] is False
     assert "exceeds allocation" in r["reason"]
+    assert ex.placed == []
+
+
+def test_booking_less_of_a_name_you_already_hold_is_allowed(co):
+    """The other half of the same scenario: asking for LESS of an oversized position is a
+    sell-down, and the cap must not block it — otherwise a strategy that is already over
+    its allocation (or whose allocation was just lowered) can never get back under it."""
+    coord, ex = co
+    ex.ledger.strategy_positions["xs_mom"] = {"GOOGL": 1700.0}     # ~$574k, over the cap
+    ex.ledger.strategy_avg_cost["xs_mom"] = {"GOOGL": 338.0}
+    ex.ledger.current_positions["GOOGL"] = 1700.0
+
+    r = coord.submit_book("xs_mom", [book_intent("GOOGL", 294, price=338.0)])
+    assert r["accepted"] is True
+    assert ex.placed[0]["symbol"] == "GOOGL" and ex.placed[0]["delta"] == -1406.0
 
 
 def test_reducing_an_over_cap_position_is_allowed(co):

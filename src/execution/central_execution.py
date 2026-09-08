@@ -5,6 +5,7 @@ from ibapi.order import Order
 from ibapi.common import BarData
 from ibapi.order_state import OrderState
 from ibapi.execution import Execution
+import math
 import threading
 from ledger.position_ledger import PositionLedger
 from risk.risk_manager import RiskManager
@@ -1152,6 +1153,196 @@ class CentralExecutor(EClient, EWrapper):
             logger.warning("FLATTEN %s: %s %g %s", strat_id, intent["side"], abs(qty), sym)
             self.place_order(intent)
 
+    # ------------------------------------------------------------------
+    # Capital allocation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _reduction_plan(values: Dict[str, float], shortfall: float, method: str) -> Dict[str, float]:
+        """How much CASH each position must raise. `values` is symbol -> SIGNED market value.
+
+        Note the asymmetry: selling a long raises cash, but buying back a short SPENDS it,
+        so shorts cannot fund a withdrawal. That is why the two methods differ in what they
+        touch:
+
+        pro_rata (default): scale the WHOLE book — longs and shorts — by one fraction, so
+            the strategy keeps its shape. The cash raised nets out to exactly the shortfall
+            (longs bring cash in, covering shorts pays some back out).
+        equal: split the shortfall evenly, in dollars, across the LONG positions only,
+            water-filling so that a position smaller than its share gives what it has and
+            the rest is redistributed. Shorts are left untouched.
+
+        Both are always feasible for any withdrawal within NAV: the shortfall can never
+        exceed net position value (pro_rata), which is itself at most the long value (equal).
+        Returns positive dollars for a long being sold, negative for a short being covered."""
+        net = sum(values.values())
+        if shortfall <= 0 or net <= 0:
+            return {}
+        shortfall = min(shortfall, net)
+
+        if method != "equal":
+            fraction = shortfall / net
+            return {sym: val * fraction for sym, val in values.items() if val}
+
+        longs = {sym: val for sym, val in values.items() if val > 0}
+        plan = {sym: 0.0 for sym in longs}
+        remaining, active = min(shortfall, sum(longs.values())), set(longs)
+        while remaining > 1e-6 and active:
+            share = remaining / len(active)
+            progressed = False
+            for sym in sorted(active):
+                room = longs[sym] - plan[sym]
+                take = min(share, room)
+                if take > 1e-12:
+                    plan[sym] += take
+                    remaining -= take
+                    progressed = True
+                if plan[sym] >= longs[sym] - 1e-9:
+                    active.discard(sym)
+            if not progressed:
+                break
+        return {sym: dollars for sym, dollars in plan.items() if dollars > 0}
+
+    def rebalance_allocation(self, strat_id: str, new_allocation: float,
+                             method: str = "pro_rata", dry_run: bool = False) -> dict:
+        """Change a strategy's capital allocation.
+
+        An INCREASE lands entirely in cash — the strategy can deploy it on its next signal.
+        A DECREASE comes out of cash first; whatever cash can't cover is raised by selling
+        positions (`method` decides how that is spread), and the withdrawal is booked
+        immediately so NAV is correct before the sales settle: cash goes negative by the
+        shortfall and the fills bring it back to zero.
+
+        Capital moves never touch P&L — the basis moves with the cash."""
+        cfg = CONFIG.get(strat_id)
+        if cfg is None:
+            raise ValueError(f"unknown strategy {strat_id}")
+        new_allocation = float(new_allocation)
+        if not (new_allocation > 0) or not math.isfinite(new_allocation):
+            raise ValueError(f"capital_allocation must be a positive number, got {new_allocation!r}")
+
+        current = float(cfg["capital_allocation"])
+        delta = new_allocation - current
+        cash = self.ledger.cash(strat_id)
+        book = {s: q for s, q in self.ledger.strategy_positions.get(strat_id, {}).items()
+                if abs(q) > 1e-9}
+
+        # Value the book at live marks, falling back to the strategy's own cost basis.
+        marks = self.get_marks(set(book)) if book else {}
+        costs = self.ledger.strategy_avg_cost.get(strat_id, {})
+        units, valued_at_cost = {}, []
+        for sym in book:
+            mult = self.ledger.multipliers.get(sym, 1.0)
+            px = marks.get(sym)
+            if px is None or px <= 0:
+                px = costs.get(sym, 0.0)
+                if px > 0:
+                    valued_at_cost.append(sym)
+            units[sym] = px * mult
+        # SIGNED market value per position: a short is negative, which is what makes the
+        # cash arithmetic below come out right.
+        values = {s: book[s] * units[s] for s in book if units.get(s, 0) > 0}
+        nav = cash + sum(values.values())
+
+        result = {"strategy_id": strat_id, "method": method, "dry_run": dry_run,
+                  "allocation_before": current, "allocation_after": new_allocation,
+                  "delta": delta, "cash_before": cash, "nav_before": nav,
+                  "valued_at_cost": sorted(valued_at_cost), "liquidations": [], "orders": []}
+
+        if abs(delta) < 1e-9:
+            result["note"] = "allocation unchanged"
+            return result
+
+        shortfall = 0.0
+        if delta < 0:
+            withdrawal = -delta
+            # A position we can't value makes both the NAV guard and the sell-down plan
+            # meaningless, so say THAT rather than reporting a nonsense NAV.
+            unvaluable = [s for s in book if units.get(s, 0) <= 0]
+            if unvaluable and withdrawal > max(cash, 0.0) + 1e-6:
+                raise ValueError(
+                    f"cannot size the sell-down for {strat_id}: no price for "
+                    f"{', '.join(sorted(unvaluable))}")
+            if withdrawal > nav + 1e-6:
+                raise ValueError(
+                    f"cannot withdraw {withdrawal:,.0f} from {strat_id}: its NAV is only "
+                    f"{nav:,.0f} (cash {cash:,.0f} + positions {nav - cash:,.0f})")
+            shortfall = max(0.0, withdrawal - max(cash, 0.0))
+            if shortfall > 1e-6:
+                for sym, dollars in sorted(self._reduction_plan(values, shortfall, method).items()):
+                    qty = book[sym]
+                    # dollars/unit is signed the same way as qty, so this moves a long down
+                    # and a short up — both toward zero — and never past it.
+                    units_to_trade = dollars / units[sym]
+                    units_to_trade = math.copysign(min(abs(qty), round(abs(units_to_trade))),
+                                                   units_to_trade)
+                    if abs(units_to_trade) < 1e-9:
+                        continue
+                    result["liquidations"].append({
+                        "symbol": sym, "from_quantity": qty,
+                        "to_quantity": qty - units_to_trade,
+                        "dollars": dollars, "freed": units_to_trade * units[sym]})
+
+        result["cash_shortfall"] = shortfall
+        if dry_run:
+            result["note"] = "dry run — nothing was changed"
+            return result
+
+        # Book the capital move first so NAV is right immediately; the sells settle into cash.
+        moved = self.ledger.adjust_capital(strat_id, delta)
+        result.update(cash_after=moved["cash_after"], starting_cash=moved["starting_cash"])
+        cfg["capital_allocation"] = new_allocation      # CONFIG is shared with risk + coordinator
+        try:
+            self.logger_db.save_allocation(strat_id, new_allocation)
+        except Exception as e:
+            logger.critical("allocation for %s changed to %s but NOT persisted (%s) — "
+                            "a restart will revert it", strat_id, f"{new_allocation:,.0f}", e)
+        self.ledger.save_state(self.logger_db)
+
+        for cut in result["liquidations"]:
+            try:
+                result["orders"].append(self._resize_position(strat_id, cut["symbol"],
+                                                              cut["to_quantity"], units))
+            except Exception as e:
+                logger.error("allocation sell-down failed for %s %s: %s",
+                             strat_id, cut["symbol"], e)
+                result["orders"].append({"symbol": cut["symbol"], "error": str(e)})
+
+        logger.warning("ALLOCATION %s: %s -> %s (cash %s -> %s, selling %d position(s))",
+                       strat_id, f"{current:,.0f}", f"{new_allocation:,.0f}",
+                       f"{cash:,.0f}", f"{moved['cash_after']:,.0f}",
+                       len(result["liquidations"]))
+        self.logger_db.log_decision(
+            strat_id, "allocation",
+            f"allocation {current:,.0f} -> {new_allocation:,.0f} ({method})",
+            detail=result, symbols=[c["symbol"] for c in result["liquidations"]])
+        return result
+
+    def _resize_position(self, strat_id: str, symbol: str, target_qty: float,
+                         units: Dict[str, float]) -> dict:
+        """Move one position to `target_qty` — through the coordinator when the strategy is
+        pooled (so the book stays authoritative), else with a direct order."""
+        if self.coordinator is not None and strat_id in getattr(self.coordinator, "desired", {}):
+            price = self.coordinator.ref_price.get(symbol)
+            r = self.coordinator.set_target(strat_id, symbol, target_qty, price=price)
+            return {"symbol": symbol, "target": target_qty, "pooled": True, **r}
+        current = self.ledger.strategy_positions.get(strat_id, {}).get(symbol, 0.0)
+        delta = target_qty - current
+        inst = self._instruments.get(symbol) or {
+            "symbol": symbol, "asset_class": "equity", "sec_type": "STK", "exchange": "SMART"}
+        mult = self.ledger.multipliers.get(symbol, 1.0)
+        intent = {
+            "client_order_id": f"alloc-{strat_id}-{symbol}-{int(time.time() * 1000)}",
+            "strategy_id": strat_id,
+            "instrument": inst,
+            "side": "buy" if delta > 0 else "sell",
+            "quantity": abs(delta),
+            "order_type": "market",
+            "time_in_force": "day",
+            "expected_price": (units.get(symbol) or 0.0) / mult or None,
+        }
+        return {"symbol": symbol, "target": target_qty, "pooled": False,
+                "order_id": self.place_order(intent)}
+
     def clear_kill_switch(self) -> None:
         """Re-enable order flow after a kill switch or a tripped circuit breaker.
 
@@ -1553,6 +1744,17 @@ class CentralExecutor(EClient, EWrapper):
             self.ledger.restore_state(self.logger_db)
         except Exception as e:
             logger.error("failed to restore ledger state: %s", e)
+
+        # restore runtime allocation changes (CONFIG holds the defaults)
+        try:
+            for sid, alloc in self.logger_db.load_allocations().items():
+                if sid in CONFIG and alloc != CONFIG[sid]["capital_allocation"]:
+                    logger.warning("restored allocation for %s: %s (config default %s)",
+                                   sid, f"{alloc:,.0f}",
+                                   f"{CONFIG[sid]['capital_allocation']:,.0f}")
+                    CONFIG[sid]["capital_allocation"] = float(alloc)
+        except Exception as e:
+            logger.error("failed to restore allocations: %s", e)
 
         # restore halted strategies
         try:

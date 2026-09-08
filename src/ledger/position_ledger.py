@@ -77,6 +77,23 @@ class PositionLedger:
         with self._lock:
             return dict(self.strategy_cash)
 
+    def adjust_capital(self, strat_id: str, delta: float) -> dict:
+        """Move capital INTO (delta > 0) or OUT OF (delta < 0) a strategy.
+
+        Cash and the capital basis move together, so P&L is untouched: funding a strategy
+        is not a profit, and withdrawing from it is not a loss. NAV moves by exactly delta.
+
+        Withdrawing more than the cash on hand is allowed and leaves cash NEGATIVE — that
+        shortfall is the amount of stock the caller must sell; the sale proceeds land back
+        in cash on the fill and bring it up to zero. See CentralExecutor.rebalance_allocation."""
+        with self._lock:
+            before = self._cash(strat_id)
+            self.strategy_cash[strat_id] = before + delta
+            self.starting_cash[strat_id] = self._basis(strat_id) + delta
+            return {"strategy_id": strat_id, "delta": delta,
+                    "cash_before": before, "cash_after": self.strategy_cash[strat_id],
+                    "starting_cash": self.starting_cash[strat_id]}
+
     def set_cash(self, strat_id: str, amount: float, reset_basis: bool = False) -> None:
         """Overwrite a strategy's cash balance (e.g. reconciling against the broker or
         funding a new strategy). `reset_basis` also moves the capital basis, so the
