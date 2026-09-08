@@ -152,6 +152,8 @@ class CentralExecutor(EClient, EWrapper):
         self._reconnecting = False
         self._whatif: Dict[int, dict] = {}         # orderId -> margin impact (whatIf openOrder)
         self._whatif_events: Dict[int, threading.Event] = {}
+        self._startup_degraded = False   # True if startup reconciliation never succeeded
+        self._flatten_retry_ts: Dict[str, float] = {}  # strat -> last flatten retry (ensure_flat)
         self._daily_baseline: Optional[float] = None  # portfolio equity baseline for the circuit breaker
         self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
@@ -787,7 +789,10 @@ class CentralExecutor(EClient, EWrapper):
                     sid, expected_price=order_info.get("expected_price"),
                 )
             self._check_fill_sanity("__net__", contract.symbol, execution.price, order_info.get("expected_price"))
-            for sid in list(self.coordinator.desired.keys()):
+            # Include the strategies this fill was attributed to, not just the ones with a
+            # desired book: after a lost/reset netting.json `desired` is empty, which
+            # silently disabled the per-fill drawdown check for every strategy.
+            for sid in set(self.coordinator.desired) | {sid for sid, _ in attributed}:
                 self.enforce_drawdown(sid, self.ledger.strategy_realized_pnl.get(sid, 0.0))
             self.ledger.save_state(self.logger_db)  # persist after every fill
             logger.info("ExecDetails(net) - %s %s %s @ %s (attributed to %s)",
@@ -1028,6 +1033,12 @@ class CentralExecutor(EClient, EWrapper):
         self.logger_db.save_halted_strategies(
             set(), self.risk_manager._active_strategies, set(CONFIG.keys()), reason)
         self.logger_db.log_decision(strat_id, "halt", f"HALTED: {reason}")
+        # Kill the strategy's in-flight orders BEFORE closing: an unfilled buy that lands
+        # after the flatten would re-open the position the halt just closed.
+        try:
+            self._cancel_strategy_orders(strat_id)
+        except Exception as e:
+            logger.error("halt: cancelling working orders failed for %s: %s", strat_id, e)
         try:
             if self.coordinator is not None and strat_id in getattr(self.coordinator, "desired", {}):
                 self.coordinator.halt(strat_id)       # zero desired book + unwind (attributes to strat)
@@ -1036,13 +1047,95 @@ class CentralExecutor(EClient, EWrapper):
         except Exception as e:
             logger.error("flatten failed for %s: %s", strat_id, e)
 
-    def _flatten_direct(self, strat_id: str) -> None:
+    def _cancel_strategy_orders(self, strat_id: str) -> list:
+        """Cancel a strategy's own working orders and reverse their pending contribution.
+
+        A halt that only places closing orders leaves the strategy's in-flight BUYS alive:
+        they fill after the flatten and re-open the position the halt just closed. Pooled
+        (__net__) orders are skipped — the coordinator's unwind cancels those per symbol,
+        and they belong to more strategies than this one."""
+        cancelled = []
+        for oid, st in list(self.order_status.items()):
+            if st.get("status") not in ("PreSubmitted", "Submitted"):
+                continue
+            if st.get("net") or st.get("strategy_id") != strat_id:
+                continue
+            try:
+                self.cancelOrder(oid)
+            except Exception as e:
+                logger.error("halt: failed to cancel order %s for %s: %s", oid, strat_id, e)
+                continue
+            pending = st.get("pending_qty", 0.0)
+            if pending:
+                self.ledger.record_pending(st.get("symbol"), -pending, strat_id)
+            st["status"] = "PendingCancel"
+            cancelled.append(oid)
+        if cancelled:
+            logger.warning("halt %s: cancelled working orders %s", strat_id, cancelled)
+        return cancelled
+
+    def _has_live_order(self, strat_id: str, symbol: str) -> bool:
+        """Is a closing order already working for this symbol? Guards the flatten retry
+        against stacking duplicate orders while one sits unfilled (e.g. market closed)."""
+        for st in self.order_status.values():
+            if st.get("status") not in ("PreSubmitted", "Submitted"):
+                continue
+            if st.get("symbol") != symbol:
+                continue
+            if st.get("net") or st.get("strategy_id") == strat_id:
+                return True
+        return False
+
+    def ensure_flat(self, strat_id: str) -> dict:
+        """Re-attempt the unwind of a halted strategy that is still holding.
+
+        halt_and_flatten fires ONCE and returns early forever after (`is_active` is already
+        False), so a flatten that failed — broker rejection, exception, market closed, a
+        partial fill — left the strategy halted AND still exposed, with nothing retrying.
+        Called each sampler cycle for halted strategies. Skips any symbol that already has
+        a working order, and re-arms at most every GLOBAL['flatten_retry_sec']."""
+        if self.risk_manager.is_active(strat_id):
+            return {"retried": False, "reason": "not halted"}
+        book = {s: q for s, q in self.ledger.strategy_positions.get(strat_id, {}).items()
+                if abs(q) > 1e-9}
+        if not book:
+            self._flatten_retry_ts.pop(strat_id, None)
+            return {"retried": False, "reason": "flat"}
+
+        outstanding = {s: q for s, q in book.items() if not self._has_live_order(strat_id, s)}
+        if not outstanding:
+            return {"retried": False, "reason": "closing orders already working",
+                    "still_holding": book}
+
+        cooldown = float(GLOBAL.get("flatten_retry_sec", 60.0))
+        last = self._flatten_retry_ts.get(strat_id, 0.0)
+        if time.time() - last < cooldown:
+            return {"retried": False, "reason": "cooldown", "still_holding": book}
+        self._flatten_retry_ts[strat_id] = time.time()
+
+        logger.critical("HALTED STRATEGY STILL HOLDING — retrying flatten for %s: %s",
+                        strat_id, outstanding)
+        try:
+            if self.coordinator is not None and strat_id in getattr(self.coordinator, "desired", {}):
+                self.coordinator.desired[strat_id] = {}
+                self.coordinator._save()
+                self.coordinator._rebalance(set(outstanding), urgent=True)
+            else:
+                self._flatten_direct(strat_id, symbols=set(outstanding))
+        except Exception as e:
+            logger.error("flatten retry failed for %s: %s", strat_id, e)
+            return {"retried": True, "ok": False, "error": str(e), "still_holding": book}
+        return {"retried": True, "ok": True, "symbols": sorted(outstanding)}
+
+    def _flatten_direct(self, strat_id: str, symbols: set = None) -> None:
         """Close every non-flat position of a (non-pooled) strategy with market orders.
         Bypasses the active-strategy risk check by calling place_order directly — the
         strategy is halted, but this system-initiated unwind must still go through."""
         book = dict(self.ledger.strategy_positions.get(strat_id, {}))
         for sym, qty in book.items():
             if abs(qty) < 1e-9:
+                continue
+            if symbols is not None and sym not in symbols:
                 continue
             inst = self._instruments.get(sym) or {
                 "symbol": sym, "asset_class": "equity", "sec_type": "STK", "exchange": "SMART"}
@@ -1058,6 +1151,37 @@ class CentralExecutor(EClient, EWrapper):
             }
             logger.warning("FLATTEN %s: %s %g %s", strat_id, intent["side"], abs(qty), sym)
             self.place_order(intent)
+
+    def clear_kill_switch(self) -> None:
+        """Re-enable order flow after a kill switch or a tripped circuit breaker.
+
+        Nothing else clears `_killed`: without this the only way back from a kill — your
+        own, or the portfolio breaker's — is a process restart. Strategies halted by the
+        breaker stay halted on purpose; reactivate them individually once you've looked."""
+        was_killed, was_broken = self._killed, self._circuit_broken
+        self._killed = False
+        self._circuit_broken = False
+        logger.critical("KILL SWITCH CLEARED — new orders accepted again "
+                        "(was killed=%s, circuit_broken=%s)", was_killed, was_broken)
+
+    def flatten_strategy(self, strat_id: str) -> dict:
+        """Close ONE strategy's positions without halting it — it can trade again on its
+        next signal. Cancels its working orders first so an in-flight order can't re-open
+        what we just closed."""
+        self._cancel_strategy_orders(strat_id)
+        book = {s: q for s, q in self.ledger.strategy_positions.get(strat_id, {}).items()
+                if abs(q) > 1e-9}
+        if not book:
+            return {"strategy_id": strat_id, "flattened": [], "note": "already flat"}
+        logger.warning("FLATTEN %s (no halt): %s", strat_id, book)
+        if self.coordinator is not None and strat_id in getattr(self.coordinator, "desired", {}):
+            self.coordinator.desired[strat_id] = {}
+            self.coordinator._save()
+            self.coordinator._rebalance(set(book), urgent=True)
+        else:
+            self._flatten_direct(strat_id, symbols=set(book))
+        return {"strategy_id": strat_id,
+                "flattened": [{"symbol": s, "quantity": q} for s, q in book.items()]}
 
     def kill_switch(self, flatten: bool = True) -> None:
         self._killed = True
@@ -1329,8 +1453,36 @@ class CentralExecutor(EClient, EWrapper):
             time.sleep(retry_delay)
 
         self.reqMarketDataType(3)
-        result = self.reconcile_and_log()      # ledger recovers NET positions from broker
-        self.recover_open_orders()             # executor recovers open orders from IB
+
+        # Startup reconciliation, but NEVER fatal. IB Gateway can hold a socket open while
+        # its uplink to IBKR flaps (error 1100), so reqPositions times out and the old code
+        # raised straight out of the FastAPI lifespan: uvicorn stopped serving, the process
+        # did NOT exit, and `restart: unless-stopped` never fired — a container that looks
+        # up while answering nothing. Far better to come up KILLED and loud: the dashboard,
+        # /health and the Telegram control all work, and nothing can trade until you
+        # /reconcile and /unkill.
+        result = {"matched": None, "discrepancies": {}}
+        self._startup_degraded = False
+        for attempt in range(1, 4):
+            try:
+                result = self.reconcile_and_log()   # ledger recovers NET positions from broker
+                break
+            except Exception as e:
+                logger.warning("startup reconciliation attempt %d/3 failed: %s", attempt, e)
+                if attempt == 3:
+                    self._startup_degraded = True
+                    self._killed = True
+                    logger.critical(
+                        "STARTUP RECONCILIATION FAILED (%s) — executor is UP but KILLED: it "
+                        "does not know the broker's positions. Fix the IB connection, then "
+                        "POST /reconcile and POST /unkill.", e)
+                else:
+                    time.sleep(2.0)
+        try:
+            self.recover_open_orders()         # executor recovers open orders from IB
+        except Exception as e:
+            logger.critical("open-order recovery failed at startup: %s — working orders may "
+                            "be untracked until the next /reconcile", e)
         self._restore_persistent_state()       # restore per-strategy positions, P&L, halts
         # Run read-only probe in background so it doesn't block server startup / health checks
         threading.Thread(target=self._wait_for_api_ready, daemon=True,

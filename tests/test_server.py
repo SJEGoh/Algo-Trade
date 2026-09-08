@@ -192,12 +192,24 @@ def test_health(client, fake, monkeypatch):
     fake._connected = True
     fake._killed = False
     body = client.get("/health").json()
-    assert body == {"connected": True, "killed": False, "market_open": True}
+    assert body == {"connected": True, "killed": False, "market_open": True,
+                    "startup_degraded": False}
 
     fake._connected = False
     fake._killed = True
     body = client.get("/health").json()
-    assert body == {"connected": False, "killed": True, "market_open": True}
+    assert body == {"connected": False, "killed": True, "market_open": True,
+                    "startup_degraded": False}
+
+
+def test_health_reports_a_degraded_startup(client, fake, monkeypatch):
+    """Startup that couldn't reconcile comes up KILLED rather than dying — /health has to
+    say so, or an executor that can't see the broker looks identical to a healthy one."""
+    monkeypatch.setattr(server, "is_market_open", lambda *a, **k: True)
+    fake._connected = True
+    fake._killed = True
+    fake._startup_degraded = True
+    assert client.get("/health").json()["startup_degraded"] is True
 
 
 # ---------------------------------------------------------------------------

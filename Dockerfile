@@ -39,11 +39,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
 COPY . .
-RUN mkdir -p /app/db /app/logs && chown -R app:app /app
+# /app/state holds the telegram-control update offset; create it (owned by app)
+# so the named volume inherits that ownership instead of defaulting to root
+RUN mkdir -p /app/db /app/logs /app/state && chown -R app:app /app
 USER app
 EXPOSE 8000
 # db/ holds SQLite + netting.json + vecm_state.json; logs/ the run logs — keep them on volumes
-VOLUME ["/app/db", "/app/logs"]
+VOLUME ["/app/db", "/app/logs", "/app/state"]
 # /health is unauthenticated; reports IB connectivity
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/health || exit 1

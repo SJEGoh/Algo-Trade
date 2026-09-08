@@ -387,7 +387,10 @@ class EventLogger:
                     )
                 self._conn.commit()
         except Exception as e:
-            logger.error("save_halted_strategies failed: %s", e)
+            # CRITICAL (-> Telegram): an unpersisted halt is resurrected on the next
+            # restart, and the strategy resumes trading as if it never breached.
+            logger.critical("save_halted_strategies FAILED — halt will not survive a "
+                            "restart: %s", e)
 
     def save_multipliers(self, multipliers: dict) -> None:
         try:

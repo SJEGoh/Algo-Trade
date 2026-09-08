@@ -142,3 +142,34 @@ ATR_EXECUTION = {
     "skip_exits": True,              # never transform exit intents (target_qty == 0)
     "cancel_before_close_min": 5,    # EOD cancel sweep (used by day_scheduler)
 }
+
+
+# ---------------------------------------------------------------------------
+# Config validation — a strategy missing `capital_allocation` or `max_drawdown` has NO
+# allocation cap and NO drawdown halt, silently: drawdown_status returns "not breached"
+# when either key is absent, so a typo disables the protection rather than announcing it.
+# Called at startup so a bad config fails at boot, not during a drawdown.
+# ---------------------------------------------------------------------------
+def validate_config(config: dict = None) -> list:
+    """Return a list of problems found in the strategy config (empty = valid)."""
+    cfg = CONFIG if config is None else config
+    problems = []
+    for sid, entry in cfg.items():
+        if not isinstance(entry, dict):
+            problems.append(f"{sid}: config entry is not a dict")
+            continue
+        alloc = entry.get("capital_allocation")
+        if alloc is None:
+            problems.append(f"{sid}: missing capital_allocation — no allocation cap")
+        elif not isinstance(alloc, (int, float)) or alloc <= 0:
+            problems.append(f"{sid}: capital_allocation must be a positive number (got {alloc!r})")
+        dd = entry.get("max_drawdown")
+        if dd is None:
+            problems.append(f"{sid}: missing max_drawdown — drawdown halt DISABLED")
+        elif not isinstance(dd, (int, float)) or not (0 < dd <= 1):
+            problems.append(f"{sid}: max_drawdown must be a fraction in (0, 1] (got {dd!r})")
+        start = entry.get("starting_cash")
+        if start is not None and (not isinstance(start, (int, float)) or start < 0):
+            problems.append(f"{sid}: starting_cash must be a non-negative number (got {start!r})")
+    return problems
+

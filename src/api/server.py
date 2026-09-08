@@ -14,7 +14,7 @@ from execution.central_execution import CentralExecutor, is_market_open
 from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
-from config import CONFIG
+from config import CONFIG, validate_config
 
 import threading
 from datetime import datetime, timezone
@@ -35,6 +35,23 @@ executor: Optional[CentralExecutor] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        async with _startup(app):
+            yield
+    except Exception:
+        # A failed lifespan stops uvicorn serving but does NOT end the process, so Docker's
+        # restart policy never fires and the container sits there answering nothing. Make
+        # the failure real: log it, then exit so the container restarts (or crash-loops
+        # visibly, which beats a zombie).
+        logging.getLogger("executor").critical("STARTUP FAILED — exiting so the container "
+                                               "restarts instead of running dead",
+                                               exc_info=True)
+        logging.shutdown()
+        os._exit(1)
+
+
+@asynccontextmanager
+async def _startup(app: FastAPI):
     global executor
     setup_logging()
     if not EXECUTOR_API_KEY:
@@ -47,6 +64,13 @@ async def lifespan(app: FastAPI):
     alerter = Alerter()
     logging.getLogger().addHandler(AlertingHandler(alerter))
     app.state.alerter = alerter
+
+    problems = validate_config()
+    if problems:
+        raise RuntimeError(
+            "invalid strategy config — every strategy needs a positive capital_allocation "
+            "and a max_drawdown in (0, 1], or its allocation cap and drawdown halt are "
+            "silently disabled:\n  " + "\n  ".join(problems))
 
     executor = CentralExecutor()
     executor._alerter = alerter  # give executor access for read-only probe Telegram alerts
@@ -249,6 +273,9 @@ def health():
         "connected": executor.isConnected(),
         "killed": executor._killed,
         "market_open": is_market_open(),
+        # True when startup could not reconcile against the broker: the executor is up and
+        # inspectable but killed, because its position state is untrusted.
+        "startup_degraded": getattr(executor, "_startup_degraded", False),
     }
 
 
@@ -260,6 +287,52 @@ def kill(req: KillRequest):
         topic="errors",
     )
     return {"killed": True, "flattened": req.flatten}
+
+@app.post("/unkill", dependencies=[Depends(require_api_key)])
+def unkill():
+    """Clear the kill switch and a tripped circuit breaker so orders flow again.
+    Strategies halted by the breaker stay halted — reactivate them individually."""
+    executor.clear_kill_switch()
+    _alert("\u2705 Kill switch CLEARED — new orders accepted again", topic="errors")
+    return {"killed": executor._killed, "circuit_broken": executor._circuit_broken}
+
+
+class HaltRequest(BaseModel):
+    flatten: bool = True
+    reason: str = ""
+
+
+@app.post("/strategies/{strategy_id}/halt", dependencies=[Depends(require_api_key)])
+def halt_strategy(strategy_id: str, req: HaltRequest = HaltRequest()):
+    """Stop ONE strategy (and by default close its book). The manual twin of the
+    automatic drawdown halt — same path, so the unwind and its retry behave identically."""
+    if strategy_id not in CONFIG:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {strategy_id}")
+    if not executor.risk_manager.is_active(strategy_id):
+        return {"strategy_id": strategy_id, "status": "halted", "note": "already halted"}
+    reason = req.reason or "manual halt"
+    if req.flatten:
+        executor.halt_and_flatten(strategy_id, f"MANUAL HALT: {reason}")
+    else:
+        executor.risk_manager.halt_strategy(strategy_id, reason)
+        executor.logger_db.save_halted_strategies(
+            set(), executor.risk_manager._active_strategies, set(CONFIG.keys()), reason)
+        executor.logger_db.log_decision(strategy_id, "halt", f"HALTED (no flatten): {reason}")
+    return {"strategy_id": strategy_id, "status": "halted", "flattened": req.flatten}
+
+
+@app.post("/strategies/{strategy_id}/flatten", dependencies=[Depends(require_api_key)])
+def flatten_strategy(strategy_id: str):
+    """Close one strategy's book WITHOUT halting it — it resumes on its next signal."""
+    if strategy_id not in CONFIG:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {strategy_id}")
+    result = executor.flatten_strategy(strategy_id)
+    if result.get("flattened"):
+        _alert(f"\U0001f4a8 Flatten {strategy_id}: "
+               + ", ".join(f"{p['symbol']} {p['quantity']:+.0f}" for p in result["flattened"]),
+               topic="orders")
+    return result
+
 
 @app.post("/flatten", dependencies=[Depends(require_api_key)])
 def flatten_all():
@@ -481,6 +554,16 @@ _sampler_stop = threading.Event()
 # Latest sampled balance sheet, refreshed by _equity_sampler and served by GET /equity.
 _last_equity: dict = {"ts": None, "strategies": {}, "totals": {}, "marks": {}}
 
+# Consecutive sampler cycles a strategy's unrealized-drawdown check was skipped for want of
+# a fresh mark. Escalates to a CRITICAL (-> Telegram) so the gap can't stay silent.
+_stale_skips: dict = {}
+_STALE_SKIP_ALERT_AFTER = 5
+
+# Consecutive whole-cycle sampler failures. The sampler is the only path that halts on
+# UNREALIZED losses, so it failing repeatedly has to page rather than log quietly.
+_sampler_failures = [0]
+_SAMPLER_FAIL_ALERT_AFTER = 3
+
 
 def _equity_sampler(interval: float = 60.0):
     log = logging.getLogger("executor")
@@ -503,11 +586,16 @@ def _equity_sampler(interval: float = 60.0):
                 if strat in _INTERNAL:
                     continue
                 visible[strat] = v
-                executor.logger_db.log_equity(
-                    ts, strat, v["realized"], v["unrealized"], v["equity"],
-                    cash=v.get("cash"), position_value=v.get("position_value"),
-                    nav=v.get("nav"),
-                )
+                # Recording history must never cost us a risk check — see the enforcement
+                # block below.
+                try:
+                    executor.logger_db.log_equity(
+                        ts, strat, v["realized"], v["unrealized"], v["equity"],
+                        cash=v.get("cash"), position_value=v.get("position_value"),
+                        nav=v.get("nav"),
+                    )
+                except Exception as e:
+                    log.error("equity snapshot not recorded for %s: %s", strat, e)
             # Portfolio balance sheet: NAV is the sum of every position of every strategy,
             # cash included. Cached for the dashboard (GET /equity).
             totals = {
@@ -521,23 +609,76 @@ def _equity_sampler(interval: float = 60.0):
             }
             _last_equity.update({"ts": ts, "strategies": visible, "totals": totals,
                                  "marks": {k: v for k, v in marks.items() if v is not None}})
-            # portfolio circuit breaker on total equity (cash + positions across all strategies;
-            # the baseline is a same-basis level, so the loss it measures is unchanged)
-            executor.enforce_daily_loss(sum(v.get("nav", 0.0) for v in snap.values()))
-            # per-strategy total-equity drawdown; SKIP a strategy if any held symbol's mark is
-            # stale/missing (don't halt+flatten on incomplete unrealized data — realized fast
-            # path still guards it).
-            for sid in CONFIG:
-                held = [s for s, q in executor.ledger.strategy_positions.get(sid, {}).items() if q != 0]
-                if held and not all(executor.mark_is_fresh(s) for s in held):
-                    log.warning("total-drawdown check skipped for %s (stale/missing mark)", sid)
-                    continue
-                # "equity" here is P&L (realized + unrealized) — the drawdown limit is a
-                # fraction of allocation, not of NAV.
-                executor.enforce_drawdown(sid, snap.get(sid, {}).get("equity", 0.0), "total")
+            # ---- risk enforcement -------------------------------------------------
+            # Isolated from everything above. This loop is the ONLY thing that halts a
+            # strategy on unrealized losses, and a single throw anywhere earlier in the
+            # cycle used to skip it entirely — silently, every cycle, logged at ERROR.
+            _enforce(log, snap)
+            _sampler_failures[0] = 0
         except Exception as e:
-            log.error("equity sampler error: %s", e)
+            _sampler_failures[0] += 1
+            if _sampler_failures[0] in (1, _SAMPLER_FAIL_ALERT_AFTER):
+                level = log.critical if _sampler_failures[0] >= _SAMPLER_FAIL_ALERT_AFTER else log.error
+                level("equity sampler error (%d in a row)%s: %s", _sampler_failures[0],
+                      " — UNREALIZED DRAWDOWN CHECKS ARE NOT RUNNING"
+                      if _sampler_failures[0] >= _SAMPLER_FAIL_ALERT_AFTER else "", e)
+            else:
+                log.error("equity sampler error (%d in a row): %s", _sampler_failures[0], e)
         _sampler_stop.wait(interval)   # sleep, wakes early on stop
+
+
+def _enforce(log, snap: dict) -> None:
+    """Portfolio breaker + per-strategy drawdown halts + retry of halted-but-holding
+    unwinds.
+
+    Every step is guarded on its own: this is the only path that halts a strategy on
+    UNREALIZED losses, so neither a bad strategy nor a failed write may stop the rest of
+    the book from being checked. Failures here page (CRITICAL -> Telegram) — an unguarded
+    strategy must never be a quiet log line."""
+    try:
+        # portfolio circuit breaker on total equity (cash + positions across all strategies;
+        # the baseline is a same-basis level, so the loss it measures is unchanged)
+        executor.enforce_daily_loss(sum(v.get("nav", 0.0) for v in snap.values()))
+    except Exception as e:
+        log.critical("portfolio circuit breaker did not run: %s", e)
+
+    for sid in CONFIG:
+        try:
+            # A halted strategy that is still holding gets its unwind retried — the
+            # one-shot halt+flatten can fail (rejection, market closed, partial fill)
+            # and would otherwise never try again.
+            if not executor.risk_manager.is_active(sid):
+                executor.ensure_flat(sid)
+                continue
+
+            # Per-strategy total-equity drawdown. SKIP a strategy if any held symbol's mark
+            # is stale/missing: halting+flattening on incomplete unrealized data is worse
+            # than waiting, and the realized fast path still guards it on every fill.
+            held = [s for s, q in executor.ledger.strategy_positions.get(sid, {}).items()
+                    if q != 0]
+            stale = [s for s in held if not executor.mark_is_fresh(s)]
+            if stale:
+                # Skipping is deliberate, but an UNBOUNDED skip is an unguarded strategy —
+                # escalate so the gap can't stay invisible.
+                n = _stale_skips.get(sid, 0) + 1
+                _stale_skips[sid] = n
+                if n == _STALE_SKIP_ALERT_AFTER:
+                    log.critical(
+                        "UNREALIZED DRAWDOWN CHECK UNGUARDED — %s skipped %d cycles: no "
+                        "fresh mark for %s. Only the realized-P&L halt is protecting it.",
+                        sid, n, ", ".join(stale))
+                else:
+                    log.warning("total-drawdown check skipped for %s (stale/missing mark: %s)",
+                                sid, ", ".join(stale))
+                continue
+            _stale_skips.pop(sid, None)
+
+            # "equity" here is P&L (realized + unrealized) — the drawdown limit is a
+            # fraction of allocation, not of NAV.
+            executor.enforce_drawdown(sid, snap.get(sid, {}).get("equity", 0.0), "total")
+        except Exception as e:
+            log.critical("DRAWDOWN CHECK FAILED for %s — strategy unguarded this cycle: %s",
+                         sid, e)
 
 
 class JournalEntry(BaseModel):
