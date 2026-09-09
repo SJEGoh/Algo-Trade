@@ -15,6 +15,7 @@ from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
 from config import CONFIG, validate_config
+from portfolio import hedger
 
 import threading
 import time
@@ -290,6 +291,56 @@ def get_positions():
         "starting_cash": dict(executor.ledger.starting_cash),
         "multipliers": dict(executor.ledger.multipliers),
     }
+
+@app.get("/exposure")
+def get_exposure(trigger: float = 0.30, target: float = 0.25, release: float = 0.20):
+    """Bucketed exposure, and the hedge that WOULD be placed. Read-only — places nothing.
+
+    Run this alongside the live book before letting anything trade on it: the thresholds are
+    the whole design, and the only way to know whether they fire sensibly is to watch them
+    against real positions for a while.
+
+    The `unpriced` and `unhedgeable` sections are the honest part. Exposure that could not
+    be measured, or that has no hedge instrument, is reported rather than dropped — a
+    coverage report that quietly omits what it could not handle is worse than no report.
+    """
+    marks = dict((_last_equity.get("marks") or {}))
+    nav = float((_last_equity.get("totals") or {}).get("nav") or 0.0)
+    if nav <= 0:
+        raise HTTPException(status_code=503,
+                            detail="no NAV sample yet — the equity sampler has not run")
+
+    try:
+        policy = hedger.BucketPolicy(trigger=trigger, target=target, release=release)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    exposures, unpriced = hedger.bucket_exposures(
+        {sid: dict(pos) for sid, pos in executor.ledger.strategy_positions.items()},
+        marks=marks, nav=nav,
+        multipliers=dict(executor.ledger.multipliers),
+        instruments=dict(getattr(executor, "_instruments", {}) or {}),
+    )
+    current = {sym: qty for sym, qty in
+               (executor.ledger.strategy_positions.get(hedger.HEDGE_STRATEGY_ID) or {}).items()
+               if abs(qty) > 1e-9}
+
+    plan = hedger.plan(exposures, nav, prices=marks, default_policy=policy,
+                       current_hedge=current, unpriced=unpriced)
+    return {
+        "nav": nav,
+        "exposures": [{"bucket": b, "notional": e.notional, "fraction": e.fraction,
+                       "symbols": e.symbols}
+                      for b, e in sorted(exposures.items(), key=lambda kv: -abs(kv[1].fraction))],
+        "hedge": [{"bucket": d.bucket, "symbol": d.hedge_symbol, "quantity": d.quantity,
+                   "notional": d.hedge_notional, "reason": d.reason}
+                  for d in plan.decisions],
+        "book": plan.book,
+        "coverage": plan.coverage,
+        "unhedgeable": plan.unhedgeable,
+        "policy": {"trigger": trigger, "target": target, "release": release},
+    }
+
 
 @app.get("/positions/orphans")
 def get_orphans():
