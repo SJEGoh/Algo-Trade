@@ -53,6 +53,25 @@ CONFIG = {
         "max_drawdown": 0.15,              # fraction of allocation, e.g. 0.15 = 15%
     },
 
+    # Portfolio hedge overlay (src/portfolio/hedger.py). Not a strategy: it holds no view
+    # and seeks no return. It shorts a sector/asset-class proxy when the book's exposure to
+    # that bucket runs past its trigger, and carries nothing otherwise.
+    #
+    # capital_allocation is a GROSS-NOTIONAL ceiling on how much hedge it may carry, not
+    # capital set aside to make money with. Size it against the largest hedge the thresholds
+    # can ask for: roughly (worst-case bucket exposure - target) x NAV.
+    #
+    # max_drawdown is deliberately near-useless here, and that is the point. A hedge LOSES
+    # money precisely when the book it protects is gaining — that is what a hedge is. A
+    # normal drawdown halt would flatten the overlay after a strong run-up, removing the
+    # protection exactly when exposure is highest and leaving the book naked into the
+    # reversal. The real limits on this book are the hedger's own thresholds and this
+    # notional ceiling, not a P&L stop.
+    "hedge_overlay": {
+        "capital_allocation": 1_500_000.0,
+        "max_drawdown": 0.95,
+    },
+
     # Kalman VECM (WTI vs Brent+RBOB futures). capital_allocation here is the sizing NAV +
     # the executor's loose multiplier-aware risk backstop; the strategy's own hard risk_limits
     # (per-leg / gross notional in models/vecm_strategy.py) are the BINDING caps — tune both

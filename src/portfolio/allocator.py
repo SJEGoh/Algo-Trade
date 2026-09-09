@@ -129,7 +129,8 @@ def history_days(returns: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Covariance
 # ---------------------------------------------------------------------------
-def shrunk_covariance(returns: pd.DataFrame, annualise: bool = True) -> tuple:
+def shrunk_covariance(returns: pd.DataFrame, annualise: bool = True,
+                      periods_per_year: float = TRADING_DAYS) -> tuple:
     """Ledoit-Wolf shrunk covariance. Returns (covariance DataFrame, shrinkage coefficient).
 
     Shrinks the sample covariance toward a scaled identity, by an amount the estimator
@@ -148,7 +149,10 @@ def shrunk_covariance(returns: pd.DataFrame, annualise: bool = True) -> tuple:
     lw = LedoitWolf().fit(clean.values)
     cov = pd.DataFrame(lw.covariance_, index=clean.columns, columns=clean.columns)
     if annualise:
-        cov *= TRADING_DAYS
+        # Must match the sampling frequency of `returns`. Scaling a 15-minute series by 252
+        # understates the annualised covariance ~26x, which would make every Sharpe number
+        # downstream quietly wrong rather than obviously wrong.
+        cov *= periods_per_year
     return cov, float(lw.shrinkage_)
 
 
@@ -296,7 +300,8 @@ class Allocation:
 def recommend(returns: pd.DataFrame, current_weights: Dict[str, float] = None,
               exclude: set = None, min_history_days: float = 14.0, max_weight: float = 0.40,
               l2_lambda: float = 0.5, min_days_for_means: float = 90.0,
-              min_days_for_cov: float = 20.0, min_coverage: float = 0.5) -> Allocation:
+              min_days_for_cov: float = 20.0, min_coverage: float = 0.5,
+              periods_per_year: float = TRADING_DAYS) -> Allocation:
     """Pick weights, holding young strategies out of the optimisation entirely.
 
     Exemption (`min_history_days`, two weeks by default)
@@ -424,7 +429,8 @@ def recommend(returns: pd.DataFrame, current_weights: Dict[str, float] = None,
                     f"to estimate a covariance) — equal weight assumes nothing{note}"),
             days=days, diagnostics=diagnostics)
 
-    cov, shrinkage = shrunk_covariance(span[seasoned])
+    cov, shrinkage = shrunk_covariance(span[seasoned],
+                                       periods_per_year=periods_per_year)
 
     if days < min_days_for_means:
         return Allocation(
@@ -434,7 +440,7 @@ def recommend(returns: pd.DataFrame, current_weights: Dict[str, float] = None,
                     f"(need {min_days_for_means:.0f}) — sizing by risk only{note}"),
             shrinkage=shrinkage, days=days, diagnostics=diagnostics)
 
-    mu = span[seasoned].mean() * TRADING_DAYS
+    mu = span[seasoned].mean() * periods_per_year
     weights = max_sharpe_weights(mu, cov, max_weight=effective_cap,
                                  l2_lambda=l2_lambda)
     diagnostics["annualised_mean"] = {k: round(float(v), 4) for k, v in mu.items()}

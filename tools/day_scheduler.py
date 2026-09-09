@@ -55,6 +55,8 @@ ENABLE = {
     "orb_breakout": True,   # intraday opening-range breakout — every ORB_EVERY_MIN
     "vecm":         True,   # Kalman VECM (futures) — once after the close
     "rrg":          True,   # Kalman/RRG combined rotation — weekly rebalance, Thursday EOD
+    "hedge":        True,   # portfolio hedge overlay — once, mid-session
+    "rebalance":    True,   # capital reallocation across strategies — once, late session
 }
 ORB_EVERY_MIN = 30              # cadence of the ORB runner through the session
 ORB_START_AFTER_OPEN_MIN = 30   # wait for the opening range to form before the first ORB
@@ -67,6 +69,10 @@ RRG_BEFORE_CLOSE_MIN = 10       # Kalman/RRG rotation rebalance, Thursday only, 
 PREMARKET_BEFORE_OPEN_MIN = 30  # Telegram briefing before the open
 POSTMARKET_AFTER_CLOSE_MIN = 10 # Telegram summary after the close
 ATR_CANCEL_BEFORE_CLOSE_MIN = 5 # cancel unfilled ATR limit orders before close
+REBALANCE_BEFORE_CLOSE_MIN = 30 # capital reallocation, late enough to see the day, early
+                                # enough to clear the c-10/c-5/c-2 cluster (rrg, ATR cancel,
+                                # ovn_volsurge enter) — a reallocation SELLS to raise cash,
+                                # so it must not run while another strategy is entering.
 RECONCILE_EVERY_MIN = 60        # POST /reconcile this often through the session (0 disables)
 GRACE_MIN = 15                  # run an event up to this late; older -> skip
 
@@ -120,6 +126,39 @@ def build_events(o, c):
         ev.append((c - timedelta(minutes=RRG_BEFORE_CLOSE_MIN),
                    "rrg rotation weekly rebalance (Thursday EOD)", "run",
                    [R("run_rrg.py")]))
+    # ------------------------------------------------------------------ SHAKEOUT SETTINGS
+    # Both blocks below are deliberately tuned to FIRE rather than to be right, so the first
+    # live run exercises the whole path instead of no-opping. Raise them once you have seen
+    # them work end to end.
+    #
+    #   HEDGE_* : with ~700k of equity capital deployed against a ~5.5M NAV, real bucket
+    #             exposures land around 4-6%. The production trigger of 30% would never fire.
+    #   REBAL_* : 6 hours of history cannot produce a DAILY return series at all (one bar,
+    #             zero returns), so the series is resampled to 15 minutes and the annualiser
+    #             changed to match (26 bars/day x 252). Lowering the means threshold defeats
+    #             the guard that stops a short lucky run winning capital — which is why the
+    #             rebalance stays REPORT-ONLY here. Do not add --apply on these settings.
+    HEDGE_TRIGGER, HEDGE_TARGET, HEDGE_RELEASE = "0.03", "0.02", "0.015"
+    REBAL_ARGS = ["--freq", "15min", "--periods-per-year", "6552",
+                  "--min-history-days", "0.2", "--min-days-cov", "0.2",
+                  "--min-days-means", "0.25"]
+
+    if ENABLE["hedge"]:
+        # The MIDPOINT of the session rather than a fixed clock time, so a half-day
+        # (early close) still hedges half way through it rather than 20 minutes before
+        # the bell. By now the open has settled and the ORB book has taken shape, so the
+        # exposure being measured is the one the day will actually carry.
+        ev.append((o + (c - o) / 2,
+                   "portfolio hedge (shave buckets past their trigger)", "run",
+                   [R("run_hedge.py"), "--trigger", HEDGE_TRIGGER,
+                    "--target", HEDGE_TARGET, "--release", HEDGE_RELEASE]))
+    if ENABLE["rebalance"]:
+        # Report-only by default — it prints the recommendation and changes nothing. Add
+        # --apply here only once the weights have been watched for a few weeks: applying
+        # sells positions to raise cash.
+        ev.append((c - timedelta(minutes=REBALANCE_BEFORE_CLOSE_MIN),
+                   "capital rebalance recommendation", "run",
+                   [R("run_rebalance.py"), *REBAL_ARGS]))
     # ATR pullback: cancel unfilled limit orders before close
     ev.append((c - timedelta(minutes=ATR_CANCEL_BEFORE_CLOSE_MIN),
                "ATR cancel unfilled limit orders", "atr_cancel", None))
