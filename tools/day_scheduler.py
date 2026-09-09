@@ -57,6 +57,7 @@ ENABLE = {
     "rrg":          True,   # Kalman/RRG combined rotation — weekly rebalance, Thursday EOD
     "hedge":        True,   # portfolio hedge overlay — once, mid-session
     "rebalance":    True,   # capital reallocation across strategies — once, late session
+    "test_strats":  True,   # MACD + Bollinger plumbing tests — disposable, 1% dd limit
 }
 ORB_EVERY_MIN = 30              # cadence of the ORB runner through the session
 ORB_START_AFTER_OPEN_MIN = 30   # wait for the opening range to form before the first ORB
@@ -69,6 +70,13 @@ RRG_BEFORE_CLOSE_MIN = 10       # Kalman/RRG rotation rebalance, Thursday only, 
 PREMARKET_BEFORE_OPEN_MIN = 30  # Telegram briefing before the open
 POSTMARKET_AFTER_CLOSE_MIN = 10 # Telegram summary after the close
 ATR_CANCEL_BEFORE_CLOSE_MIN = 5 # cancel unfilled ATR limit orders before close
+TEST_STRATS_AFTER_OPEN_MIN = 70 # first MACD/Bollinger plumbing run — early in the session on
+                                # purpose: they exist to trip a 1% drawdown halt, and an
+                                # early entry leaves the whole day for it to happen.
+TEST_STRATS_EVERY_MIN = 30      # then re-fire this often. They run on 30-minute bars, so a
+                                # once-a-day run would re-evaluate a signal that changed 13
+                                # times and would take a week to reach the halt threshold.
+TEST_STRATS_STOP_BEFORE_CLOSE_MIN = 15  # last run, clear of the closing cluster
 REBALANCE_BEFORE_CLOSE_MIN = 30 # capital reallocation, late enough to see the day, early
                                 # enough to clear the c-10/c-5/c-2 cluster (rrg, ATR cancel,
                                 # ovn_volsurge enter) — a reallocation SELLS to raise cash,
@@ -110,6 +118,19 @@ def build_events(o, c):
     if ENABLE["momentum"]:
         ev.append((o + timedelta(minutes=MOMENTUM_AFTER_OPEN_MIN),
                    "momentum rebalance", "run", [R("run_strat.py")]))
+    if ENABLE["test_strats"]:
+        # `resync` = authoritative full-book submit, so a signal that has gone flat closes
+        # the book explicitly rather than leaving the last run's positions in place.
+        # Staggered by 2 minutes so the pair's logs do not interleave.
+        t = o + timedelta(minutes=TEST_STRATS_AFTER_OPEN_MIN)
+        last = c - timedelta(minutes=TEST_STRATS_STOP_BEFORE_CLOSE_MIN)
+        while t <= last:
+            for n, sid in enumerate(("halt_test_macd", "halt_test_bollinger")):
+                when = t + timedelta(minutes=2 * n)
+                if when <= last:
+                    ev.append((when, f"{sid} (plumbing test — tight drawdown limit)", "run",
+                               [R("run_equity.py"), sid, "resync"]))
+            t += timedelta(minutes=TEST_STRATS_EVERY_MIN)
     if ENABLE["orb_breakout"]:
         t = o + timedelta(minutes=ORB_START_AFTER_OPEN_MIN)
         last = c - timedelta(minutes=ORB_STOP_BEFORE_CLOSE_MIN)

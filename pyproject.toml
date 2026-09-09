@@ -9,3 +9,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# models/test_strategies.py holds disposable TRADING strategies, not tests, but its name
+# matches pytest's `test_*.py` collection pattern. Pinning testpaths keeps a bare `pytest`
+# from importing it (and from importing yfinance at collection time).
+testpaths = ["tests"]

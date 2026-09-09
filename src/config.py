@@ -98,6 +98,19 @@ CONFIG = {
     #     LIVE (RiskManager.check_drawdown -> halt_strategy -> is_active False -> subsequent
     #     orders rejected). Allocation fits one micro future (e.g. MCL ~$6.85k notional).
     #     Drive with tools/halt_test.py. 1% of 10k = $100 realized-loss halt threshold.
+    # Plumbing tests with a signal attached (models/test_strategies.py). Same 1%-of-$10k
+    # ($100) halt threshold as the halt_test_* fixtures above, but driven by MACD and
+    # Bollinger rather than by hand — so the halt path gets exercised by a real signal
+    # placing real orders, which is the version that finds the bugs a scripted test misses.
+    "halt_test_macd": {
+        "capital_allocation": 10_000.0,
+        "max_drawdown": 0.01,
+    },
+    "halt_test_bollinger": {
+        "capital_allocation": 10_000.0,
+        "max_drawdown": 0.01,
+    },
+
     "halt_test_1": {
         "capital_allocation": 10_000.0,
         "max_drawdown": 0.01,

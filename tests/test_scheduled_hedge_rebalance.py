@@ -223,3 +223,66 @@ def test_the_shakeout_rebalance_never_carries_apply():
     failure the guards exist to prevent."""
     cmd = _cmd_for("capital rebalance", *session())
     assert "--apply" not in cmd
+
+
+# ------------------------------------------------------------------ plumbing strategies
+def test_the_test_strategies_fire_repeatedly_through_the_session():
+    """They run on 30-minute bars and exist to trip a 1% drawdown halt. Once a day would
+    re-evaluate a signal that changed 13 times, and would take a week to reach the limit."""
+    o, c = session()
+    fired = sorted(w for w, lbl in events_of("plumbing test", o, c))
+
+    assert len(fired) > 10, f"only {len(fired)} runs scheduled"
+    assert fired[0] < o + timedelta(hours=2), "first run is too late to leave time to halt"
+    assert fired[-1] <= c - timedelta(minutes=ds.TEST_STRATS_STOP_BEFORE_CLOSE_MIN)
+    assert len(set(fired)) == len(fired), "two runs scheduled at the same instant"
+
+
+def test_both_test_strategies_fire_on_every_cycle():
+    o, c = session()
+    per_strategy = {}
+    for when, lbl in events_of("plumbing test", o, c):
+        per_strategy.setdefault(lbl.split(" ")[0], []).append(when)
+    assert set(per_strategy) == {"halt_test_macd", "halt_test_bollinger"}
+    a, b = (len(v) for v in per_strategy.values())
+    assert abs(a - b) <= 1, f"cadences drifted apart: {a} vs {b}"
+
+
+def test_they_submit_an_authoritative_book():
+    """`resync` closes names the signal has dropped. Without it a flat signal would leave
+    yesterday's positions in place and the halt would never be reached."""
+    o, c = session()
+    cmds = [p for _w, lbl, _k, p in ds.build_events(o, c) if "plumbing test" in lbl]
+    assert cmds and all(cmd[-1] == "resync" for cmd in cmds)
+    assert {cmd[-2] for cmd in cmds} == {"halt_test_macd", "halt_test_bollinger"}
+
+
+def test_they_can_be_switched_off(monkeypatch):
+    monkeypatch.setitem(ds.ENABLE, "test_strats", False)
+    assert events_of("plumbing test", *session()) == []
+
+
+def test_their_drawdown_limits_are_tight_enough_to_actually_halt():
+    from config import CONFIG
+    for sid in ("halt_test_macd", "halt_test_bollinger"):
+        cfg = CONFIG[sid]
+        assert cfg["max_drawdown"] <= 0.01
+        # $100 of loss on a $10k allocation — reachable in a day by a $5k book
+        assert cfg["capital_allocation"] * cfg["max_drawdown"] <= 100.0
+
+
+def test_they_are_excluded_from_capital_reallocation():
+    """The `halt_test` prefix is load-bearing: the rebalancer must never hand real capital
+    to a disposable fixture."""
+    from run_rebalance import TEST_PREFIXES
+    for sid in ("halt_test_macd", "halt_test_bollinger"):
+        assert sid.startswith(TEST_PREFIXES)
+
+
+def test_the_book_fits_inside_the_allocation_cap():
+    """5 names x $1,000 against a $10,000 cap. If the book could exceed the cap the orders
+    would be rejected by the allocation check before reaching the halt logic being tested."""
+    from models.test_strategies import TEST_UNIVERSE, _IntradayBarStrategy
+    from config import CONFIG
+    worst_case = len(TEST_UNIVERSE) * _IntradayBarStrategy("x").lot_dollars
+    assert worst_case <= CONFIG["halt_test_macd"]["capital_allocation"]
