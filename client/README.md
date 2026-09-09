@@ -109,9 +109,21 @@ pooled book. Use `ExecutorClient` directly if you want none of this.
 ## Scheduling
 
 Nothing here schedules anything — use cron or a systemd timer on the strategy host. The
-exit codes are meant for that: `0` submitted (or deliberately skipped), `1` the executor
-refused or the book was invalid, `2` unreachable — orders did **not** go in, and a Telegram
-alert has already gone out.
+exit codes are meant for that:
+
+| code | meaning |
+|---|---|
+| `0` | submitted **and confirmed by the broker** (or deliberately skipped) |
+| `1` | the executor refused, or the book was invalid |
+| `2` | executor unreachable — orders did **not** go in, Telegram already alerted |
+| `3` | the executor took the orders, **IB did not** — see below |
+
+Code `3` is the one worth understanding. A submission returning `accepted: true` only means
+the executor handed the order to the socket; whether IB accepted it is a separate question.
+A gateway in read-only mode refuses every order while submissions still come back clean, so
+`run()` polls `/orders/acks` after submitting and will not report success until the broker
+has confirmed. Set `confirm_with_broker = False` to opt out, or raise `ack_timeout`
+(default 30s) for a slow gateway.
 
 ```cron
 35 15 * * 1-5  cd /home/ubuntu/strategy && ./venv/bin/python client/example_remote_strategy.py

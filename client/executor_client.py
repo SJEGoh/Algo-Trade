@@ -232,6 +232,60 @@ class ExecutorClient:
                          "target_quantity": i["target_quantity"],
                          "expected_price": i.get("expected_price")} for i in intents]})
 
+    # ------------------------------------------------------------------ acknowledgement
+    @staticmethod
+    def order_ids(result: dict) -> list:
+        """Pull the order ids out of whatever submit_book / submit_orders returned."""
+        if not isinstance(result, dict):
+            return []
+        ids = [o.get("order_id") for o in (result.get("orders") or [])]
+        for entry in (result.get("submitted") or []):
+            ids.append(entry.get("order_id"))
+        return [int(i) for i in ids if i is not None]
+
+    def acks(self, order_ids: list) -> dict:
+        """GET /orders/acks — has IB actually taken these orders?"""
+        if not order_ids:
+            return {"acks": {}, "pending": 0, "rejected": 0, "unknown_order_ids": []}
+        return self._request("GET", "/orders/acks",
+                             params={"ids": ",".join(str(i) for i in order_ids)})
+
+    def wait_for_acks(self, order_ids: list, timeout: float = 30.0,
+                      poll: float = 2.0) -> dict:
+        """Block until IB has accepted or refused every order, or `timeout` elapses.
+
+        A submission returning `accepted: true` only means the EXECUTOR took the order — it
+        has been handed to the socket and nothing more. Whether IB accepted it is a separate
+        question with a separate answer, and a strategy that never asks records a position
+        it may not have: a read-only gateway rejects every order while the submission still
+        comes back clean.
+
+        Returns {"live": [...], "rejected": [...], "pending": [...], "acks": {...}} —
+        `pending` means IB never answered within the timeout, which is not the same as a
+        refusal and should not be reported as one.
+        """
+        deadline = time.time() + timeout
+        result = {"live": [], "rejected": [], "pending": list(order_ids), "acks": {}}
+        while True:
+            result["acks"] = (self.acks(order_ids) or {}).get("acks", {})
+            buckets = {"live": [], "rejected": [], "pending": []}
+            for oid in order_ids:
+                state = (result["acks"].get(str(oid)) or {}).get("ack", "pending")
+                buckets.get(state, buckets["pending"]).append(oid)
+            result.update(buckets)
+            if not buckets["pending"] or time.time() >= deadline:
+                break
+            time.sleep(min(poll, max(0.0, deadline - time.time())))
+
+        for oid in result["rejected"]:
+            err = (result["acks"].get(str(oid)) or {}).get("last_error") or {}
+            log.error("order %s REJECTED by IB: %s %s", oid,
+                      err.get("code", ""), err.get("message", ""))
+        for oid in result["pending"]:
+            log.error("order %s was never acknowledged by IB after %.0fs — it may not "
+                      "exist at the broker", oid, timeout)
+        return result
+
     def journal(self, event_type: str, summary: str, detail: str = "",
                 symbols: list = None, strategy_id: str = None) -> dict:
         """Leave a note in the decision journal — what you decided and why. Worth doing on

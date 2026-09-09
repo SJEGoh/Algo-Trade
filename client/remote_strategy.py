@@ -26,7 +26,8 @@ Everything the framework does is something that is easy to get wrong once and ne
   * submission through `/targets` (absolute, authoritative, safe to repeat);
   * a journal entry on EVERY run, including the ones that decide to do nothing — those are
     the runs you cannot reconstruct later;
-  * exit codes: 0 submitted or deliberately skipped, 1 refused, 2 unreachable.
+  * exit codes: 0 submitted AND confirmed by the broker, 1 refused,
+    2 unreachable, 3 the executor took the orders but IB did not.
 """
 from __future__ import annotations
 
@@ -56,10 +57,15 @@ class RemoteStrategy(ABC):
     require_market_open: bool = False
     #: capital to assume for --dry-run, where the executor is not consulted
     dry_run_capital: float = float(os.environ.get("DRY_RUN_CAPITAL", 100_000.0))
+    #: after submitting, wait for IB to confirm it took the orders before reporting success
+    confirm_with_broker: bool = True
+    #: how long to wait for that confirmation
+    ack_timeout: float = 30.0
 
     EXIT_OK = 0
     EXIT_REFUSED = 1        # the executor answered and said no — config or risk
     EXIT_UNREACHABLE = 2    # orders did NOT go in
+    EXIT_NOT_ACKED = 3      # the executor took them; the BROKER did not
 
     def __init__(self, strategy_id: str = None, client: ExecutorClient = None,
                  dry_run: bool = False):
@@ -198,15 +204,52 @@ class RemoteStrategy(ABC):
         log.info("submitted: %s", {k: v for k, v in result.items() if k != "internal_crosses"})
         self.on_submitted(result)
 
+        # A clean submission means the EXECUTOR took the orders — it handed them to the
+        # socket. Whether the BROKER took them is a different question, and not asking it is
+        # how a strategy ends a run reporting success while holding nothing: a read-only
+        # gateway refuses every order and the submission still comes back accepted.
+        acks = None
+        if self.confirm_with_broker:
+            if not hasattr(self.client, "wait_for_acks"):
+                # A client predating broker confirmation. Skipping is the only option, but
+                # it must be said out loud: the run is about to report success on the
+                # executor's word alone, which is the very thing this step exists to stop.
+                log.warning("%s cannot confirm orders with the broker — reporting success "
+                            "on the executor's acceptance alone",
+                            type(self.client).__name__)
+            else:
+                acks = self.client.wait_for_acks(self.client.order_ids(result),
+                                                 timeout=self.ack_timeout)
+            if acks["live"]:
+                log.info("%d order(s) confirmed at the broker", len(acks["live"]))
+
         # journal AFTER submitting, so the record reflects what was actually sent, and even
         # when the book was empty — a decision to hold nothing is still a decision
         try:
             self.client.journal("signal", self.describe(book),
-                                detail=self.journal_detail(book),
+                                detail=self._with_ack_detail(self.journal_detail(book), acks),
                                 symbols=[i["instrument"]["symbol"] for i in held])
         except ExecutorError as e:
             log.warning("submitted, but could not journal it: %s", e)
+
+        if acks and (acks["rejected"] or acks["pending"]):
+            log.critical("%d rejected, %d unacknowledged — the book is NOT in place at the "
+                         "broker", len(acks["rejected"]), len(acks["pending"]))
+            return self.EXIT_NOT_ACKED
         return self.EXIT_OK
+
+    @staticmethod
+    def _with_ack_detail(detail: str, acks: dict) -> str:
+        """Put the broker's answer in the journal too — a run that submitted and was refused
+        must not read the same as one that worked."""
+        if not acks:
+            return detail
+        note = (f"broker: {len(acks['live'])} live, {len(acks['rejected'])} rejected, "
+                f"{len(acks['pending'])} unacknowledged")
+        for oid in acks["rejected"]:
+            err = (acks["acks"].get(str(oid)) or {}).get("last_error") or {}
+            note += f"\n  order {oid} rejected: {err.get('code', '')} {err.get('message', '')}"
+        return f"{detail}\n{note}" if detail else note
 
     # ------------------------------------------------------------------ entry point
     @classmethod

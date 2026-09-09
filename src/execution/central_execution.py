@@ -223,6 +223,11 @@ class CentralExecutor(EClient, EWrapper):
             logger.error("IB ORDER ERROR  orderId=%s  sym=%s  code=%s  %s  %s",
                          reqId, sym, errorCode, errorString,
                          advancedOrderRejectJson or "")
+            # Record WHY, so the dashboard and the submitting strategy can both see it
+            # instead of watching an order sit at "Submitted" forever.
+            self.order_status[reqId]["ack"] = "rejected"
+            self.order_status[reqId]["last_error"] = {
+                "code": errorCode, "message": errorString[:300]}
             # --- retry on read-only (code 321) ---
             if errorCode == 321:
                 self._retry_readonly_order(reqId)
@@ -421,7 +426,14 @@ class CentralExecutor(EClient, EWrapper):
             "client_order_id": intent["client_order_id"],
             "strategy_id": intent["strategy_id"],
             "symbol": symbol,
+            # "Submitted" here is OUR word, written when the order goes to the socket —
+            # IB has said nothing yet, and its own callback later writes the identical
+            # string. `ack` is the part that distinguishes them: nothing downstream could
+            # tell "we sent it" from "IB accepted it", which is how 27 orders IB never had
+            # showed on the dashboard as working.
             "status": "Submitted",
+            "ack": "pending",          # pending -> live (IB knows) | rejected (IB refused)
+            "sent_at": time.time(),
             "filled": 0,
             "remaining": intent["quantity"],
             "pending_qty": signed_qty,
@@ -505,7 +517,14 @@ class CentralExecutor(EClient, EWrapper):
             "client_order_id": intent["client_order_id"],
             "strategy_id": "__net__",
             "symbol": sym,
+            # "Submitted" here is OUR word, written when the order goes to the socket —
+            # IB has said nothing yet, and its own callback later writes the identical
+            # string. `ack` is the part that distinguishes them: nothing downstream could
+            # tell "we sent it" from "IB accepted it", which is how 27 orders IB never had
+            # showed on the dashboard as working.
             "status": "Submitted",
+            "ack": "pending",          # pending -> live (IB knows) | rejected (IB refused)
+            "sent_at": time.time(),
             "filled": 0,
             "remaining": abs(delta),
             "pending_qty": delta,
@@ -521,6 +540,9 @@ class CentralExecutor(EClient, EWrapper):
             self.order_status[orderId].update({
                 "status": status, "filled": filled,
                 "remaining": remaining, "avg_fill_price": avgFillPrice,
+                # IB has spoken about this order, so it is real at the broker. "Inactive"
+                # is IB's way of saying it refused it.
+                "ack": "rejected" if status == "Inactive" else "live",
             })
             self.logger_db.update_order_status(orderId, status)
             # Cancel the paper-fill streaming sub once the order is done
@@ -1663,6 +1685,12 @@ class CentralExecutor(EClient, EWrapper):
             }
             return
 
+        # IB volunteering this order means it holds it — an acknowledgement for one we sent.
+        if orderId in self.order_status:
+            self.order_status[orderId].setdefault("ack", "live")
+            if self.order_status[orderId].get("ack") == "pending":
+                self.order_status[orderId]["ack"] = "live"
+
         # rebuild order_status from what IB reports as live
         if orderId not in self.order_status:
             original = self.logger_db.get_order(orderId)  # you'd add this method
@@ -1674,6 +1702,8 @@ class CentralExecutor(EClient, EWrapper):
                 "strategy_id": strategy_id,
                 "symbol": contract.symbol,
                 "status": orderState.status,
+                "ack": "live",          # it came from IB, so IB has it
+                "sent_at": time.time(),
                 "filled": 0,
                 "remaining": order.totalQuantity,
                 "pending_qty": signed_qty,

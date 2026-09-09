@@ -17,6 +17,7 @@ from monitoring.logging_config import setup_logging
 from config import CONFIG, validate_config
 
 import threading
+import time
 from datetime import datetime, timezone
 import logging
 
@@ -27,6 +28,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DB_DIR = Path(__file__).resolve().parent.parent.parent / "db"
 
 EXECUTOR_API_KEY = os.environ.get("EXECUTOR_API_KEY")
+#: how long an order may sit unacknowledged by IB before /orders says something is wrong
+UNACKED_WARN_SEC = float(os.environ.get("UNACKED_WARN_SEC", "20"))
 SERVER_CLIENT_ID = int(os.environ.get("IB_CLIENT_ID", "8"))  # distinct from main.py / run_strat.py (both use 6)
 IB_HOST = os.environ.get("IB_HOST", "127.0.0.1")               # 'ib-gateway' in Docker compose
 IB_PORT = int(os.environ.get("IB_PORT", "4002"))              # 4002 paper / 4001 live (Gateway); 7497 TWS paper
@@ -220,6 +223,47 @@ def get_net():
     if executor.coordinator is None:
         return {"net": {}, "desired": {}}
     return {"net": executor.coordinator.net(), "desired": executor.coordinator.desired}
+
+# NOTE: declared BEFORE /orders/{order_id} on purpose — FastAPI matches routes in
+# declaration order, and the parameterised route would otherwise capture "acks"
+# as an order_id and fail it as a non-integer.
+@app.get("/orders/acks")
+def order_acks(ids: str = ""):
+    """Acknowledgement state for specific orders — what a strategy needs after submitting.
+
+    A submission returning `accepted: true` only means the executor handed the order to the
+    socket. It says nothing about whether IB took it, so a strategy that stops there records
+    a position it may not have. Poll this with the ids from the submission instead.
+
+    `ids` is a comma-separated list; omit it for every order this session.
+    """
+    wanted = None
+    if ids.strip():
+        try:
+            wanted = {int(i) for i in ids.replace(" ", "").split(",") if i}
+        except ValueError:
+            raise HTTPException(status_code=422, detail="ids must be comma-separated integers")
+
+    now = time.time()
+    out = {}
+    for oid, st in executor.order_status.items():
+        if wanted is not None and oid not in wanted:
+            continue
+        out[str(oid)] = {
+            "ack": st.get("ack", "live"),
+            "status": st.get("status"),
+            "symbol": st.get("symbol"),
+            "filled": st.get("filled"),
+            "remaining": st.get("remaining"),
+            "avg_fill_price": st.get("avg_fill_price"),
+            "last_error": st.get("last_error"),
+            "age_sec": round(now - st["sent_at"], 1) if st.get("sent_at") else None,
+        }
+    missing = sorted(wanted - {int(k) for k in out}) if wanted else []
+    return {"acks": out, "unknown_order_ids": missing,
+            "pending": sum(1 for v in out.values() if v["ack"] == "pending"),
+            "rejected": sum(1 for v in out.values() if v["ack"] == "rejected")}
+
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: int):
@@ -599,7 +643,32 @@ def list_orders():
                                 and abs(pos.get(sym, 0)) > 1e-9]
             entry["strategy_id"] = ", ".join(contributors) if contributors else "__net__"
         orders.append(entry)
-    return {"orders": orders}
+
+    # Split on whether IB has actually acknowledged the order. Everything above is our own
+    # record of what we SENT; only `ack != "pending"` means the broker has it.
+    #
+    # Deliberately split rather than filtered: hiding unacknowledged orders would have made
+    # the read-only-gateway incident invisible — an empty dashboard and no explanation for
+    # why nothing traded. The useful signal is "8 sent, 0 acknowledged", plus IB's reason.
+    now = time.time()
+    live, pending = [], []
+    for entry in orders:
+        (pending if entry.get("ack", "live") == "pending" else live).append(entry)
+        if entry.get("sent_at"):
+            entry["age_sec"] = round(now - entry["sent_at"], 1)
+
+    stuck = [e for e in pending if (e.get("age_sec") or 0) > UNACKED_WARN_SEC]
+    return {
+        "orders": live,
+        "unacknowledged": pending,
+        "unacknowledged_count": len(pending),
+        # A single order awaiting acknowledgement is normal for a moment. Several, or one
+        # that has waited, means the gateway is not accepting orders — say so plainly.
+        "warning": (f"{len(pending)} order(s) not acknowledged by IB"
+                    + (f", oldest {max(e['age_sec'] for e in stuck):.0f}s" if stuck else "")
+                    + " — the broker may be refusing orders (check read-only mode)")
+                   if stuck else None,
+    }
 
 
 @app.get("/fills")

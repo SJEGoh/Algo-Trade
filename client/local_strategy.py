@@ -29,6 +29,7 @@ Environment (see client/README.md):
 """
 import argparse
 import logging
+import math
 import os
 import sys
 
@@ -57,9 +58,17 @@ class LocalStrategy(RemoteStrategy):
 
         close = yf.download(self.symbol, period="5d", progress=False,
                             auto_adjust=True)["Close"]
+        # dropna FIRST: yfinance hands back a NaN close for a symbol it could not price, and
+        # NaN survives every arithmetic step to die much later as "cannot convert float NaN
+        # to integer" — a data problem wearing a sizing problem's error message.
+        close = close.squeeze().dropna() if not close.empty else close
         if close.empty:
-            raise StrategyError(f"no price data for {self.symbol} — check the ticker")
-        return round(float(close.squeeze().iloc[-1]), 2)
+            raise StrategyError(
+                f"no usable price for {self.symbol} — the feed returned nothing or all NaN")
+        price = round(float(close.iloc[-1]), 2)
+        if not math.isfinite(price) or price <= 0:
+            raise StrategyError(f"{self.symbol} priced at {price!r}, which cannot size a book")
+        return price
 
     def generate_book(self, capital):
         price = self.last_price()

@@ -80,10 +80,18 @@ the multiplier — a 1000x understatement on CL sails straight past the allocati
 rejected as "not active". See *Adding a strategy* below — you no longer need to edit config.py
 and restart.
 
-**5. Exit codes are the interface to cron.** `0` submitted or deliberately skipped, `1` the
-executor refused (config or risk — fix the caller, retrying won't help), `2` unreachable, which
-means the orders did **NOT** go in and a Telegram alert has already fired. Never collapse 2
-into "probably fine" — that failure mode is exactly what `ExecutorClient` exists to prevent.
+**5. Exit codes are the interface to cron.** `0` submitted and confirmed by the broker,
+`1` the executor refused (config or risk — fix the caller, retrying won't help), `2`
+unreachable, which means the orders did **NOT** go in and a Telegram alert has already fired,
+`3` the executor took the orders but IB never acknowledged them. Never collapse 2 or 3 into
+"probably fine" — those failure modes are exactly what `ExecutorClient` exists to surface.
+
+**6. "Accepted" is the executor's word, not the broker's.** `POST /orders` returning
+`accepted: true` means the order reached the socket. A gateway in read-only mode refuses
+every order while submissions still come back clean, so `run()` polls `GET /orders/acks`
+until each order is `live` or `rejected`. The same field splits the dashboard: `GET /orders`
+returns confirmed orders in `orders` and everything still unanswered in `unacknowledged`,
+with IB's reason attached.
 
 ## Adding a strategy id
 
@@ -119,6 +127,8 @@ Existing ids worth knowing: `test_suite_small_alloc` ($1k cap — use this for s
 | `GET /resolve_front/{symbol}?exchange=` | – | front-month futures contract |
 | `POST /targets` | key | the whole book, absolute — **use this** |
 | `POST /orders` | key | one intent (a domain rejection is HTTP 200 + `accepted:false`) |
+| `GET /orders/acks?ids=` | – | did the BROKER take these orders? `live` / `rejected` / `pending` |
+| `GET /positions/orphans` | – | broker positions no strategy claims |
 | `POST /journal` | key | decision record |
 | `POST /strategies` | key | register a new strategy id |
 

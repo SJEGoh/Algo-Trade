@@ -16,11 +16,12 @@ from client.remote_strategy import RemoteStrategy, StrategyError
 class FakeClient:
     """Stands in for ExecutorClient, recording what the framework asked it to do."""
 
-    def __init__(self, health=None, capital=100_000.0, fail=None):
+    def __init__(self, health=None, capital=100_000.0, fail=None, ack="live"):
         self.base_url = "http://executor:8000"
         self._health = health or {"connected": True, "killed": False, "market_open": True}
         self._capital = capital
         self._fail = fail
+        self._ack = ack          # what the BROKER says about the orders, not the executor
         self.submitted = []
         self.journalled = []
         self.preflighted = False
@@ -36,8 +37,18 @@ class FakeClient:
 
     def submit_book(self, book, strategy_id=None):
         self.submitted.append(("book", book))
-        return {"orders": [{"symbol": i["instrument"]["symbol"]} for i in book
-                           if i["target_quantity"]]}
+        return {"orders": [{"symbol": i["instrument"]["symbol"], "order_id": n}
+                           for n, i in enumerate(b for b in book if b["target_quantity"])]}
+
+    # --- broker confirmation, the half a submission cannot answer -----------------------
+    @staticmethod
+    def order_ids(result):
+        return [o["order_id"] for o in (result.get("orders") or []) if "order_id" in o]
+
+    def wait_for_acks(self, order_ids, timeout=30.0, poll=2.0):
+        bucket = {"live": [], "rejected": [], "pending": []}
+        bucket[self._ack] = list(order_ids)
+        return {**bucket, "acks": {str(i): {"ack": self._ack} for i in order_ids}}
 
     def submit_orders(self, book):
         self.submitted.append(("orders", book))

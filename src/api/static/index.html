@@ -88,6 +88,7 @@
     <div id="recon-bar" class="recon-bar" hidden></div>
     <div class="body" id="positions"></div>
   </section>
+  <section id="unacked-section" style="display:none"><h2>Awaiting Broker</h2><div class="body" id="unacked-orders"></div></section>
   <section><h2>Open Orders</h2><div class="body" id="open-orders"></div></section>
   <section><h2>Recent Fills (Last 5)</h2><div class="body" id="recent-fills"></div></section>
   <section>
@@ -267,6 +268,32 @@ function renderNavBar() {
   ].join("");
 }
 
+// Orders we sent that IB has not acknowledged. Shown SEPARATELY rather than mixed into
+// Open Orders, because "Submitted" in that table is our own word, written when the order
+// goes to the socket — an order IB never accepted looked identical to a working one, which
+// is how a read-only gateway went unnoticed while orders piled up.
+function renderUnackedOrders() {
+  const data = state.data.orders || {};
+  const rows = (data.unacknowledged || []).sort((a, b) => b.order_id - a.order_id);
+  const sec = document.getElementById("unacked-section");
+  if (sec) sec.style.display = rows.length ? "" : "none";
+  if (!rows.length) return;
+  panel("unacked-orders", () => {
+    const warn = data.warning
+      ? `<div class="dim" style="color:#e0a030;margin-bottom:6px">${data.warning}</div>` : "";
+    return warn + table([
+      { label: "ID", get: r => r.order_id },
+      { label: "Symbol", get: r => r.symbol },
+      { label: "Side", get: r => (r.pending_qty > 0 ? "BUY" : r.pending_qty < 0 ? "SELL" : "—") },
+      { label: "Qty", get: r => num(Math.abs(r.pending_qty)) },
+      { label: "Waiting", get: r => (r.age_sec == null ? "—" : `${r.age_sec.toFixed(0)}s`) },
+      { label: "IB said", cls: () => "dim",
+        get: r => (r.last_error ? `${r.last_error.code}: ${r.last_error.message}` : "nothing yet") },
+      { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
+    ], rows);
+  });
+}
+
 function renderOpenOrders() {
   panel("open-orders", () => {
     const rows = ((state.data.orders?.orders) || [])
@@ -439,7 +466,8 @@ function renderEquity() {
 
 function renderAll() {
   renderHeader(); renderNavBar(); renderStrategies(); renderPositions(); renderReconBar();
-  renderOpenOrders(); renderRecentFills(); renderOrders(); renderFills(); renderEquity();
+  renderOpenOrders();
+  renderUnackedOrders(); renderRecentFills(); renderOrders(); renderFills(); renderEquity();
 }
 
 // ---------- poll loop: fetch -> state -> render (error-isolated per panel) ----------
