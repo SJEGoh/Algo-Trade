@@ -2,176 +2,162 @@
 """
 tools/postmarket_briefing.py — Telegram post-market summary.
 
-Fires ~10 min after the close (via day_scheduler). Sends a summary of:
-  * Today's fills (what traded, at what price)
-  * Realized P&L per strategy + total
-  * End-of-day positions (the overnight book)
-  * Strategy status (any halts during the day)
-  * Reconciliation status
-
-Talks to the executor server via REST; sends the message via Telegram directly.
+Fires ~10 min after the close (via day_scheduler):
+  * Today's fills — what traded, when, at what price, and slippage vs expectation
+  * Realized P&L per strategy, with fixtures and unattributed buckets kept separate
+  * The overnight book, including anything no strategy claims
+  * Halts, and the last reconciliation
 """
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import requests
 from dotenv import load_dotenv
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / "tools"))
 load_dotenv(_ROOT / ".env")
 
-ET = ZoneInfo("America/New_York")
-BASE = os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000")
-KEY = os.environ.get("EXECUTOR_API_KEY", "")
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
-
-
-def _get(path):
-    r = requests.get(f"{BASE}{path}", headers={"X-API-Key": KEY}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+from briefing_common import (ET, HEDGE_SID, INTERNAL_SIDS, et, get,  # noqa: E402
+                             is_strategy, is_today_et, money, pnl_sections,
+                             send_telegram)
 
 
 def build_summary():
     now = datetime.now(ET)
-    lines = [f"\U0001f319 POST-MARKET SUMMARY — {now:%A, %b %d %Y}"]
-    lines.append("")
+    L = [f"\U0001f319 POST-MARKET SUMMARY — {now:%A, %b %d %Y}", ""]
 
-    # Fills
-    lines.append("\U0001f4dd TODAY'S FILLS")
+    # ---------------------------------------------------------------- fills
+    L.append("\U0001f4dd TODAY'S FILLS")
     try:
-        fills = _get("/fills?limit=200").get("fills", [])
-        today_str = now.strftime("%Y-%m-%d")
-        today_fills = [f for f in fills if f.get("timestamp", "").startswith(today_str)]
-        if not today_fills:
-            lines.append("  (no fills today)")
+        fills = get("/fills?limit=500").get("fills", [])
+        # The fill record's timestamp field is `filled_at`, and it is UTC. This used to read
+        # `timestamp` — a key that does not exist — so the filter matched nothing and the
+        # summary reported "(no fills today)" every single day regardless of what traded.
+        today = [f for f in fills if is_today_et(f.get("filled_at"), now)]
+        if not today:
+            L.append("  (no fills today)")
         else:
-            lines.append(f"  {len(today_fills)} fill(s):")
-            for f in today_fills:
-                sym = f.get("symbol", "?")
-                side = f.get("side", "?")
-                qty = f.get("quantity", 0)
-                price = f.get("fill_price", f.get("price", 0))
-                sid = f.get("strategy_id", "")
-                ts = f.get("timestamp", "")
-                # extract time portion
-                t_part = ts.split("T")[1][:8] if "T" in ts else ts
-                lines.append(f"  {t_part}  {side.upper()} {abs(qty)} {sym} @ ${price:,.2f}  [{sid}]")
+            L.append(f"  {len(today)} fill(s):")
+            for f in sorted(today, key=lambda x: x.get("filled_at") or ""):
+                px, exp = f.get("price"), f.get("expected_price")
+                slip = ""
+                if px and exp:
+                    # signed so a positive number always means "worse than expected"
+                    sign = 1 if str(f.get("side", "")).upper().startswith("B") else -1
+                    slip = f"  slip {sign * (px - exp) / exp * 100:+.2f}%"
+                L.append(f"  {et(f.get('filled_at'))}  {str(f.get('side','?')).upper()} "
+                         f"{abs(f.get('quantity', 0)):g} {f.get('symbol','?')} "
+                         f"@ ${px or 0:,.2f}  [{f.get('strategy_id','?')}]{slip}")
+            L.append("  note: pooled fills booked to __net__ are filtered out by /fills")
     except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch fills: {e}")
+        L.append(f"  ⚠️ Could not fetch fills: {e}")
 
-    # P&L
-    lines.append("")
-    lines.append("\U0001f4b0 REALIZED P&L")
+    # ---------------------------------------------------------------- P&L
+    L.append("")
+    L.append("\U0001f4b0 REALIZED P&L (cumulative)")
     try:
-        pnl = _get("/pnl").get("realized_pnl", {})
-        total = 0.0
-        any_pnl = False
-        for sid, val in sorted(pnl.items()):
-            if sid.startswith("test_suite") or sid.startswith("halt_test"):
-                continue
-            if val != 0:
-                lines.append(f"  {sid}: ${val:+,.2f}")
-                total += val
-                any_pnl = True
-        if any_pnl:
-            emoji = "\U0001f7e2" if total >= 0 else "\U0001f534"
-            lines.append(f"  ── {emoji} Total: ${total:+,.2f}")
-        else:
-            lines.append("  (no realized P&L)")
+        strat, fixture, internal = pnl_sections(get("/pnl").get("realized_pnl", {}))
+        for sid, val in strat:
+            L.append(f"  {sid}: {money(val)}")
+        if not strat:
+            L.append("  (none)")
+        total = sum(v for _s, v in strat)
+        emoji = "\U0001f7e2" if total >= 0 else "\U0001f534"
+        L.append(f"  ── {emoji} Strategies: {money(total)}")
+        if fixture:
+            L.append("  fixtures: " + ", ".join(f"{s} {money(v)}" for s, v in fixture))
+        if internal:
+            # Real money, but booked to a ledger bucket rather than a strategy — listing
+            # these as strategies is what made the old total misleading.
+            L.append("  unattributed: "
+                     + ", ".join(f"{s} {money(v)}" for s, v in internal))
     except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch P&L: {e}")
+        L.append(f"  ⚠️ Could not fetch P&L: {e}")
 
-    # Overnight book
-    lines.append("")
-    lines.append("\U0001f30d OVERNIGHT BOOK")
+    # ---------------------------------------------------------------- overnight book
+    L.append("")
+    L.append("\U0001f30d OVERNIGHT BOOK")
     try:
-        pos = _get("/positions")
-        net = pos.get("current_positions", {})
-        strat_pos = pos.get("strategy_positions", {})
-        held = {s: q for s, q in net.items() if q != 0}
+        pos = get("/positions")
+        held = {s: q for s, q in pos.get("current_positions", {}).items() if q}
         if not held:
-            lines.append("  (flat — no overnight exposure)")
+            L.append("  (flat — no overnight exposure)")
         else:
             for sym, qty in sorted(held.items()):
-                lines.append(f"  {sym}: {qty:+}")
-            # per-strategy breakdown
-            for sid, positions in sorted(strat_pos.items()):
-                if sid.startswith("test_suite") or sid.startswith("halt_test"):
+                L.append(f"  {sym}: {qty:+g}")
+            for sid, positions in sorted(pos.get("strategy_positions", {}).items()):
+                names = {s: q for s, q in positions.items() if q}
+                if not names:
                     continue
-                strat_held = {s: q for s, q in positions.items() if q != 0}
-                if strat_held:
-                    parts = ", ".join(f"{s} {q:+}" for s, q in sorted(strat_held.items()))
-                    lines.append(f"    [{sid}] {parts}")
+                # Keep the bucket name. Collapsing __net__ and flatten_all to a shared
+                # "unattributed" label put two lines of apparently contradictory quantities
+                # next to each other (ANET -10 on one, +10 on the other) when they are
+                # simply two books that net to zero.
+                tag = f"unattributed:{sid}" if sid in INTERNAL_SIDS else sid
+                L.append(f"    [{tag}] "
+                         + ", ".join(f"{s} {q:+g}" for s, q in sorted(names.items())))
     except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch positions: {e}")
+        L.append(f"  ⚠️ Could not fetch positions: {e}")
 
-    # Strategy status
-    lines.append("")
-    lines.append("\U0001f3af STRATEGY STATUS")
+    # ---------------------------------------------------------------- orphans
     try:
-        strats = _get("/strategies").get("strategies", [])
-        halted = []
-        for s in strats:
-            sid = s["strategy_id"]
-            if sid.startswith("test_suite") or sid.startswith("halt_test"):
-                continue
-            if not s.get("active"):
-                halted.append(sid)
-        if halted:
-            lines.append(f"  \U0001f6d1 HALTED: {', '.join(halted)}")
-        else:
-            lines.append("  ✅ All strategies active")
-    except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch strategies: {e}")
-
-    # Reconciliation
-    lines.append("")
-    try:
-        recon = _get("/reconcile/status")
-        if recon.get("ts"):
-            matched = recon.get("matched", False)
-            disc = recon.get("discrepancies", {})
-            if matched:
-                lines.append("✅ Last reconcile: ledger matches broker")
-            else:
-                lines.append(f"⚠️ Last reconcile: {len(disc)} discrepancy(ies)")
-                for sym, detail in disc.items():
-                    lines.append(f"    {sym}: {detail}")
-        else:
-            lines.append("ℹ️ No reconciliation ran today")
+        orphans = get("/positions/orphans")
+        if orphans.get("count"):
+            L.append("")
+            L.append("\U0001f6a8 POSITIONS NO STRATEGY CLAIMS")
+            for row in orphans["orphans"]:
+                notional = (f"  (${row['notional']:,.0f})" if row.get("notional") else "")
+                L.append(f"  {row['symbol']}: {row['quantity']:+g}{notional}")
+            L.append("  these sit outside NAV and outside /flatten — see /exposure")
     except Exception:
-        pass
+        pass          # endpoint is newer than some deployments; absence is not an error
 
-    lines.append("")
-    lines.append("Session complete \U0001f44b")
-    return "\n".join(lines)
-
-
-def send_telegram(text):
-    if not TG_TOKEN or not TG_CHAT:
-        print("WARN: Telegram not configured — printing to stdout only")
-        print(text)
-        return
+    # ---------------------------------------------------------------- halts
+    L.append("")
+    L.append("\U0001f3af STRATEGY STATUS")
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text},
-            timeout=10,
-        )
-        print("Telegram summary sent OK")
+        strats = get("/strategies").get("strategies", [])
+        halted = [s["strategy_id"] for s in strats
+                  if is_strategy(s["strategy_id"]) and not s.get("active")]
+        halted_fixtures = [s["strategy_id"] for s in strats
+                           if not is_strategy(s["strategy_id"]) and not s.get("active")]
+        L.append(f"  \U0001f6d1 HALTED: {', '.join(halted)}" if halted
+                 else "  ✅ All strategies active")
+        if halted_fixtures:
+            L.append(f"  (fixtures halted: {', '.join(halted_fixtures)})")
     except Exception as e:
-        print(f"Telegram send failed: {e}")
-        print(text)
+        L.append(f"  ⚠️ Could not fetch strategies: {e}")
+
+    # ---------------------------------------------------------------- reconcile
+    L.append("")
+    try:
+        recon = get("/reconcile/status")
+        ts = recon.get("ts")
+        if not ts:
+            L.append("⚠️ No reconciliation has ever run")
+        elif not is_today_et(ts, now):
+            # The old text said "no reconciliation ran today" only when the field was
+            # absent, so a week-old reconcile read as a fresh pass.
+            L.append(f"⚠️ Last reconcile was {et(ts)} on {datetime.fromisoformat(ts).astimezone(ET):%b %d} — NOT today")
+        elif recon.get("matched"):
+            L.append(f"✅ Reconciled {et(ts)} ET: ledger matches broker")
+        else:
+            disc = recon.get("discrepancies", {})
+            L.append(f"⚠️ Reconcile {et(ts)} ET: {len(disc)} discrepancy(ies)")
+            for sym, detail in disc.items():
+                L.append(f"    {sym}: {detail}")
+    except Exception as e:
+        L.append(f"⚠️ Could not fetch reconcile status: {e}")
+
+    L.append("")
+    L.append("Session complete \U0001f44b")
+    return "\n".join(L)
 
 
 if __name__ == "__main__":
     msg = build_summary()
     print(msg)
     print()
-    send_telegram(msg)
+    send_telegram(msg, "summary")

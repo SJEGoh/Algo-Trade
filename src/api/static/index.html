@@ -234,19 +234,49 @@ function renderStrategies() {
   });
 }
 
+// Average cost is held PER STRATEGY, but this table is the account-level book, so the row
+// needs the cost basis weighted across every strategy holding the symbol — including the
+// internal buckets, since their positions are part of the broker total. Weighting by signed
+// quantity makes the denominator the account position, so the result is the true basis.
+// Long and short legs in different strategies can net toward zero; the row only exists when
+// the net is non-zero, but a near-zero net still makes the average meaningless, so it is
+// suppressed rather than shown as a wild number.
+function weightedAvgCost(sym, strategyPositions, strategyCost) {
+  let notional = 0, qty = 0;
+  for (const [sid, book] of Object.entries(strategyPositions || {})) {
+    const q = book?.[sym];
+    const c = strategyCost?.[sid]?.[sym];
+    if (!q || c == null) continue;
+    notional += q * c;
+    qty += q;
+  }
+  if (Math.abs(qty) < 1e-9) return null;
+  return notional / qty;
+}
+
 function renderPositions() {
   panel("positions", () => {
     const cur = (state.data.positions?.current_positions) || {};
     const mults = (state.data.positions?.multipliers) || {};
     const marks = (state.data.equity?.marks) || {};
+    const stratPos = (state.data.positions?.strategy_positions) || {};
+    const stratCost = (state.data.positions?.strategy_avg_cost) || {};
     const rows = Object.entries(cur).filter(([, q]) => q !== 0)
-      .map(([sym, q]) => ({ sym, q, mark: marks[sym] ?? null,
-                            val: marks[sym] == null ? null : marks[sym] * q * (mults[sym] ?? 1) }));
+      .map(([sym, q]) => {
+        const cost = weightedAvgCost(sym, stratPos, stratCost);
+        const mark = marks[sym] ?? null;
+        const mult = mults[sym] ?? 1;
+        return { sym, q, mark, cost,
+                 val: mark == null ? null : mark * q * mult,
+                 upl: (mark == null || cost == null) ? null : (mark - cost) * q * mult };
+      });
     return table([
       { label: "Symbol", get: r => r.sym },
       { label: "Quantity", cls: r => signClass(r.q), get: r => num(r.q) },
+      { label: "Avg Cost", cls: () => "dim", get: r => r.cost == null ? "—" : num(r.cost, 2) },
       { label: "Mark", cls: () => "dim", get: r => num(r.mark, 2) },
       { label: "Market Value", cls: r => signClass(r.val ?? 0), get: r => r.val == null ? "—" : money(r.val) },
+      { label: "Unrealized", cls: r => signClass(r.upl ?? 0), get: r => r.upl == null ? "—" : money(r.upl) },
     ], rows);
   });
 }
@@ -286,12 +316,28 @@ function renderUnackedOrders() {
       { label: "Symbol", get: r => r.symbol },
       { label: "Side", get: r => (r.pending_qty > 0 ? "BUY" : r.pending_qty < 0 ? "SELL" : "—") },
       { label: "Qty", get: r => num(Math.abs(r.pending_qty)) },
+      { label: "Type", get: r => orderKind(r) },
       { label: "Waiting", get: r => (r.age_sec == null ? "—" : `${r.age_sec.toFixed(0)}s`) },
       { label: "IB said", cls: () => "dim",
         get: r => (r.last_error ? `${r.last_error.code}: ${r.last_error.message}` : "nothing yet") },
       { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
     ], rows);
   });
+}
+
+// `sent_at` is epoch seconds, recorded when the order went to the socket. Rendered in the
+// viewer's local time — the dashboard is read by a person, not by the scheduler.
+const clockTime = (epoch) => epoch == null ? "—"
+  : new Date(epoch * 1000).toLocaleTimeString([], { hour12: false });
+
+// What the order actually IS. A market order and an ATR-transformed limit resting away from
+// the market looked identical here before — both just "Submitted" — so an order that could
+// not fill at its limit was indistinguishable from one the broker had not got to yet.
+function orderKind(r) {
+  const t = (r.order_type || "market").toLowerCase();
+  if (t === "market") return "MKT";
+  const layer = r.execution_layer ? "ATR" : t.toUpperCase().replace("_", " ");
+  return r.limit_price == null ? layer : `${layer} @ ${num(r.limit_price, 2)}`;
 }
 
 function renderOpenOrders() {
@@ -301,8 +347,11 @@ function renderOpenOrders() {
       .sort((a, b) => b.order_id - a.order_id);
     return table([
       { label: "ID", get: r => r.order_id },
+      { label: "Sent", cls: () => "dim", get: r => clockTime(r.sent_at) },
       { label: "Symbol", get: r => r.symbol },
       { label: "Side", get: r => (r.pending_qty > 0 ? "BUY" : r.pending_qty < 0 ? "SELL" : "—") },
+      { label: "Type", get: r => orderKind(r) },
+      { label: "Ref", cls: () => "dim", get: r => num(r.expected_price, 2) },
       { label: "Pending", cls: r => signClass(r.pending_qty), get: r => num(r.pending_qty) },
       { label: "Filled", get: r => num(r.filled) },
       { label: "Remaining", get: r => num(r.remaining) },

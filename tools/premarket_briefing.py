@@ -2,193 +2,171 @@
 """
 tools/premarket_briefing.py — Telegram pre-market briefing.
 
-Fires ~30 min before the open (via day_scheduler). Sends a summary of:
-  * Today's session times (open/close, half-day flag)
-  * Current positions (net + per-strategy)
-  * Strategy status (active / halted)
-  * Today's scheduled events
-  * ATR execution layer status
+Fires ~30 min before the open (via day_scheduler):
+  * Session times (open/close, half-day flag)
+  * IB connection and kill-switch state
+  * Strategies, with fixtures and the hedge overlay kept out of the strategy list
+  * Positions carried into the day, and anything no strategy claims
+  * Today's schedule, READ FROM THE SCHEDULER ITSELF
 
-Talks to the executor server via REST; sends the message via Telegram directly
-(not through the Alerter class, since this is a structured briefing, not a
-one-line alert).
+That last point is the one that mattered. The schedule used to be a hand-written list of
+times, so every change to day_scheduler.py silently made the briefing wrong — by the time
+the hedge, the rebalance and the plumbing strategies had been added it was describing a day
+that no longer happened. It now calls build_events(), so the briefing cannot drift from what
+will actually run: if it is in the briefing it is scheduled, and if it is scheduled it is in
+the briefing.
 """
-import os
 import sys
-from datetime import datetime, timedelta
+from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import requests
 from dotenv import load_dotenv
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / "tools"))
+sys.path.insert(0, str(_ROOT / "src"))
 load_dotenv(_ROOT / ".env")
 
-ET = ZoneInfo("America/New_York")
-BASE = os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000")
-KEY = os.environ.get("EXECUTOR_API_KEY", "")
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID")
+from briefing_common import (ET, HEDGE_SID, INTERNAL_SIDS, get,  # noqa: E402
+                             is_strategy, money, send_telegram)
 
 
-def _get(path):
-    r = requests.get(f"{BASE}{path}", headers={"X-API-Key": KEY}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def _schedule_lines(o, c):
+    """Today's plan, collapsed. A raw dump is ~45 lines once the ORB resyncs, the reconciles
+    and the plumbing runs are in — so anything that repeats is shown as a range and a
+    cadence rather than one line per firing."""
+    from day_scheduler import build_events
 
+    groups = OrderedDict()
+    for when, label, kind, _payload in build_events(o, c):
+        groups.setdefault(label, []).append(when)
 
-def _session_times():
-    try:
-        import pandas_market_calendars as mcal
-        now = datetime.now(ET)
-        sched = mcal.get_calendar("NYSE").schedule(start_date=now.date(), end_date=now.date())
-        if sched.empty:
-            return None, None
-        o = sched.iloc[0]["market_open"].tz_convert(ET).to_pydatetime()
-        c = sched.iloc[0]["market_close"].tz_convert(ET).to_pydatetime()
-        return o, c
-    except Exception:
-        return None, None
+    rows = []
+    for label, times in groups.items():
+        times.sort()
+        if len(times) <= 2:
+            rows.extend((t, label) for t in times)
+        else:
+            gap = round((times[1] - times[0]).total_seconds() / 60)
+            rows.append((times[0],
+                         f"{label} — every {gap} min until {times[-1]:%H:%M} "
+                         f"({len(times)} runs)"))
+    return [f"  {when:%H:%M}  {label}" for when, label in sorted(rows)]
 
 
 def build_briefing():
     now = datetime.now(ET)
-    lines = [f"\U0001f305 PRE-MARKET BRIEFING — {now:%A, %b %d %Y}"]
-    lines.append("")
+    L = [f"\U0001f305 PRE-MARKET BRIEFING — {now:%A, %b %d %Y}", ""]
 
-    # Session times
-    o, c = _session_times()
-    if o and c:
-        duration = (c - o).total_seconds() / 3600
-        half = " (HALF DAY)" if duration < 6 else ""
-        lines.append(f"\U0001f552 Session: {o:%H:%M} – {c:%H:%M} ET{half}")
-    else:
-        lines.append("⚠️ No NYSE session today")
-        return "\n".join(lines)
-
-    # Health
     try:
-        health = _get("/health")
-        ib_status = "✅ Connected" if health.get("connected") else "❌ Disconnected"
-        if health.get("killed"):
-            ib_status += " \U0001f6d1 KILL SWITCH ACTIVE"
-        lines.append(f"\U0001f4e1 IB Gateway: {ib_status}")
+        from day_scheduler import session_today
+        o, c = session_today()
     except Exception as e:
-        lines.append(f"❌ Server unreachable: {e}")
-        return "\n".join(lines)
+        L.append(f"⚠️ Could not read the session calendar: {e}")
+        return "\n".join(L)
 
-    # Strategies
-    lines.append("")
-    lines.append("\U0001f3af STRATEGIES")
+    if o is None:
+        L.append("⚠️ No NYSE session today")
+        return "\n".join(L)
+
+    hours = (c - o).total_seconds() / 3600
+    L.append(f"\U0001f552 Session: {o:%H:%M} – {c:%H:%M} ET"
+             + (" (HALF DAY)" if hours < 6 else ""))
+
+    # ---------------------------------------------------------------- health
     try:
-        strats = _get("/strategies").get("strategies", [])
-        for s in strats:
-            sid = s["strategy_id"]
-            # skip test/halt-test strategies
-            if sid.startswith("test_suite") or sid.startswith("halt_test"):
-                continue
-            status = "✅" if s.get("active") else "\U0001f6d1 HALTED"
-            alloc = s.get("capital_allocation", 0)
-            dd = s.get("max_drawdown", 0)
-            lines.append(f"  {status} {sid}  (${alloc:,.0f} / {dd:.0%} max DD)")
+        h = get("/health")
+        status = "✅ Connected" if h.get("connected") else "❌ Disconnected"
+        if h.get("killed"):
+            status += " \U0001f6d1 KILL SWITCH ACTIVE"
+        if h.get("startup_degraded"):
+            status += " ⚠️ STARTED DEGRADED (no broker reconciliation)"
+        L.append(f"\U0001f4e1 IB Gateway: {status}")
+        # `connected` only means the socket is up. The gateway can accept reads and refuse
+        # every order, which is exactly how a read-only session went unnoticed for a day.
+        L.append("   note: 'connected' does not prove orders are accepted")
     except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch strategies: {e}")
+        L.append(f"❌ Server unreachable: {e}")
+        return "\n".join(L)
 
-    # Positions
-    lines.append("")
-    lines.append("\U0001f4ca POSITIONS")
+    # ---------------------------------------------------------------- strategies
+    L.append("")
+    L.append("\U0001f3af STRATEGIES")
     try:
-        pos = _get("/positions")
-        net = pos.get("current_positions", {})
-        strat_pos = pos.get("strategy_positions", {})
-        if not net:
-            lines.append("  (flat — no open positions)")
+        strats = get("/strategies").get("strategies", [])
+        shown = [s for s in strats if is_strategy(s["strategy_id"])]
+        for s in shown:
+            mark = "✅" if s.get("active") else "\U0001f6d1 HALTED"
+            L.append(f"  {mark} {s['strategy_id']}  "
+                     f"(${s.get('capital_allocation', 0):,.0f} / "
+                     f"{s.get('max_drawdown', 0):.0%} max DD)")
+        if not shown:
+            L.append("  (none configured)")
+        # The hedge overlay is not a strategy but it IS operationally live, so it gets its
+        # own line rather than being buried in a list of fixtures.
+        hedge = next((s for s in strats if s["strategy_id"] == HEDGE_SID), None)
+        if hedge:
+            mark = "✅" if hedge.get("active") else "\U0001f6d1 HALTED"
+            L.append(f"  {mark} {HEDGE_SID} (overlay, "
+                     f"${hedge.get('capital_allocation', 0):,.0f} notional ceiling)")
+        # Fixtures are counted, not listed: naming them put a $600k demo_meanrev allocation
+        # in the briefing every morning as though it were capital at work.
+        fixtures = [s["strategy_id"] for s in strats
+                    if not is_strategy(s["strategy_id"]) and s["strategy_id"] != HEDGE_SID]
+        if fixtures:
+            L.append(f"  ({len(fixtures)} fixtures not shown)")
+    except Exception as e:
+        L.append(f"  ⚠️ Could not fetch strategies: {e}")
+
+    # ---------------------------------------------------------------- positions
+    L.append("")
+    L.append("\U0001f4ca POSITIONS CARRIED IN")
+    try:
+        pos = get("/positions")
+        # current_positions keeps zero entries for every symbol ever traded, so the old
+        # `if not net:` was truthy on a flat book and printed an empty section instead of
+        # saying "flat".
+        held = {s: q for s, q in pos.get("current_positions", {}).items() if q}
+        if not held:
+            L.append("  (flat — no open positions)")
         else:
-            for sym, qty in sorted(net.items()):
-                if qty != 0:
-                    lines.append(f"  {sym}: {qty:+}")
-            # per-strategy breakdown
-            for sid, positions in sorted(strat_pos.items()):
-                if sid.startswith("test_suite") or sid.startswith("halt_test"):
-                    continue
-                held = {s: q for s, q in positions.items() if q != 0}
-                if held:
-                    parts = ", ".join(f"{s} {q:+}" for s, q in sorted(held.items()))
-                    lines.append(f"    [{sid}] {parts}")
+            for sym, qty in sorted(held.items()):
+                L.append(f"  {sym}: {qty:+g}")
+            for sid, positions in sorted(pos.get("strategy_positions", {}).items()):
+                names = {s: q for s, q in positions.items() if q}
+                if names:
+                    tag = f"unattributed:{sid}" if sid in INTERNAL_SIDS else sid
+                    L.append(f"    [{tag}] "
+                             + ", ".join(f"{s} {q:+g}" for s, q in sorted(names.items())))
     except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch positions: {e}")
+        L.append(f"  ⚠️ Could not fetch positions: {e}")
 
-    # P&L
-    lines.append("")
-    lines.append("\U0001f4b0 REALIZED P&L")
     try:
-        pnl = _get("/pnl").get("realized_pnl", {})
-        total = 0.0
-        for sid, val in sorted(pnl.items()):
-            if sid.startswith("test_suite") or sid.startswith("halt_test"):
-                continue
-            if val != 0:
-                lines.append(f"  {sid}: ${val:+,.2f}")
-                total += val
-        if total != 0:
-            lines.append(f"  ── Total: ${total:+,.2f}")
-        else:
-            lines.append("  (no realized P&L)")
-    except Exception as e:
-        lines.append(f"  ⚠️ Could not fetch P&L: {e}")
-
-    # ATR layer
-    try:
-        atr = _get("/atr/status")
-        if atr.get("enabled"):
-            lines.append("")
-            lines.append(f"\U0001f4c9 ATR Layer: ON (period={atr['atr_period']}, "
-                         f"fraction={atr['atr_fraction']}, "
-                         f"pending={atr.get('pending_orders', 0)})")
+        orphans = get("/positions/orphans")
+        if orphans.get("count"):
+            L.append(f"  \U0001f6a8 {orphans['count']} position(s) no strategy claims: "
+                     + ", ".join(f"{r['symbol']} {r['quantity']:+g}"
+                                 for r in orphans["orphans"]))
     except Exception:
         pass
 
-    # Schedule preview
-    lines.append("")
-    lines.append(f"\U0001f4c5 TODAY'S SCHEDULE")
-    dow = now.strftime("%A")
-    lines.append(f"  {o:%H:%M}        Market open")
-    lines.append(f"  {o + timedelta(minutes=30):%H:%M}  ORB first fire (then every 30 min)")
-    lines.append(f"  {o + timedelta(minutes=60):%H:%M}  ovn_volsurge EXIT + momentum rebalance")
-    if dow == "Thursday":
-        lines.append(f"  {c - timedelta(minutes=10):%H:%M}  RRG rotation (Thursday)")
-    lines.append(f"  {c - timedelta(minutes=5):%H:%M}   ATR cancel sweep")
-    lines.append(f"  {c - timedelta(minutes=2):%H:%M}   ovn_volsurge ENTER")
-    lines.append(f"  {c:%H:%M}        Market close")
-    lines.append(f"  {c + timedelta(minutes=5):%H:%M}   VECM EOD run")
-    lines.append(f"  {c + timedelta(minutes=10):%H:%M}  Post-market summary")
-
-    lines.append("")
-    lines.append("Good trading \U0001f44a")
-    return "\n".join(lines)
-
-
-def send_telegram(text):
-    if not TG_TOKEN or not TG_CHAT:
-        print("WARN: Telegram not configured — printing to stdout only")
-        print(text)
-        return
+    # ---------------------------------------------------------------- schedule
+    L.append("")
+    L.append("\U0001f4c5 TODAY'S SCHEDULE")
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text},
-            timeout=10,
-        )
-        print("Telegram briefing sent OK")
+        L.extend(_schedule_lines(o, c))
     except Exception as e:
-        print(f"Telegram send failed: {e}")
-        print(text)
+        L.append(f"  ⚠️ Could not read the schedule: {e}")
+
+    L.append("")
+    L.append("Good trading \U0001f44a")
+    return "\n".join(L)
 
 
 if __name__ == "__main__":
     msg = build_briefing()
     print(msg)
     print()
-    send_telegram(msg)
+    send_telegram(msg, "briefing")

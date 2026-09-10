@@ -438,6 +438,13 @@ class CentralExecutor(EClient, EWrapper):
             "remaining": intent["quantity"],
             "pending_qty": signed_qty,
             "expected_price": intent.get("expected_price"),
+            # How the order was actually WORKED, which the dashboard could not show before:
+            # order_status recorded neither the type nor the limit. An ATR-transformed order
+            # looked identical to a market order that had simply not filled yet, so a limit
+            # resting away from the market was indistinguishable from a stuck order.
+            "order_type": intent.get("order_type"),
+            "limit_price": intent.get("limit_price"),
+            "execution_layer": (intent.get("metadata") or {}).get("execution_layer"),
         }
         return order_id
 
@@ -529,6 +536,9 @@ class CentralExecutor(EClient, EWrapper):
             "remaining": abs(delta),
             "pending_qty": delta,
             "expected_price": ref_price,
+            "order_type": intent.get("order_type"),
+            "limit_price": intent.get("limit_price"),
+            "execution_layer": (intent.get("metadata") or {}).get("execution_layer"),
             "net": True,
         }
         return order_id
