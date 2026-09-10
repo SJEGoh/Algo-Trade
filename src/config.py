@@ -41,15 +41,15 @@ CONFIG = {
 
     # Tier 5 netting strategies
     "demo_momentum": {
-        "capital_allocation": 500_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.15,
     },
     "demo_meanrev": {
-        "capital_allocation": 500_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.15,
     },
         "cross_sectional_momentum": {
-        "capital_allocation": 100_000.0,   # match the capital_allocation in your MomentumStrategy
+        "capital_allocation": 10_000.0,   # match the capital_allocation in your MomentumStrategy
         "max_drawdown": 0.15,              # fraction of allocation, e.g. 0.15 = 15%
     },
 
@@ -68,7 +68,7 @@ CONFIG = {
     # reversal. The real limits on this book are the hedger's own thresholds and this
     # notional ceiling, not a P&L stop.
     "hedge_overlay": {
-        "capital_allocation": 1_500_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.95,
     },
 
@@ -77,21 +77,21 @@ CONFIG = {
     # (per-leg / gross notional in models/vecm_strategy.py) are the BINDING caps — tune both
     # to your competition capital.
     "kalman_vecm": {
-        "capital_allocation": 2_000_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.15,
     },
 
     # Best-2 equities strategies from the claude research (daily-rebalanced port).
     "ovn_volsurge": {   # best unbiased strategy (Sharpe 2.62) — overnight vol-surge hold
-        "capital_allocation": 200_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.15,
     },
     "orb_breakout": {   # intraday opening-range breakout (30-min bars); unbiased Sharpe ~2.5
-        "capital_allocation": 200_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.15,
     },
     "kalman_rrg_combined": {   # combined Kalman/RRG rotation (gated long-leg + naive risk parity)
-        "capital_allocation": 200_000.0,
+        "capital_allocation": 10_000.0,
         "max_drawdown": 0.15,
     },
     # --- halt-test strategies: tight 1% max_drawdown to exercise the drawdown -> halt path

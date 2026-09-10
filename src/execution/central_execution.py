@@ -220,17 +220,30 @@ class CentralExecutor(EClient, EWrapper):
         Code 321 (read-only) triggers a background retry of the order."""
         if reqId in self.order_status:
             sym = self.order_status[reqId].get("symbol", "?")
-            logger.error("IB ORDER ERROR  orderId=%s  sym=%s  code=%s  %s  %s",
-                         reqId, sym, errorCode, errorString,
-                         advancedOrderRejectJson or "")
-            # Record WHY, so the dashboard and the submitting strategy can both see it
-            # instead of watching an order sit at "Submitted" forever.
-            self.order_status[reqId]["ack"] = "rejected"
             self.order_status[reqId]["last_error"] = {
                 "code": errorCode, "message": errorString[:300]}
-            # --- retry on read-only (code 321) ---
-            if errorCode == 321:
-                self._retry_readonly_order(reqId)
+            if errorCode in self.CANCEL_CONFIRMED_CODES:
+                # IB answering OUR cancel, not refusing the order. 202 used to be labelled a
+                # rejection (and logged at ERROR), so every successful cancel read as refused.
+                logger.info("IB confirmed cancel  orderId=%s  sym=%s  code=%s  %s",
+                            reqId, sym, errorCode, errorString)
+                self._release_pending(reqId, f"IB code {errorCode}")
+            elif errorCode in self.CANCEL_REFUSED_CODES:
+                # The cancel failed, usually because the order had already filled. Its
+                # pending was released when the cancel was sent, and any fill still to
+                # arrive is compensated in _note_fill, so there is nothing to undo here.
+                logger.warning("cancel refused  orderId=%s  sym=%s  code=%s  %s",
+                               reqId, sym, errorCode, errorString)
+            else:
+                logger.error("IB ORDER ERROR  orderId=%s  sym=%s  code=%s  %s  %s",
+                             reqId, sym, errorCode, errorString,
+                             advancedOrderRejectJson or "")
+                # Record WHY, so the dashboard and the submitting strategy can both see it
+                # instead of watching an order sit at "Submitted" forever.
+                self.order_status[reqId]["ack"] = "rejected"
+                # --- retry on read-only (code 321) ---
+                if errorCode == 321:
+                    self._retry_readonly_order(reqId)
         elif errorCode in (2104, 2106, 2158):
             # data-farm connection messages — informational
             logger.debug("IB info  code=%s  %s", errorCode, errorString)
@@ -266,6 +279,9 @@ class CentralExecutor(EClient, EWrapper):
 
         attempts = self._readonly_retries.get(sym, 0)
         if attempts >= self.READONLY_MAX_RETRIES:
+            # This order will never fill, and IB sends no Inactive for a 321, so without a
+            # release its pending sat in the ledger until the process restarted.
+            self._release_pending(failed_order_id, "read-only retries exhausted")
             logger.critical(
                 "READ-ONLY GIVE UP %s: %d/%d retries used and the gateway is still "
                 "refusing orders. %s %g %s was NOT placed and will not be retried — fix the "
@@ -282,9 +298,12 @@ class CentralExecutor(EClient, EWrapper):
             try:
                 instrument = self._instruments.get(sym, {"symbol": sym})
                 ref_price = info.get("expected_price")
+                # Release ONLY the failed order's remainder before resubmitting. The pooled
+                # path used to pop ALL pending for the symbol — wiping other orders still
+                # working in it — and the direct path released nothing at all, so every
+                # retried direct order counted its shares twice.
+                self._release_pending(failed_order_id, "read-only retry")
                 if info.get("net", False):
-                    # remove stale pending so place_net_order can re-add it
-                    self.ledger.pending_deltas.pop(sym, None)
                     oid = self.place_net_order(sym, pending, instrument, ref_price)
                 else:
                     intent = {
@@ -445,6 +464,8 @@ class CentralExecutor(EClient, EWrapper):
             "order_type": intent.get("order_type"),
             "limit_price": intent.get("limit_price"),
             "execution_layer": (intent.get("metadata") or {}).get("execution_layer"),
+            "exec_filled": 0.0,          # signed, from execDetails — what really traded
+            "pending_released": False,   # set once the unfilled remainder leaves pending
         }
         return order_id
 
@@ -539,6 +560,8 @@ class CentralExecutor(EClient, EWrapper):
             "order_type": intent.get("order_type"),
             "limit_price": intent.get("limit_price"),
             "execution_layer": (intent.get("metadata") or {}).get("execution_layer"),
+            "exec_filled": 0.0,
+            "pending_released": False,
             "net": True,
         }
         return order_id
@@ -555,8 +578,14 @@ class CentralExecutor(EClient, EWrapper):
                 "ack": "rejected" if status == "Inactive" else "live",
             })
             self.logger_db.update_order_status(orderId, status)
+            # IB ended the order without filling the rest: a day order expiring, a rejection,
+            # a cancel from TWS or from us. Nothing released pending here before, so every
+            # order IB ended on its own left shares the ledger believed were still on the way
+            # — and the next rebalance treated that symbol as already on target.
+            if status in self.TERMINAL_UNFILLED:
+                self._release_pending(orderId, f"IB {status}")
             # Cancel the paper-fill streaming sub once the order is done
-            if status in ("Filled", "Cancelled", "Inactive"):
+            if status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
                 sym = self.order_status[orderId].get("symbol")
                 if sym:
                     self._paper_unsubscribe(sym)
@@ -798,23 +827,90 @@ class CentralExecutor(EClient, EWrapper):
         resolved["quantity"] = abs(delta)
         return resolved
 
+    #: IB statuses that end an order without filling the rest of it.
+    TERMINAL_UNFILLED = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
+    #: IB's answers confirming a cancel: 202 cancelled, 10147 no such order at IB.
+    CANCEL_CONFIRMED_CODES = frozenset({202, 10147})
+    #: IB refusing a cancel: 161 / 10148, usually because the order already filled.
+    CANCEL_REFUSED_CODES = frozenset({161, 10148})
+
+    def _release_pending(self, order_id: int, reason: str) -> float:
+        """Release an order's UNFILLED REMAINDER from pending — exactly once.
+
+        The single place pending leaves the ledger for an order that ended without filling.
+        It used to happen in several places with different rules, and most paths never did
+        it: the kill switch, /flatten, the ATR sweep and every cancel IB made on its own
+        released nothing, while the netting cancel released the FULL original quantity even
+        after a partial fill, and reconcile could release it a second time.
+
+        Remainder = original quantity minus what execDetails has actually filled; pooled
+        orders release at the net level, direct orders per strategy. Returns the quantity
+        released (0 if already released, fully filled, or unknown)."""
+        st = self.order_status.get(order_id)
+        if not st or st.get("pending_released"):
+            return 0.0
+        st["pending_released"] = True
+        sym = st.get("symbol")
+        original = float(st.get("pending_qty") or 0.0)
+        remainder = original - float(st.get("exec_filled") or 0.0)
+        if original == 0.0 or remainder * original <= 0.0:
+            return 0.0                              # fully filled, or overfilled
+        if sym:
+            if st.get("net"):
+                self.ledger.record_net_pending(sym, -remainder)
+            else:
+                self.ledger.record_pending(sym, -remainder, st.get("strategy_id", "?"))
+            logger.info("released pending %+g %s from order %s (%s)",
+                        -remainder, sym, order_id, reason)
+        return remainder
+
+    def _note_fill(self, order_id: int, signed_qty: float) -> None:
+        """Count a fill against its order, and keep pending right if the order was cancelled.
+
+        A cancel releases pending straight away, because whoever cancelled usually sizes a
+        replacement immediately. If the order fills anyway — the cancel lost the race — the
+        fill is about to deduct its quantity from pending a second time. Adding it back first
+        nets the two out: the position still moves, because the shares really traded, but
+        pending does not go negative."""
+        st = self.order_status.get(order_id)
+        if not st:
+            return
+        st["exec_filled"] = float(st.get("exec_filled") or 0.0) + signed_qty
+        if st.get("pending_released"):
+            sym = st.get("symbol")
+            if st.get("net"):
+                self.ledger.record_net_pending(sym, signed_qty)
+            else:
+                self.ledger.record_pending(sym, signed_qty, st.get("strategy_id", "?"))
+            logger.warning("late fill %+g %s on order %s after its pending was released — "
+                           "the cancel lost the race", signed_qty, sym, order_id)
+
+    def cancel_order(self, order_id: int, reason: str = "") -> bool:
+        """Cancel an order at IB, mark it PendingCancel, and release its unfilled remainder.
+
+        EVERY cancel path goes through here. Releasing at send time rather than on IB's
+        confirmation is deliberate: the netting rebalance and /flatten size their replacement
+        orders the moment they have cancelled, so pending must already exclude the cancelled
+        shares. If IB refuses the cancel and the order fills, _note_fill compensates.
+        Marking PendingCancel also stops a second path cancelling the same order again.
+        Returns False if the cancel could not be sent (pending is then left untouched)."""
+        st = self.order_status.get(order_id)
+        try:
+            self.cancelOrder(order_id)
+        except Exception as e:
+            logger.error("failed to send cancel for order %s (%s): %s", order_id, reason, e)
+            return False
+        if st is not None:
+            st["status"] = "PendingCancel"
+            self._release_pending(order_id, f"cancel: {reason}" if reason else "cancel")
+        return True
+
     def _cancel_open_orders_for_symbol(self, symbol: str) -> None:
         for order_id, status in list(self.order_status.items()):
             if status["symbol"] == symbol and status["status"] in ("PreSubmitted", "Submitted"):
-                logger.info("Cancelling stale open order %s for %s before resolving new target", order_id, symbol)
-                self.cancelOrder(order_id)  # FIX: second arg required
-                pending_contribution = status.get("pending_qty", 0.0)
-                # reverse this order's pending contribution in the ledger
-                if status.get("net"):
-                    # pooled net order: pending lives at net level only (record_net_pending),
-                    # so reverse it there — NOT via record_pending, which would write a
-                    # phantom strategy_pending["__net__"] entry.
-                    self.ledger.record_net_pending(symbol, -pending_contribution)
-                else:
-                    self.ledger.record_pending(symbol, -pending_contribution, status["strategy_id"])
-                # Mark it cancelled locally so a rapid re-target (another rebalance before IB
-                # confirms this cancel) won't cancel it AGAIN and reverse its pending twice.
-                status["status"] = "PendingCancel"
+                logger.info("Cancelling stale open order %s for %s before resolving new target",
+                            order_id, symbol)
+                self.cancel_order(order_id, "rebalance")
 
     # ------------------------------------------------------------------
     # Fill / position callbacks — all delegate to the ledger
@@ -827,6 +923,7 @@ class CentralExecutor(EClient, EWrapper):
         # process: the next read-only episode would be refused on a stale counter.
         self.clear_readonly_retries(contract.symbol)
         signed_qty = execution.shares if execution.side == "BOT" else -execution.shares
+        self._note_fill(execution.orderId, signed_qty)
         if getattr(contract, "multiplier", None):
             try:
                 self.ledger.multipliers[contract.symbol] = float(contract.multiplier)
@@ -836,7 +933,10 @@ class CentralExecutor(EClient, EWrapper):
         # Pooled net order: let the coordinator decompose this fill into per-strategy
         # sub-fills (correct P&L even with opposing legs), then check drawdown per book.
         if order_info.get("net") and self.coordinator is not None:
-            attributed = self.coordinator.attribute_fill(contract.symbol, signed_qty, execution.price)
+            # order_id lets the coordinator book this fill to the strategies that OWNED the
+            # order, rather than whoever has an open gap in the symbol when it arrives.
+            attributed = self.coordinator.attribute_fill(contract.symbol, signed_qty, execution.price,
+                                                         order_id=execution.orderId)
             # Log the raw net fill (the actual IB execution)
             self.logger_db.log_fill(
                 execution.orderId, execution.execId, contract.symbol,
@@ -1124,15 +1224,8 @@ class CentralExecutor(EClient, EWrapper):
                 continue
             if st.get("net") or st.get("strategy_id") != strat_id:
                 continue
-            try:
-                self.cancelOrder(oid)
-            except Exception as e:
-                logger.error("halt: failed to cancel order %s for %s: %s", oid, strat_id, e)
+            if not self.cancel_order(oid, f"halt {strat_id}"):
                 continue
-            pending = st.get("pending_qty", 0.0)
-            if pending:
-                self.ledger.record_pending(st.get("symbol"), -pending, strat_id)
-            st["status"] = "PendingCancel"
             cancelled.append(oid)
         if cancelled:
             logger.warning("halt %s: cancelled working orders %s", strat_id, cancelled)
@@ -1516,10 +1609,12 @@ class CentralExecutor(EClient, EWrapper):
         self._killed = True
         logger.critical("KILL SWITCH ACTIVATED")
 
-        # 1. cancel all open orders
+        # 1. cancel all open orders. Through cancel_order, which releases their pending: a
+        #    bare cancelOrder did not, so the flatten below sized its closing orders against
+        #    shares the ledger still believed were on the way.
         for order_id, status in list(self.order_status.items()):
             if status["status"] in ("PreSubmitted", "Submitted"):
-                self.cancelOrder(order_id)
+                self.cancel_order(order_id, "kill switch")
 
         # 2. optionally flatten every position — per-strategy so fills attribute correctly
         if flatten:
@@ -1606,12 +1701,11 @@ class CentralExecutor(EClient, EWrapper):
             })
             # mark as dead — set status so it's no longer treated as live
             self.order_status[oid]["status"] = "Reconciled_Stale"
-            # clear any pending delta the ledger is holding for this order
-            sym = st.get("symbol")
-            pending_qty = st.get("pending_qty", 0)
-            if sym and abs(pending_qty) > 1e-9:
-                # reverse the pending delta by recording the negated amount
-                self.ledger.record_pending(sym, -pending_qty, st.get("strategy_id", "?"))
+            # Release through the shared helper: once only, the unfilled remainder, at the net
+            # level for a pooled order. This used to release the FULL original quantity via the
+            # per-strategy path — a second time for an order whose cancel had already released
+            # it, and into a phantom strategy_pending["__net__"] for a pooled one.
+            self._release_pending(oid, "reconcile: not live at IB")
             logger.warning("reconcile: removed stale order %s (%s %s) — not in IBKR",
                            oid, st.get("symbol"), st.get("strategy_id"))
 

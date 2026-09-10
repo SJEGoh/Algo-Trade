@@ -1,4 +1,8 @@
 """tests/test_internal_crossing.py — Internal crossing in the NettingCoordinator.
+
+Crossing is OFF by default (positions should move only on a broker fill), so every
+coordinator here is built with internal_crossing=True: these tests pin the algorithm for
+when it is switched back on, not the default behaviour.
 Verifies that offsetting strategy deltas are crossed internally at the reference
 price, and only the residual net goes to IB."""
 import pytest
@@ -71,7 +75,7 @@ class TestInternalCrossBasic:
         """A wants +10, B wants -10 → cross all 10, no IB order."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         # A sets target first — goes to IB since B has no opposite delta yet
         r1 = co.set_target("A", "MSFT", 10, instrument=inst("MSFT"), price=400)
@@ -91,7 +95,7 @@ class TestInternalCrossBasic:
         """Both strategies set targets at once — offsetting deltas cross internally."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         # A wants +10
         co.set_target("A", "MSFT", 10, instrument=inst("MSFT"), price=400)
@@ -101,7 +105,7 @@ class TestInternalCrossBasic:
 
         # Start fresh
         ex2 = FakeExecutor(cfg)
-        co2 = NettingCoordinator(ex2, cfg)
+        co2 = NettingCoordinator(ex2, cfg, internal_crossing=True)
 
         # Set both desired books via submit_book
         co2.submit_book("A", [{"instrument": inst("MSFT"), "target_quantity": 10, "expected_price": 400}])
@@ -124,7 +128,7 @@ class TestInternalCrossBasic:
         """A wants +10, B wants -3 → cross 3 internally, send +7 to IB."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         # Both strategies have unfilled deltas from the start
         # Use desired directly to set up the scenario
@@ -161,7 +165,7 @@ class TestInternalCrossBasic:
         """A wants +10, B wants +5 → no internal cross, all to IB."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": 5}}
         co.ref_price["MSFT"] = 400.0
@@ -180,7 +184,7 @@ class TestInternalCrossThreeStrategies:
         """A wants +10, B wants -5, C wants -3 → cross 8 internally, send +2 to IB."""
         cfg = _cfg(A=1e9, B=1e9, C=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": -5}, "C": {"MSFT": -3}}
         co.ref_price["MSFT"] = 400.0
@@ -224,7 +228,7 @@ class TestInternalCrossThreeStrategies:
         """A wants +6, B wants +4, C wants -5 → cross 5 pro-rata among buyers."""
         cfg = _cfg(A=1e9, B=1e9, C=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 6}, "B": {"MSFT": 4}, "C": {"MSFT": -5}}
         co.ref_price["MSFT"] = 400.0
@@ -258,7 +262,7 @@ class TestInternalCrossPnL:
         B gets all shares at internal price. P&L should reflect this."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         # Set up: A wants +10 MSFT, B wants -4 MSFT
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": -4}}
@@ -289,7 +293,7 @@ class TestInternalCrossPnL:
         """A buys internally, then sells later → realized P&L uses internal entry price."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         # Phase 1: A wants +5, B wants -5 → full internal cross @ 400
         co.desired = {"A": {"MSFT": 5}, "B": {"MSFT": -5}}
@@ -323,7 +327,7 @@ class TestInternalCrossDBLogging:
     def test_internal_fills_logged_to_db(self):
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": -3}}
         co.ref_price["MSFT"] = 400.0
@@ -351,7 +355,7 @@ class TestInternalCrossDBLogging:
     def test_no_db_logging_when_no_cross(self):
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": 5}}
         co.ref_price["MSFT"] = 400.0
@@ -370,7 +374,7 @@ class TestInternalCrossInvariants:
         """Internal crosses are zero-sum: current_positions must not change."""
         cfg = _cfg(A=1e9, B=1e9, C=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": -5}, "C": {"MSFT": -3}}
         co.ref_price["MSFT"] = 400.0
@@ -386,7 +390,7 @@ class TestInternalCrossInvariants:
         """After internal cross + IB fill, sum of strategy positions = current_positions."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 10}, "B": {"MSFT": -3}}
         co.ref_price["MSFT"] = 400.0
@@ -408,7 +412,7 @@ class TestInternalCrossInvariants:
         """effective_position (current + pending) must still reflect only broker state."""
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {"A": {"MSFT": 8}, "B": {"MSFT": -8}}
         co.ref_price["MSFT"] = 400.0
@@ -431,7 +435,7 @@ class TestInternalCrossMultipleSymbols:
     def test_two_symbols_cross_independently(self):
         cfg = _cfg(A=1e9, B=1e9)
         ex = FakeExecutor(cfg)
-        co = NettingCoordinator(ex, cfg)
+        co = NettingCoordinator(ex, cfg, internal_crossing=True)
 
         co.desired = {
             "A": {"MSFT": 10, "AAPL": -5},

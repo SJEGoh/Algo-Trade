@@ -199,7 +199,7 @@ def test_net_fill_checks_the_strategies_it_was_attributed_to(ex):
 
     class Coord:
         desired = {}                                  # book state lost
-        def attribute_fill(self, *a):
+        def attribute_fill(self, *a, order_id=None):
             return [("s1", 100.0)]
 
     ex.coordinator = Coord()

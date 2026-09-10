@@ -78,40 +78,55 @@ coord.submit_book("orb_breakout", [
 
 ## How a rebalance works
 
-Both entry points end in `_rebalance(symbols)`. For each affected symbol:
+Both entry points end in `_rebalance(symbols)`. **No strategy position moves here** — positions
+move only when the broker reports a fill (next section). For each affected symbol:
 
 1. `target = net()[symbol]` — the new pooled target (sum of all desired books).
-2. If `target` already equals the ledger's **effective** position (filled + pending), do
-   nothing — no order. (This is why re-running the same target is a clean no-op and why the
-   coordinator doesn't churn cancels.)
+2. If `target` already equals the ledger's **effective** position (filled + pending), place
+   nothing — re-running the same target is a clean no-op. The one exception: strategies whose
+   gaps cancel out *exactly* (s1 wants +60, s2 wants −60) with no working order to settle
+   them. A single order for zero shares would never fill, so neither position could ever
+   move; the buyers and the sellers are sent to IB as **two orders**, each owned by its side.
 3. Otherwise cancel any stale in-flight order for the symbol, recompute
-   `delta = target − effective_position`, and if it's non-trivial, call
-   `executor.place_net_order(symbol, delta, instrument, ref_price)`.
+   `delta = target − effective_position`, snapshot each strategy's gap (`want − filled`), call
+   `executor.place_net_order(symbol, delta, instrument, ref_price)`, and **record those gaps
+   as the order's owners** against its order id.
 
-`place_net_order` submits the pooled order under a synthetic strategy id `__net__` and
-records the pending at the **net** level only (`record_net_pending`) — deliberately *not*
-per strategy, because the account doesn't yet know how to split the fill. That split
-happens on the fill.
+`place_net_order` submits the pooled order under the synthetic id `__net__` and records the
+pending at the **net** level only (`record_net_pending`). Opposing legs still net into one
+order — s1 +100 and s2 −60 send +40 — and each strategy books its own side when that order
+fills, at the real fill price.
 
-## Fill attribution — the clever bit
+**Internal crossing is off by default.** It booked offsetting legs against each other at the
+reference price the moment an order was made, with no fill, which broke the rule that a
+position moves only on a fill. It remains available as `NettingCoordinator(...,
+internal_crossing=True)`, and `tests/test_internal_crossing.py` pins the algorithm with it on.
 
-When the net order fills, `execDetails` sees the order is flagged `net` and calls
-`coordinator.attribute_fill(symbol, filled_signed, price)`. That method:
+## Fill attribution — to the order's owners
 
-1. Computes, for every strategy, `want − have` for the symbol (`want` = desired book,
-   `have` = what the strategy is currently booked at). These are the per-strategy changes
-   the fill is *supposed* to deliver.
-2. `total = sum(changes)`. On a **full** fill, `total == filled_signed`, so each strategy
-   gets exactly its own change. On a **partial** fill, `scale = filled_signed / total`
-   pro-rates every strategy's change by the same fraction.
-3. For each strategy, `apply_attributed_fill(symbol, change*scale, price, strat)` books the
-   sub-fill at the **fill price** — so realized P&L is correct even when strategies hold
-   opposing legs (A closes into B's open at the true traded price), and reverses the net
-   pending.
+When a net order fills, `execDetails` calls
+`coordinator.attribute_fill(symbol, filled_signed, price, order_id=...)`. That method uses the
+owners **frozen when the order was placed**:
 
-Edge case: if `total ≈ 0` (the desired books net out to no change but a fill still arrived,
-e.g. a reconciliation artifact), the fill is booked to `__net__` rather than silently
-dropped, keeping the invariant intact.
+1. `total = sum(owner gaps)`; `scale = filled_signed / total`. A full fill gives each owner
+   exactly its gap; a partial fill pro-rates every owner by the same fraction.
+2. For each owner, `apply_attributed_fill(symbol, gap*scale, price, strat)` books the
+   sub-fill at the **fill price** and reverses the net pending.
+3. Once the order's full quantity has filled, its owner record is dropped.
+
+Why frozen rather than recomputed at fill time: attribution used to re-derive owners from the
+live desired book when the fill arrived, so any strategy with an open gap in the symbol could
+claim it. A fill from strategy B's order landed on strategy A's fresh target — A's position
+moved before A's own order had filled — and one IB sale of 14 MSFT was booked 10 to
+`kalman_vecm`, a futures strategy. A cancelled order that fills anyway (the cancel lost the
+race) now also books to the strategies it was actually for.
+
+The owner map is **in memory only**. IB reuses order ids across restarts, so a persisted entry
+could attach to an unrelated order next session. An order with no record — placed before a
+restart — falls back to the live desired book, and the log says so.
+
+Edge case: an order nobody owned (e.g. closing a position no strategy holds), or a fill whose
+owners net to zero, is booked to `__net__` rather than dropped, keeping the invariant intact.
 
 ## Halting a strategy
 
@@ -158,3 +173,6 @@ the executor's `place_net_order` / `execDetails` net-fill routing do the rest.
 - an over-allocation target is rejected and the book reverted (no order placed);
 - a halted strategy cannot submit;
 - a partial fill is split pro-rata across strategies.
+
+Owner-based attribution — positions move only on the owning order's fill, late fills on
+cancelled orders, exact offsets as two orders — is in `tests/test_fill_owned_attribution.py`.

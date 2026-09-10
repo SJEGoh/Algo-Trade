@@ -30,16 +30,20 @@ class FakeExecutor:
     def place_net_order(self, sym, delta, instrument, price, urgent=False):
         self.ledger.record_net_pending(sym, delta)
         oid = len(self.placed) + 1
-        self.placed.append({"symbol": sym, "delta": delta, "price": price})
+        self.placed.append({"symbol": sym, "delta": delta, "price": price, "oid": oid})
         return oid
 
+    # Fills carry the order id, as execDetails does, so attribution runs on the owners
+    # recorded when the order was placed rather than on the live desired book.
     def fill_last(self, co, price=None):
         o = self.placed[-1]
-        co.attribute_fill(o["symbol"], o["delta"], price if price is not None else o["price"])
+        co.attribute_fill(o["symbol"], o["delta"], price if price is not None else o["price"],
+                          order_id=o["oid"])
 
     def fill_orders(self, co, orders):
         for o in orders:
-            co.attribute_fill(o["symbol"], o["delta"], self.ref(o["symbol"]))
+            co.attribute_fill(o["symbol"], o["delta"], self.ref(o["symbol"]),
+                              order_id=o.get("order_id"))
 
     def ref(self, sym):
         return next(p["price"] for p in reversed(self.placed) if p["symbol"] == sym)

@@ -73,9 +73,6 @@ class _IntradayBarStrategy(_EquityBase):
                 data[t] = df[["open", "high", "low", "close", "volume"]]
         return data
 
-    def _shares(self, df) -> int:
-        price = float(df["close"].iloc[-1])
-        return round(self.lot_dollars / price) if price > 0 else 0
 
 
 class MacdCrossStrategy(_IntradayBarStrategy):
@@ -91,15 +88,13 @@ class MacdCrossStrategy(_IntradayBarStrategy):
         super().__init__(strategy_id, **kw)
         self.fast, self.slow, self.signal = int(fast), int(slow), int(signal)
 
-    def _targets(self, data):
-        out = {}
+    def _selected(self, data):
+        held = set()
         for t, df in data.items():
             line, sig, _hist = ind.macd(df["close"], self.fast, self.slow, self.signal)
-            buy = ind.cross_up(line, sig)
-            sell = ind.cross_down(line, sig)
-            held = int(held_state(buy, sell).iloc[-1])
-            out[t] = self._shares(df) if held else 0
-        return out
+            if int(held_state(ind.cross_up(line, sig), ind.cross_down(line, sig)).iloc[-1]):
+                held.add(t)
+        return held
 
 
 class BollingerReversionStrategy(_IntradayBarStrategy):
@@ -117,12 +112,12 @@ class BollingerReversionStrategy(_IntradayBarStrategy):
         super().__init__(strategy_id, **kw)
         self.n, self.k = int(n), float(k)
 
-    def _targets(self, data):
-        out = {}
+    def _selected(self, data):
+        held = set()
         for t, df in data.items():
             mid, _upper, lower = ext.bollinger(df["close"], self.n, self.k)
             buy = ind.cross_down(df["close"], lower)     # crossing BELOW the lower band
             sell = ind.cross_up(df["close"], mid)        # back through the middle
-            held = int(held_state(buy, sell).iloc[-1])
-            out[t] = self._shares(df) if held else 0
-        return out
+            if int(held_state(buy, sell).iloc[-1]):
+                held.add(t)
+        return held

@@ -2,7 +2,8 @@
 
 Each strategy owns a DESIRED BOOK (its target position per symbol). The coordinator
 holds ONE net position per symbol at the broker (= sum of all books) and attributes
-fills back to strategies so per-strategy P&L and risk stay correct.
+each fill to the strategies that OWNED the order that filled, so per-strategy P&L and risk
+stay correct. Strategy positions move on fills, never on submission.
 
 Two ways a strategy updates its book:
   * set_target(sid, symbol, qty, ...)  — incremental (one symbol); good for event-driven
@@ -15,6 +16,7 @@ Invariant maintained:  sum_over_strategies(strategy_positions[*][sym]) == net po
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -22,16 +24,29 @@ from pathlib import Path
 
 _EPS = 1e-9
 
+logger = logging.getLogger("executor")
+
+#: Ledger buckets. They hold residue, not intent, so they are never an order's owner.
+_BOOKKEEPING = frozenset({"__net__", "flatten_all", "kill_switch"})
+
 
 class NettingCoordinator:
     NET_SID = "__net__"
 
-    def __init__(self, executor, config, state_path=None):
+    def __init__(self, executor, config, state_path=None, internal_crossing: bool = False):
         self.ex = executor
         self.config = config
         self.desired = {}      # {strategy_id: {symbol: qty}}
         self.instrument = {}   # {symbol: instrument dict}  (how to build the contract)
         self.ref_price = {}    # {symbol: price}            (notional + net order)
+        #: Book offsetting legs against each other at the reference price, with NO fill.
+        #: Off by default: a strategy's position should move only when the broker fills.
+        self.internal_crossing = bool(internal_crossing)
+        #: order_id -> {symbol, gaps {sid: qty}, delta, filled}. Who each working order is
+        #: FOR, frozen when it is placed. In memory only, on purpose: IB reuses order ids
+        #: across restarts, so a persisted entry could attach to an unrelated order in the
+        #: next session.
+        self.order_owners = {}
         self.state_path = Path(state_path) if state_path else None
         self._lock = threading.RLock()
         self._load()
@@ -318,33 +333,151 @@ class NettingCoordinator:
         return crosses
 
     # ---------------- rebalance to net ----------------
+    def _owner_gaps(self, sym):
+        """Each strategy's outstanding change in `sym`: desired minus FILLED position.
+
+        This is what a new order for `sym` is for. Pending is deliberately excluded — the
+        rebalance cancels every working order for the symbol before placing, so the gaps
+        and the new order describe the same shares."""
+        gaps = {}
+        for sid, book in self.desired.items():
+            if sid in _BOOKKEEPING:
+                continue
+            want = book.get(sym, 0.0)
+            have = self.ex.ledger.strategy_positions.get(sid, {}).get(sym, 0.0)
+            if abs(want - have) > _EPS:
+                gaps[sid] = want - have
+        return gaps
+
+    def _register(self, oid, sym, gaps, delta):
+        """Freeze who an order is for, at the moment it is placed."""
+        if oid is None:
+            return
+        self.order_owners[oid] = {"symbol": sym, "gaps": dict(gaps),
+                                  "delta": float(delta), "filled": 0.0}
+        status = getattr(self.ex, "order_status", None)
+        if isinstance(status, dict) and oid in status:
+            status[oid]["owners"] = dict(gaps)            # visible on /orders
+
+    def _working_orders(self, sym):
+        """Registered orders for `sym` that can still fill."""
+        status = getattr(self.ex, "order_status", None)
+        out = []
+        for oid, rec in self.order_owners.items():
+            if rec["symbol"] != sym or abs(rec["filled"]) >= abs(rec["delta"]) - _EPS:
+                continue
+            if isinstance(status, dict):
+                st = status.get(oid) or {}
+                if st.get("ack") == "rejected" or st.get("status") not in (
+                        "PreSubmitted", "Submitted", "PendingSubmit"):
+                    continue
+            out.append(oid)
+        return out
+
+    @staticmethod
+    def _is_exact_offset(gaps):
+        return (any(g > 0 for g in gaps.values()) and any(g < 0 for g in gaps.values())
+                and abs(sum(gaps.values())) < _EPS)
+
+    def _place_offsetting_legs(self, sym, gaps, urgent):
+        """Legs that cancel out exactly still need real fills. One net order for zero shares
+        places nothing, so neither strategy's position could ever move — send the buyers
+        and the sellers to the broker as two orders, each owned by its own side."""
+        placed = []
+        buys = {s: g for s, g in gaps.items() if g > 0}
+        sells = {s: g for s, g in gaps.items() if g < 0}
+        for side in (buys, sells):
+            qty = sum(side.values())
+            oid = self.ex.place_net_order(sym, qty, self.instrument.get(sym),
+                                          self.ref_price.get(sym), urgent=urgent)
+            self._register(oid, sym, side, qty)
+            placed.append({"symbol": sym, "delta": qty, "order_id": oid, "offset_leg": True})
+        logger.info("Offsetting legs for %s sent as two orders: %+g / %+g",
+                    sym, sum(buys.values()), sum(sells.values()))
+        return placed
+
     def _rebalance(self, symbols, urgent: bool = False):
-        """Cross internally first, then send residual net delta to IB.
+        """Send each symbol's net change to IB as one order, owned by the strategies it is for.
+
+        Positions do NOT move here. They move in attribute_fill when the broker reports a
+        fill, and only for the strategies that owned the order that filled. Opposing legs
+        still net into a single order; they settle when it fills, at the real price. Internal
+        crossing — booking them against each other at the reference price with no fill — runs
+        only if the coordinator was built with internal_crossing=True.
+
+        Takes the lock itself: the flatten and kill paths call this directly while fills can
+        be arriving on the IB thread, and both touch order_owners.
         urgent=True skips ATR (used by flatten / kill_switch).
         Returns {"orders": [...], "internal_crosses": [...]}."""
-        crosses = self._internal_cross(symbols)
-        net = self.net()
-        placed = []
-        for sym in symbols:
-            target = net.get(sym, 0.0)
-            if abs(target - self.ex.ledger.effective_position(sym)) < _EPS:
-                continue
-            self.ex._cancel_open_orders_for_symbol(sym)          # cancel stale in-flight first
-            delta = target - self.ex.ledger.effective_position(sym)
-            if abs(delta) < _EPS:
-                continue
-            oid = self.ex.place_net_order(sym, delta, self.instrument.get(sym), self.ref_price.get(sym), urgent=urgent)
-            placed.append({"symbol": sym, "delta": delta, "order_id": oid})
-        return {"orders": placed, "internal_crosses": crosses}
+        with self._lock:
+            crosses = self._internal_cross(symbols) if self.internal_crossing else []
+            net = self.net()
+            placed = []
+            for sym in symbols:
+                target = net.get(sym, 0.0)
+                if abs(target - self.ex.ledger.effective_position(sym)) < _EPS:
+                    # Covered by filled + working orders — unless strategies offset each
+                    # other exactly and nothing is working to settle them.
+                    gaps = self._owner_gaps(sym)
+                    if self._is_exact_offset(gaps) and not self._working_orders(sym):
+                        placed += self._place_offsetting_legs(sym, gaps, urgent)
+                    continue
+                self.ex._cancel_open_orders_for_symbol(sym)      # cancel stale in-flight first
+                delta = target - self.ex.ledger.effective_position(sym)
+                gaps = self._owner_gaps(sym)
+                if abs(delta) < _EPS:
+                    if self._is_exact_offset(gaps):
+                        placed += self._place_offsetting_legs(sym, gaps, urgent)
+                    continue
+                oid = self.ex.place_net_order(sym, delta, self.instrument.get(sym),
+                                              self.ref_price.get(sym), urgent=urgent)
+                self._register(oid, sym, gaps, delta)
+                placed.append({"symbol": sym, "delta": delta, "order_id": oid})
+            return {"orders": placed, "internal_crosses": crosses}
 
     # ---------------- fill attribution ----------------
-    def attribute_fill(self, symbol, filled_signed, price):
-        """Decompose a net fill into per-strategy sub-fills at the fill price, so each
-        strategy books only its own change (correct P&L even with opposing legs).
+    def attribute_fill(self, symbol, filled_signed, price, order_id=None):
+        """Book a fill to the strategies that OWNED the order that filled.
+
+        Owners and their shares were frozen when the order was placed, so a fill cannot be
+        claimed by a strategy that merely has an open gap in the same symbol when it arrives.
+        That was the old behaviour: owners were re-derived from the live desired book, so
+        strategy B's fill could land on strategy A's fresh target — A's position moved
+        before A's own order had filled, and a futures strategy once collected 10 shares of
+        MSFT that way.
+
+        Partial fills split pro-rata across the owners; the record is dropped once the
+        order's full quantity has filled. An order with no record (placed before a restart,
+        or a caller that does not pass order_id) falls back to the live desired book.
         Returns a list of (strategy_id, attributed_qty) tuples for DB logging."""
         with self._lock:
+            rec = self.order_owners.get(order_id) if order_id is not None else None
+            if rec is not None and rec["symbol"] == symbol:
+                gaps = rec["gaps"]
+                total = sum(gaps.values())
+                rec["filled"] += filled_signed
+                if abs(rec["filled"]) >= abs(rec["delta"]) - _EPS:
+                    del self.order_owners[order_id]
+                if not gaps or abs(total) < _EPS:
+                    # an order nobody owned, e.g. closing a position no strategy holds
+                    self.ex.ledger.apply_attributed_fill(symbol, filled_signed, price, self.NET_SID)
+                    return [(self.NET_SID, filled_signed)]
+                scale = filled_signed / total
+                attributed = []
+                for sid, gap in gaps.items():
+                    sub_qty = gap * scale
+                    self.ex.ledger.apply_attributed_fill(symbol, sub_qty, price, sid)
+                    attributed.append((sid, sub_qty))
+                return attributed
+
+            if order_id is not None:
+                logger.warning("fill for order %s (%s) has no recorded owners — placed before a "
+                               "restart or outside the coordinator; attributing by the current "
+                               "desired book instead", order_id, symbol)
             changes = {}
             for sid, book in self.desired.items():
+                if sid in _BOOKKEEPING:
+                    continue
                 want = book.get(symbol, 0.0)
                 have = self.ex.ledger.strategy_positions.get(sid, {}).get(symbol, 0.0)
                 if abs(want - have) > _EPS:

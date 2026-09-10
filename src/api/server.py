@@ -29,6 +29,12 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DB_DIR = Path(__file__).resolve().parent.parent.parent / "db"
 
 EXECUTOR_API_KEY = os.environ.get("EXECUTOR_API_KEY")
+#: Module logger. /atr/cancel has called logger.info and logger.warning since it was written,
+#: but nothing ever defined `logger` here — so the daily sweep raised NameError the moment it
+#: cancelled its first order (the except branch raised it again), returned a 500, and left
+#: every remaining ATR limit working into the close.
+logger = logging.getLogger("executor")
+
 #: how long an order may sit unacknowledged by IB before /orders says something is wrong
 UNACKED_WARN_SEC = float(os.environ.get("UNACKED_WARN_SEC", "20"))
 SERVER_CLIENT_ID = int(os.environ.get("IB_CLIENT_ID", "8"))  # distinct from main.py / run_strat.py (both use 6)
@@ -342,6 +348,39 @@ def get_exposure(trigger: float = 0.30, target: float = 0.25, release: float = 0
     }
 
 
+@app.get("/pending")
+def get_pending():
+    """What the ledger believes is still on its way, and whether working orders explain it.
+
+    Pending feeds effective_position, which the netting rebalance trades against. Pending
+    held for an order that no longer exists makes a symbol look already on target, and the
+    strategy quietly stops getting fills in it — with nothing in the logs. Nothing exposed
+    this before. `unexplained` is pending with no working order behind it; it should be
+    empty, and a non-empty value is a leak to investigate, not a rounding error."""
+    explained, orders = {}, []
+    for oid, st in list(executor.order_status.items()):
+        if st.get("pending_released") or st.get("status") in (
+                "Filled", "Reconciled_Stale", *executor.TERMINAL_UNFILLED):
+            continue
+        original = float(st.get("pending_qty") or 0.0)
+        remainder = original - float(st.get("exec_filled") or 0.0)
+        if original == 0.0 or remainder * original <= 0.0:
+            continue
+        sym = st.get("symbol")
+        explained[sym] = explained.get(sym, 0.0) + remainder
+        orders.append({"order_id": oid, "symbol": sym, "strategy_id": st.get("strategy_id"),
+                       "status": st.get("status"), "net": bool(st.get("net")),
+                       "remainder": remainder})
+    pending = {sym: q for sym, q in dict(executor.ledger.pending_deltas).items() if abs(q) > 1e-9}
+    unexplained = {}
+    for sym in set(pending) | set(explained):
+        gap = pending.get(sym, 0.0) - explained.get(sym, 0.0)
+        if abs(gap) > 1e-6:
+            unexplained[sym] = gap
+    return {"pending": pending, "explained_by_orders": explained, "orders": orders,
+            "unexplained": unexplained, "consistent": not unexplained}
+
+
 @app.get("/positions/orphans")
 def get_orphans():
     """Broker positions no strategy claims — real risk the per-strategy views do not show.
@@ -461,11 +500,12 @@ def flatten_all():
     cancelled = []
     for oid, status in list(executor.order_status.items()):
         if status.get("status") in ("PreSubmitted", "Submitted"):
-            try:
-                executor.cancelOrder(oid)
+            # cancel_order releases the order's unfilled pending and marks it PendingCancel.
+            # A bare cancelOrder did neither: the closing orders below were sized against
+            # shares still counted as on the way, and the rebalance then cancelled the same
+            # order a second time.
+            if executor.cancel_order(oid, "flatten"):
                 cancelled.append(oid)
-            except Exception:
-                pass
 
     # 2. flatten per-strategy — ONLY when market is open
     _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
@@ -1026,12 +1066,12 @@ def atr_cancel_unfilled():
     for oid in executor.atr_layer.pending_order_ids():
         status = executor.order_status.get(oid, {})
         if status.get("status") in ("PreSubmitted", "Submitted"):
-            try:
-                executor.cancelOrder(oid)
+            # releases the unfilled pending too. This sweep runs every day before the close,
+            # and a bare cancelOrder left each cancelled limit's shares in pending — so the
+            # next day's rebalance treated those names as already on target.
+            if executor.cancel_order(oid, "ATR end-of-day sweep"):
                 cancelled.append(oid)
                 logger.info("ATR cancel: cancelled unfilled order %s (%s)", oid, status.get("symbol"))
-            except Exception as e:
-                logger.warning("ATR cancel: failed to cancel order %s: %s", oid, e)
     executor.atr_layer.clear_tracked()
     return {"cancelled": cancelled, "count": len(cancelled)}
 

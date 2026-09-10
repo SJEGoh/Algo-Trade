@@ -254,8 +254,11 @@ def test_strategy_status_unknown_404(client):
 def test_strategy_allocation_known(client):
     body = client.get(f"/strategies/{KNOWN_STRAT}/allocation").json()
     assert body["strategy_id"] == KNOWN_STRAT
-    assert body["capital_allocation"] == 100_000.0
-    assert body["max_drawdown"] == 0.15
+    # compare against the config, not a literal — the test is that the endpoint reports
+    # what config.py says, and a hardcoded 100_000 broke the moment allocations changed
+    from config import CONFIG
+    assert body["capital_allocation"] == CONFIG[KNOWN_STRAT]["capital_allocation"]
+    assert body["max_drawdown"] == CONFIG[KNOWN_STRAT]["max_drawdown"]
 
 
 def test_strategy_allocation_unknown_404(client):

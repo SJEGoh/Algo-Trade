@@ -21,20 +21,94 @@ DEFAULT_UNIVERSE = ["NVDA","AMD","AVGO","MU","AMZN","META","GOOGL","MSFT","ORCL"
                     "AMAT","QCOM","TXN","ON","MCHP","NXPI","CDNS","SNPS","VRT","SMCI"]
 
 
+def inverse_vol_sizing(data, selected, deployable: float, max_weight: float = 0.25,
+                       vol_lookback: int = 20) -> dict:
+    """Split `deployable` dollars across `selected` names, inversely to their volatility.
+
+    Returns symbol -> dollars. A calmer name carries more capital than a jumpy one, so each
+    position contributes roughly the same risk instead of the same notional — which is what
+    equal dollar lots quietly got wrong: $2,000 of a 60%-vol name is several times the risk
+    of $2,000 of a 15%-vol one.
+
+    The weights are capped at `max_weight` and DELIBERATELY NOT renormalised afterwards.
+    Portfolio weights must sum to 1, so capping there redistributes the excess; here the cap
+    exists to stop one name taking the book, and redistributing would defeat it — with two
+    names and a 25% cap, renormalising hands each 50%. Leaving the sum short instead means a
+    thin book simply deploys less than its full allocation, which is the safe direction.
+    """
+    if not selected or deployable <= 0:
+        return {}
+
+    vols = {}
+    for t in selected:
+        df = data.get(t)
+        if df is None or len(df) < 3:
+            continue
+        r = df["close"].pct_change().dropna().tail(vol_lookback)
+        v = float(r.std()) if len(r) >= 2 else 0.0
+        if v > 0 and v == v:                     # positive and not NaN
+            vols[t] = v
+    if not vols:
+        # No usable volatility for anything selected — fall back to equal weight rather
+        # than silently sizing nothing, but cap it the same way.
+        w = min(max_weight, 1.0 / len(selected))
+        return {t: deployable * w for t in selected}
+
+    inv_total = sum(1.0 / v for v in vols.values())
+    return {t: deployable * min(max_weight, (1.0 / v) / inv_total)
+            for t, v in vols.items()}
+
+
 class _EquityBase:
     def __init__(self, strategy_id, universe=None, lot_dollars: float = 2000.0,
-                 ohlc_fn: Optional[Callable] = None, lookback_days: int = 400):
+                 ohlc_fn: Optional[Callable] = None, lookback_days: int = 400,
+                 capital_allocation: Optional[float] = None,
+                 deploy_fraction: float = 1.0, max_weight: float = 0.25,
+                 vol_lookback: int = 20):
         self.strategy_id = strategy_id
         self.universe = list(universe or DEFAULT_UNIVERSE)
         self.lot_dollars = float(lot_dollars)
         self._ohlc_fn = ohlc_fn or self._yf_ohlc
         self.lookback_days = lookback_days
+        #: The strategy's cap, read from the executor at run time. When it is None the
+        #: strategy falls back to fixed `lot_dollars` lots — the old behaviour — so a caller
+        #: that has not been taught to fetch it keeps working unchanged.
+        self.capital_allocation = (None if capital_allocation is None
+                                   else float(capital_allocation))
+        self.deploy_fraction = float(deploy_fraction)
+        self.max_weight = float(max_weight)
+        self.vol_lookback = int(vol_lookback)
 
     def _yf_ohlc(self):
         raise NotImplementedError
 
-    def _targets(self, data) -> dict:
+    def _selected(self, data) -> set:
+        """Which names the signal wants to hold. Sizing is not the signal's business."""
         raise NotImplementedError
+
+    def _targets(self, data) -> dict:
+        """Selection -> share counts, sized against the live allocation."""
+        held = set(self._selected(data))
+        if self.capital_allocation is None:
+            dollars = {t: self.lot_dollars for t in held}
+        else:
+            dollars = inverse_vol_sizing(
+                data, held, self.capital_allocation * self.deploy_fraction,
+                max_weight=self.max_weight, vol_lookback=self.vol_lookback)
+
+        out, rounded_out = {}, []
+        for t, df in data.items():
+            price = float(df["close"].iloc[-1])
+            d = dollars.get(t, 0.0)
+            shares = int(d / price) if d > 0 and price > 0 else 0
+            if d > 0 and shares == 0:
+                # Selected, but its risk-weighted share of the allocation does not buy one
+                # share. Reported rather than left to look like the signal skipped it.
+                rounded_out.append(f"{t} (${d:,.0f} < 1 share @ ${price:,.2f})")
+            out[t] = shares
+        if rounded_out:
+            print(f"  note: selected but sized to zero — {', '.join(rounded_out)}")
+        return out
 
     def generate_intents(self) -> list:
         data = self._ohlc_fn()
@@ -81,16 +155,12 @@ class OvernightVolSurgeStrategy(_EquityBase):
                 data[t] = df[["open", "high", "low", "close", "volume"]]
         return data
 
-    def _targets(self, data):
+    def _selected(self, data):
         if self.phase == "exit":
-            return {t: 0 for t in data}
-        out = {}
-        for t, df in data.items():
-            v = df["volume"]
-            price = float(df["close"].iloc[-1])
-            surge = len(v) >= 20 and v.iloc[-1] > self.surge_mult * v.iloc[-20:].mean()
-            out[t] = round(self.lot_dollars / price) if surge else 0
-        return out
+            return set()
+        return {t for t, df in data.items()
+                if len(df["volume"]) >= 20
+                and df["volume"].iloc[-1] > self.surge_mult * df["volume"].iloc[-20:].mean()}
 
 
 class OrbBreakoutStrategy(_EquityBase):
@@ -115,10 +185,10 @@ class OrbBreakoutStrategy(_EquityBase):
                 data[t] = df[["open", "high", "low", "close", "volume"]]
         return data
 
-    def _targets(self, data):
-        out = {}
+    def _selected(self, data):
+        held = set()
         for t, df in data.items():
             buy, sell = orb_breakout_signal(df)
-            held = int(held_state(buy, sell).iloc[-1])
-            out[t] = round(self.lot_dollars / float(df["close"].iloc[-1])) if held else 0
-        return out
+            if int(held_state(buy, sell).iloc[-1]):
+                held.add(t)
+        return held
