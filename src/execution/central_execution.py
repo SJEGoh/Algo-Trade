@@ -156,6 +156,12 @@ class CentralExecutor(EClient, EWrapper):
         self._startup_degraded = False   # True if startup reconciliation never succeeded
         self._flatten_retry_ts: Dict[str, float] = {}  # strat -> last flatten retry (ensure_flat)
         self._readonly_retries: Dict[str, int] = {}    # symbol -> read-only retries this episode
+        # --- commissions ------------------------------------------------------------------
+        # IB reports each fee separately from, and normally after, its execution. These let
+        # the fee find the strategies the fill was booked to, in the same proportions.
+        self._exec_alloc: Dict[str, dict] = {}         # execId -> {symbol, parts, net}
+        self._early_commissions: Dict[str, object] = {}  # execId -> report that beat its fill
+        self._commissions_applied: set = set()         # execIds already charged
         self._daily_baseline: Optional[float] = None  # portfolio equity baseline for the circuit breaker
         self._circuit_broken = False
         self.coordinator = None   # NettingCoordinator (net-pooling); set by server lifespan
@@ -952,6 +958,7 @@ class CentralExecutor(EClient, EWrapper):
                     sub_side, execution.price, abs(sub_qty),
                     sid, expected_price=order_info.get("expected_price"),
                 )
+            self._remember_execution(execution.execId, contract.symbol, attributed, net=True)
             self._check_fill_sanity("__net__", contract.symbol, execution.price, order_info.get("expected_price"))
             # Include the strategies this fill was attributed to, not just the ones with a
             # desired book: after a lost/reset netting.json `desired` is empty, which
@@ -971,10 +978,88 @@ class CentralExecutor(EClient, EWrapper):
             order_info.get("strategy_id", "unknown"),
             expected_price=order_info.get("expected_price"),
         )
+        self._remember_execution(execution.execId, contract.symbol,
+                                 [(strategy_id, signed_qty)], net=False)
         self._check_fill_sanity(strategy_id, contract.symbol, execution.price, order_info.get("expected_price"))
         self.enforce_drawdown(strategy_id, self.ledger.strategy_realized_pnl.get(strategy_id, 0.0))  # halt+flatten on breach
         self.ledger.save_state(self.logger_db)  # persist after every fill
         logger.info("ExecDetails - %s %s %s @ %s", contract.symbol, execution.side, execution.shares, execution.price)
+
+    # ------------------------------------------------------------------
+    # Commissions
+    # ------------------------------------------------------------------
+    #: IB fills unknown doubles with DBL_MAX (1.797e308) — for a commission not yet
+    #: computed, and for realizedPNL on an opening trade. Never a real fee.
+    _IB_UNSET_THRESHOLD = 1e300
+
+    def _remember_execution(self, exec_id: str, symbol: str, parts, net: bool) -> None:
+        """Record how an execution was booked across strategies, so its commission is charged
+        to the same strategies in the same proportions. Applies a commission that arrived
+        before this fill did."""
+        self._exec_alloc[exec_id] = {"symbol": symbol, "net": net,
+                                     "parts": [(sid, float(qty)) for sid, qty in parts]}
+        early = self._early_commissions.pop(exec_id, None)
+        if early is not None:
+            self._apply_commission(early)
+
+    def commissionReport(self, commissionReport) -> None:
+        """IB's commission for one execution, keyed by execId.
+
+        Nothing handled this before, so every figure the executor reported — realized P&L,
+        cash, NAV, the P&L the drawdown halts read — was gross of fees."""
+        if commissionReport.execId not in self._exec_alloc:
+            # Reported before the fill was booked. Hold it; _remember_execution applies it.
+            self._early_commissions[commissionReport.execId] = commissionReport
+            return
+        self._apply_commission(commissionReport)
+
+    def _apply_commission(self, report) -> None:
+        import math
+
+        exec_id = report.execId
+        if exec_id in self._commissions_applied:
+            return                          # replayed (e.g. after a reconnect) — already charged
+        fee = report.commission
+        if fee is None or not math.isfinite(fee) or abs(fee) >= self._IB_UNSET_THRESHOLD:
+            # IB's placeholder. Not marked applied, so a real report for the same execution
+            # that follows still gets charged.
+            logger.debug("commission for %s not yet known (%r)", exec_id, fee)
+            return
+        alloc = self._exec_alloc.pop(exec_id, None)
+        if alloc is None:
+            return
+        self._commissions_applied.add(exec_id)
+        currency = (report.currency or "USD").upper()
+
+        if currency != "USD":
+            # The ledger is dollar-denominated and there is no FX rate here. Deducting a EUR
+            # amount as dollars would be quietly wrong, so store it and say so instead.
+            self.logger_db.log_commission(exec_id, fee, currency)
+            logger.warning("commission %.4f %s on %s is not USD — stored on the fill but NOT "
+                           "deducted from P&L", fee, currency, alloc["symbol"])
+            return
+
+        # Split by traded quantity. A pooled fill booked s1 +100 and s2 -60 from a 40-share
+        # execution: IB charged for 40 shares, and each side bears it in proportion to what
+        # it was booked.
+        parts = alloc["parts"] or [("__net__", 1.0)]
+        gross = sum(abs(q) for _sid, q in parts)
+        shares = ([(sid, fee * abs(q) / gross) for sid, q in parts] if gross > 0
+                  else [(parts[0][0], fee)])
+
+        for sid, amount in shares:
+            self.ledger.apply_fee(sid, amount)
+        self.logger_db.log_commission(exec_id, fee, currency)
+        if alloc["net"]:
+            for i, (sid, amount) in enumerate(shares):
+                self.logger_db.log_commission(f"{exec_id}-attr-{sid}-{i}", amount, currency)
+
+        # A fee can be what tips a strategy over its limit; check it the way a fill would.
+        for sid, _amount in shares:
+            self.enforce_drawdown(sid, self.ledger.strategy_realized_pnl.get(sid, 0.0))
+        self.ledger.save_state(self.logger_db)
+        logger.info("commission %.4f %s on %s charged to %s", fee, currency, alloc["symbol"],
+                    ", ".join(f"{sid}:{amount:.4f}" for sid, amount in shares))
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float) -> None:
         # write to the LEDGER's broker_positions, not a local copy

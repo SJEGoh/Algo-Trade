@@ -47,9 +47,16 @@ def build_summary():
                     # signed so a positive number always means "worse than expected"
                     sign = 1 if str(f.get("side", "")).upper().startswith("B") else -1
                     slip = f"  slip {sign * (px - exp) / exp * 100:+.2f}%"
+                fee = (f"  fee ${f['commission']:,.2f}"
+                       if f.get("commission") is not None else "")
                 L.append(f"  {et(f.get('filled_at'))}  {str(f.get('side','?')).upper()} "
                          f"{abs(f.get('quantity', 0)):g} {f.get('symbol','?')} "
-                         f"@ ${px or 0:,.2f}  [{f.get('strategy_id','?')}]{slip}")
+                         f"@ ${px or 0:,.2f}  [{f.get('strategy_id','?')}]{slip}{fee}")
+            day_fees = sum(f["commission"] for f in today if f.get("commission") is not None)
+            unreported = sum(1 for f in today if f.get("commission") is None)
+            L.append(f"  fees today: ${day_fees:,.2f}"
+                     + (f" ({unreported} fill(s) with no commission reported yet)"
+                        if unreported else ""))
             L.append("  note: pooled fills booked to __net__ are filtered out by /fills")
     except Exception as e:
         L.append(f"  ⚠️ Could not fetch fills: {e}")
@@ -58,7 +65,8 @@ def build_summary():
     L.append("")
     L.append("\U0001f4b0 REALIZED P&L (cumulative)")
     try:
-        strat, fixture, internal = pnl_sections(get("/pnl").get("realized_pnl", {}))
+        pnl_body = get("/pnl")
+        strat, fixture, internal = pnl_sections(pnl_body.get("realized_pnl", {}))
         for sid, val in strat:
             L.append(f"  {sid}: {money(val)}")
         if not strat:
@@ -66,6 +74,13 @@ def build_summary():
         total = sum(v for _s, v in strat)
         emoji = "\U0001f7e2" if total >= 0 else "\U0001f534"
         L.append(f"  ── {emoji} Strategies: {money(total)}")
+        fees = {s: v for s, v in (pnl_body.get("fees") or {}).items() if v}
+        if fees:
+            strat_fees = sum(v for s, v in fees.items() if is_strategy(s))
+            # The figures above are already net of these. Stated so a reader does not
+            # subtract them a second time.
+            L.append(f"  fees paid (already deducted above): ${strat_fees:,.2f} strategies, "
+                     f"${sum(fees.values()):,.2f} total")
         if fixture:
             L.append("  fixtures: " + ", ".join(f"{s} {money(v)}" for s, v in fixture))
         if internal:

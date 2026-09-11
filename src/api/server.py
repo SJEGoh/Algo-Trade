@@ -404,7 +404,10 @@ def get_orphans():
 
 @app.get("/pnl")
 def get_pnl():
-    return {"realized_pnl": dict(executor.ledger.strategy_realized_pnl)}
+    # realized_pnl is NET of commissions — apply_fee deducts them as IB reports them — and
+    # `fees` is the running total deducted, so gross trading P&L is realized + fees.
+    return {"realized_pnl": dict(executor.ledger.strategy_realized_pnl),
+            "fees": dict(getattr(executor.ledger, "strategy_fees", {}) or {})}
 
 
 @app.get("/equity")

@@ -237,3 +237,4 @@ build.log
 .DS_Store
 
 venv_algotrade/
+test.ipynb

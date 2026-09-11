@@ -22,6 +22,9 @@ class PositionLedger:
         self.strategy_positions: Dict[str, Dict[str, float]] = {}
         self.strategy_avg_cost: Dict[str, Dict[str, float]] = {}
         self.strategy_realized_pnl: Dict[str, float] = {}  # Phase 3 addition
+        #: strat -> cumulative commissions. Already deducted from realized P&L and cash by
+        #: apply_fee; tallied separately so fees stay visible instead of dissolving into P&L.
+        self.strategy_fees: Dict[str, float] = {}
         self._positions_ready = threading.Event()
         self._lock = threading.Lock()
         self.strategy_pending: Dict[str, Dict[str, float]] = {}
@@ -149,6 +152,21 @@ class PositionLedger:
         with self._lock:
             self._attribute_fill(symbol, signed_qty, price, strat_id)
 
+    def apply_fee(self, strat_id: str, amount: float) -> None:
+        """Charge a commission to a strategy: out of its cash AND its realized P&L.
+
+        Both, so  nav == starting_cash + realized + unrealized  still holds. From cash alone,
+        NAV would disagree with P&L by every fee paid; from P&L alone, NAV would overstate by
+        the same amount. And because the drawdown checks read realized P&L, a fee now counts
+        toward a halt — which matters most on a tight limit, where fees can be most of it."""
+        if not amount:
+            return
+        with self._lock:
+            self.strategy_cash[strat_id] = self._cash(strat_id) - amount
+            self.strategy_realized_pnl[strat_id] = (
+                self.strategy_realized_pnl.get(strat_id, 0.0) - amount)
+            self.strategy_fees[strat_id] = self.strategy_fees.get(strat_id, 0.0) + amount
+
     def _attribute_fill(self, symbol: str, signed_qty: float, price: float, strat_id: str) -> None:
         strat_pos = self.strategy_positions.setdefault(strat_id, {})
         strat_cost = self.strategy_avg_cost.setdefault(strat_id, {})
@@ -230,6 +248,12 @@ class PositionLedger:
             logger_db.save_realized_pnl(dict(self.strategy_realized_pnl))
             logger_db.save_multipliers(dict(self.multipliers))
             logger_db.save_strategy_cash(dict(self.strategy_cash), dict(self.starting_cash))
+            # getattr: logger backends that predate fee tracking still save everything else.
+            # The fees are already inside the realized P&L and cash persisted above, so all a
+            # missing method loses is the separate tally, not the money.
+            save_fees = getattr(logger_db, "save_strategy_fees", None)
+            if save_fees:
+                save_fees(dict(self.strategy_fees))
 
     def restore_state(self, logger_db) -> None:
         """Reload per-strategy positions, avg costs, realized P&L, and multipliers
@@ -239,10 +263,13 @@ class PositionLedger:
         realized = logger_db.load_realized_pnl()
         multipliers = logger_db.load_multipliers()
         cash, basis = logger_db.load_strategy_cash()
+        load_fees = getattr(logger_db, "load_strategy_fees", None)
+        fees = load_fees() if load_fees else {}
         with self._lock:
             self.strategy_positions = positions
             self.strategy_avg_cost = avg_cost
             self.strategy_realized_pnl = realized
+            self.strategy_fees = dict(fees)
             self.multipliers.update(multipliers)
             # Cash survives restarts; a strategy with no saved row keeps the basis seeded
             # from config (a newly added strategy starts fully in cash).

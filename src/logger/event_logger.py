@@ -43,6 +43,7 @@ class EventLogger:
         # CREATE TABLE IF NOT EXISTS statements above, ALTER TABLE must never be able to
         # stop the executor from starting.
         self._has_nav_cols = self._migrate_equity_nav_columns()
+        self._has_fee_cols = self._migrate_fill_fee_columns()
 
     def _create_tables(self) -> None:
         with self._lock:
@@ -109,6 +110,13 @@ class EventLogger:
                 CREATE TABLE IF NOT EXISTS strategy_pnl (
                     strategy_id TEXT PRIMARY KEY,
                     realized    REAL NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
+                -- Cumulative commissions per strategy. Already deducted from strategy_pnl and
+                -- strategy_cash; kept so fees can be seen separately from trading P&L.
+                CREATE TABLE IF NOT EXISTS strategy_fees (
+                    strategy_id TEXT PRIMARY KEY,
+                    fees        REAL NOT NULL,
                     updated_at  TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS halted_strategies (
@@ -198,6 +206,41 @@ class EventLogger:
                      "(dashboard will rebase); retried on next restart")
         return False
 
+    #: Added to `fills` after the first release. NULL on older rows — "unknown", not "free".
+    FEE_COLUMNS = {"commission": "REAL", "commission_currency": "TEXT"}
+
+    def _migrate_fill_fee_columns(self, attempts: int = 3, delay: float = 1.0) -> bool:
+        """Add commission / commission_currency to an existing fills table.
+
+        NEVER fatal, for the same reason as the NAV migration: a concurrent writer holding the
+        lock would otherwise stop the executor starting. Without the columns fees are still
+        charged to P&L and cash; they just are not stored per fill. Retried next restart."""
+        for attempt in range(1, attempts + 1):
+            try:
+                with self._lock:
+                    cols = {r[1] for r in self._conn.execute("PRAGMA table_info(fills)")}
+                    missing = [c for c in self.FEE_COLUMNS if c not in cols]
+                    if not missing:
+                        return True
+                    for col in missing:
+                        self._conn.execute(
+                            f"ALTER TABLE fills ADD COLUMN {col} {self.FEE_COLUMNS[col]}")
+                    self._conn.commit()
+                logger.info("fills migrated: added %s", ", ".join(missing))
+                return True
+            except Exception as e:
+                logger.warning("fills fee migration attempt %d/%d failed: %s",
+                               attempt, attempts, e)
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                if attempt < attempts:
+                    time.sleep(delay)
+        logger.error("fills fee migration failed — fees still reach P&L, but are not stored "
+                     "per fill; retried on next restart")
+        return False
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -239,6 +282,16 @@ class EventLogger:
                (order_id, exec_id, symbol, side, price, expected_price, quantity, strategy_id, filled_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (order_id, exec_id, symbol, side, price, expected_price, quantity, strategy_id, self._now()),
+        )
+
+    def log_commission(self, exec_id: str, commission: float, currency: str) -> None:
+        """Attach a commission to a fill that is already logged. IB reports commissions
+        separately from — and after — the execution, so the row exists first."""
+        if not getattr(self, "_has_fee_cols", False):
+            return
+        self._execute(
+            "UPDATE fills SET commission = ?, commission_currency = ? WHERE exec_id = ?",
+            (float(commission), currency, exec_id),
         )
 
     def log_reconciliation(self, matched: bool, discrepancies: dict) -> None:
@@ -293,20 +346,21 @@ class EventLogger:
         }
 
     def get_recent_fills(self, limit: int = 50) -> list:
-        """Most-recent fills first, for the dashboard fills/slippage panel."""
+        """Most-recent fills first, for the dashboard fills/slippage panel. Includes the
+        commission when the fee columns exist (NULL until IB reports it)."""
+        cols = ["order_id", "exec_id", "symbol", "side", "price",
+                "expected_price", "quantity", "strategy_id", "filled_at"]
+        if getattr(self, "_has_fee_cols", False):
+            cols += list(self.FEE_COLUMNS)
         try:
             with self._lock:
                 rows = self._conn.execute(
-                    "SELECT order_id, exec_id, symbol, side, price, expected_price, "
-                    "quantity, strategy_id, filled_at "
-                    "FROM fills ORDER BY fill_id DESC LIMIT ?",
+                    f"SELECT {', '.join(cols)} FROM fills ORDER BY fill_id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         except Exception as e:
             logger.error("EventLogger get_recent_fills failed: %s", e)
             return []
-        cols = ["order_id", "exec_id", "symbol", "side", "price",
-                "expected_price", "quantity", "strategy_id", "filled_at"]
         return [dict(zip(cols, r)) for r in rows]
 
     def log_equity(self, ts, strategy_id, realized, unrealized, equity,
@@ -363,6 +417,21 @@ class EventLogger:
                 self._conn.commit()
         except Exception as e:
             logger.error("save_realized_pnl failed: %s", e)
+
+    def save_strategy_fees(self, strategy_fees: dict) -> None:
+        now = self._now()
+        try:
+            with self._lock:
+                for sid, fees in strategy_fees.items():
+                    self._conn.execute(
+                        "INSERT INTO strategy_fees (strategy_id, fees, updated_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(strategy_id) DO UPDATE SET fees = excluded.fees, "
+                        "updated_at = excluded.updated_at",
+                        (sid, float(fees), now),
+                    )
+                self._conn.commit()
+        except Exception as e:
+            logger.error("save_strategy_fees failed: %s", e)
 
     def save_strategy_cash(self, strategy_cash: dict, starting_cash: dict) -> None:
         """Snapshot every strategy's cash position + capital basis."""
@@ -521,6 +590,16 @@ class EventLogger:
             logger.error("load_realized_pnl failed: %s", e)
             return {}
         return {sid: pnl for sid, pnl in rows}
+
+    def load_strategy_fees(self) -> dict:
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT strategy_id, fees FROM strategy_fees").fetchall()
+        except Exception as e:
+            logger.error("load_strategy_fees failed: %s", e)
+            return {}
+        return {sid: fees for sid, fees in rows}
 
     def load_halted_strategies(self) -> set:
         try:

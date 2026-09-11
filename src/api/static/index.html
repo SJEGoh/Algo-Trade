@@ -381,6 +381,7 @@ function renderRecentFills() {
       { label: "Expected", cls: () => "dim", get: r => num(r.expected_price, 2) },
       { label: "Slip", cls: r => signClass(slip(r) ?? 0), get: r => { const s = slip(r); return s == null ? "\u2014" : (s > 0 ? "+" : "") + s.toFixed(2); } },
       { label: "bps", cls: r => signClass(bps(r) ?? 0), get: r => { const b = bps(r); return b == null ? "\u2014" : (b > 0 ? "+" : "") + b.toFixed(0); } },
+      { label: "Fee", cls: () => "dim", get: r => (r.commission == null ? "\u2014" : "$" + num(r.commission, 2)) },
       { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
     ], rows);
   });
@@ -439,6 +440,7 @@ function renderFills() {
       { label: "Expected", cls: () => "dim", get: r => num(r.expected_price, 2) },
       { label: "Slip", cls: r => signClass(slip(r) ?? 0), get: r => { const s = slip(r); return s == null ? "—" : (s > 0 ? "+" : "") + s.toFixed(2); } },
       { label: "bps", cls: r => signClass(bps(r) ?? 0), get: r => { const b = bps(r); return b == null ? "—" : (b > 0 ? "+" : "") + b.toFixed(0); } },
+      { label: "Fee", cls: () => "dim", get: r => (r.commission == null ? "\u2014" : "$" + num(r.commission, 2)) },
       { label: "Strategy", cls: () => "dim", get: r => r.strategy_id },
     ], rows);
   });
