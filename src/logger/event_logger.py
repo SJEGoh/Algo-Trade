@@ -155,6 +155,15 @@ class EventLogger:
                     created_at         TEXT NOT NULL,
                     created_by         TEXT
                 );
+                -- Stop-loss / take-profit / trailing-stop rules and same-session re-entry
+                -- lockouts (risk/exit_rules.py). One row holding the whole state, because a
+                -- trailing stop's high-water mark must survive a restart — lose it and the
+                -- trail silently resets to the entry price.
+                CREATE TABLE IF NOT EXISTS exit_state (
+                    id         INTEGER PRIMARY KEY CHECK (id = 1),
+                    state      TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
                 -- Trade/decision journal: every signal, weight, and rebalance decision
                 CREATE TABLE IF NOT EXISTS decision_journal (
@@ -530,6 +539,22 @@ class EventLogger:
             self._conn.execute("DELETE FROM runtime_strategies WHERE strategy_id = ?",
                                (strategy_id,))
             self._conn.commit()
+
+    def save_exit_state(self, state_json: str) -> None:
+        """Raises on failure — ExitManager reports it, since rules that are not saved do not
+        survive a restart."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO exit_state (id, state, updated_at) VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET state = excluded.state, "
+                "updated_at = excluded.updated_at",
+                (state_json, self._now()))
+            self._conn.commit()
+
+    def load_exit_state(self):
+        with self._lock:
+            row = self._conn.execute("SELECT state FROM exit_state WHERE id = 1").fetchone()
+        return row[0] if row else None
 
     def save_halted_strategies(self, halted: set, active: set, config_keys: set, reason: str = "") -> None:
         """Save which strategies are halted (= in config but NOT in the active set)."""

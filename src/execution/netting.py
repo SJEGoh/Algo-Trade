@@ -187,8 +187,12 @@ class NettingCoordinator:
         return out
 
     # ---------------- book updates ----------------
-    def set_target(self, sid, symbol, qty, instrument=None, price=None):
-        """Incremental: set ONE symbol's target for a strategy, then re-net it."""
+    def set_target(self, sid, symbol, qty, instrument=None, price=None, urgent: bool = False):
+        """Incremental: set ONE symbol's target for a strategy, then re-net it.
+
+        urgent=True sends the resulting order at market, past ATR and any other execution
+        layer — for system exits (stops, trailing stops) that must close now, not rest as a
+        limit waiting for a pullback that is the very move the stop is getting out of."""
         with self._lock:
             if not self.ex.risk_manager.is_active(sid):
                 return {"accepted": False, "reason": f"{sid} not active"}
@@ -212,7 +216,7 @@ class NettingCoordinator:
                     book[symbol] = prev
                 return rejection
             self._save()
-            rebal = self._rebalance({symbol})
+            rebal = self._rebalance({symbol}, urgent=urgent)
             return {"accepted": True, **rebal}
 
     def submit_book(self, sid, intents):

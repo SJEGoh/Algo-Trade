@@ -150,6 +150,13 @@ GLOBAL = {
     # total-equity drawdown check SKIP that strategy for the cycle (realized fast path still runs).
     "mark_staleness_sec": 120.0,
 
+    # Stop-loss / take-profit / trailing-stop checks (risk/exit_rules.py): how often every name
+    # with an armed exit is re-priced from IB, and the oldest mark an exit may act on. The age
+    # allows one missed sample and no more — a failed fetch carries the last price forward, and
+    # acting on an old one fires a stop the market has left, or misses one it just crossed.
+    "exit_check_sec": 30.0,
+    "exit_mark_max_age_sec": 65.0,
+
     # Auto-reconnect to IB on an unexpected disconnect (then reconcile + recover open orders).
     "auto_reconnect": True,
     "reconnect_max_attempts": 30,

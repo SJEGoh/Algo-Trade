@@ -138,10 +138,21 @@ class FakeClient(ExecutorClient):
         self.submitted = None
         self.journalled = []
 
+    #: what the strategy's book holds once its orders fill — AAPL at Strat's target below.
+    #: (Not called `holdings`: that is a method on the real client this class extends.)
+    held_after_fill = {"AAPL": 10.0}
+
     def _request(self, method, path, **kw):
         if path == "/orders/acks":
             return self.ack_sequence.pop(0) if len(self.ack_sequence) > 1 \
                 else self.ack_sequence[0]
+        if path == "/strategies/s1/book":
+            return {"strategy_id": "s1",
+                    "book": [{"symbol": "CASH", "quantity": 0.0, "is_cash": True}]
+                    + [{"symbol": sym, "quantity": q, "is_cash": False}
+                       for sym, q in self.held_after_fill.items()]}
+        if path == "/pnl":
+            return {"realized_pnl": {"s1": -1.0}, "fees": {"s1": 1.0}}
         raise AssertionError(f"unexpected {method} {path}")
 
     def preflight(self): return {"market_open": True}

@@ -16,14 +16,16 @@ from client.remote_strategy import RemoteStrategy, StrategyError
 class FakeClient:
     """Stands in for ExecutorClient, recording what the framework asked it to do."""
 
-    def __init__(self, health=None, capital=100_000.0, fail=None, ack="live"):
+    def __init__(self, health=None, capital=100_000.0, fail=None, ack="live", fill="filled"):
         self.base_url = "http://executor:8000"
         self._health = health or {"connected": True, "killed": False, "market_open": True}
         self._capital = capital
         self._fail = fail
         self._ack = ack          # what the BROKER says about the orders, not the executor
+        self._fill = fill        # whether the strategy's book then reaches its targets
         self.submitted = []
         self.journalled = []
+        self.fill_calls = []
         self.preflighted = False
 
     def preflight(self):
@@ -49,6 +51,16 @@ class FakeClient:
         bucket = {"live": [], "rejected": [], "pending": []}
         bucket[self._ack] = list(order_ids)
         return {**bucket, "acks": {str(i): {"ack": self._ack} for i in order_ids}}
+
+    def wait_for_fills(self, targets, order_ids=(), authoritative=True, timeout=60.0,
+                       poll=2.0, strategy_id=None):
+        self.fill_calls.append({"targets": dict(targets), "authoritative": authoritative})
+        if self._fill == "filled":
+            return {"filled": sorted(targets), "unfilled": {}, "reason": None,
+                    "working_order_ids": []}
+        return {"filled": [],
+                "unfilled": {s: {"target": float(q), "held": 0.0} for s, q in targets.items()},
+                "reason": "not filled within 60s", "working_order_ids": list(order_ids)}
 
     def submit_orders(self, book):
         self.submitted.append(("orders", book))

@@ -51,14 +51,15 @@ if __name__ == "__main__":
 ```
 
 `run()` then does, in order: preflight → `should_run()` → allocation lookup → your
-`generate_book()` → `validate()` → `POST /targets` → `on_submitted()` → journal entry.
+`generate_book()` → `validate()` → `POST /targets` → `on_submitted()` → wait for the broker's
+acknowledgement → wait for fills → journal entry (with both outcomes).
 
 Optional hooks: `describe(book)` (the journal one-liner — record *why*), `journal_detail(book)`
 (scores, weights), `should_run(health)`, `on_submitted(result)`.
 Class attributes: `mode` (`"book"` → `/targets`, `"orders"` → one `POST /orders` per intent),
 `require_market_open`, `dry_run_capital` (or the `DRY_RUN_CAPITAL` env var).
 
-## The five things that actually bite
+## The things that actually bite
 
 **1. The book is authoritative.** `/targets` takes the strategy's ENTIRE desired book. Any
 symbol you stop mentioning is CLOSED. This is the property that makes re-running safe and
@@ -80,18 +81,32 @@ the multiplier — a 1000x understatement on CL sails straight past the allocati
 rejected as "not active". See *Adding a strategy* below — you no longer need to edit config.py
 and restart.
 
-**5. Exit codes are the interface to cron.** `0` submitted and confirmed by the broker,
-`1` the executor refused (config or risk — fix the caller, retrying won't help), `2`
-unreachable, which means the orders did **NOT** go in and a Telegram alert has already fired,
-`3` the executor took the orders but IB never acknowledged them. Never collapse 2 or 3 into
-"probably fine" — those failure modes are exactly what `ExecutorClient` exists to surface.
+**5. Exit codes are the interface to cron.** `0` submitted, confirmed and filled; `1` the
+executor refused (config or risk — fix the caller, retrying won't help); `2` unreachable, so
+the orders did **NOT** go in and a Telegram alert has already fired; `3` the executor took the
+orders but IB never acknowledged them; `4` IB acknowledged them but the book did not reach its
+targets in time. Never collapse 2, 3 or 4 into "probably fine" — each is a run that looks
+clean from one step earlier.
 
-**6. "Accepted" is the executor's word, not the broker's.** `POST /orders` returning
-`accepted: true` means the order reached the socket. A gateway in read-only mode refuses
-every order while submissions still come back clean, so `run()` polls `GET /orders/acks`
-until each order is `live` or `rejected`. The same field splits the dashboard: `GET /orders`
-returns confirmed orders in `orders` and everything still unanswered in `unacknowledged`,
-with IB's reason attached.
+**6. Accepted, acknowledged and filled are three different things.** `accepted: true` from
+`POST /orders` or `/targets` means the order reached the socket. `ack: live` from
+`GET /orders/acks` means IB has it — but a resting or cancelled order is also `live`. Only the
+strategy's own book says it traded: the executor moves a strategy's position solely when an
+order that strategy owns fills, so `run()` polls `holdings()` until it matches the targets.
+Don't use a pooled order's `filled` count for this — it covers every strategy the order was
+for. Realized P&L from `/pnl` is net of commissions; `fees` is what was deducted.
+
+**7. Exits are optional, per name, and enforced by the executor.**
+`self.intent(..., stop_pct=0.03)`, `trail_pct=0.05`, `take_profit_pct=0.08` — or the
+`stop_price` / `take_profit_price` / `trail_amount` forms — in any combination, or none. On
+the wire (curl, `ExecutorClient` directly) it is `"exits": {"stop_pct": 0.03}` on the intent.
+`client.exits()` shows each armed exit and the price it fires at. Send
+them WITH the entry: `*_pct` is measured from the average cost the executor records from the
+fills. Each submission replaces that name's exits, so leaving them out of the next book
+removes them. Armed names are re-priced from IB every 30s and nothing rests at IB (a
+rebalance would cancel a resting stop). A hit closes the name at market, skipping ATR and any
+other execution layer, and blocks re-entry in the same direction until
+the next session; `run()` expects a blocked name flat. One invalid exit refuses the whole book.
 
 ## Adding a strategy id
 
@@ -122,15 +137,20 @@ Existing ids worth knowing: `test_suite_small_alloc` ($1k cap — use this for s
 |---|---|---|
 | `GET /health` | – | `connected`, `killed`, `market_open`, `startup_degraded` |
 | `GET /strategies/{id}/allocation` | – | the capital to size against |
-| `GET /strategies/{id}/book` | – | the strategy's current desired book |
-| `GET /positions` `/pnl` `/equity` `/fills` | – | state |
+| `GET /strategies/{id}/book` | – | this strategy's holdings and cash — moves only on its own fills |
+| `GET /positions` `/equity` `/fills` | – | state; fills carry `commission` |
+| `GET /pnl` | – | `realized_pnl` (net of fees) and `fees` |
 | `GET /resolve_front/{symbol}?exchange=` | – | front-month futures contract |
 | `POST /targets` | key | the whole book, absolute — **use this** |
 | `POST /orders` | key | one intent (a domain rejection is HTTP 200 + `accepted:false`) |
 | `GET /orders/acks?ids=` | – | did the BROKER take these orders? `live` / `rejected` / `pending` |
+| `GET /pending` | – | shares the executor still expects, and whether working orders explain them |
+| `GET /exposure` | – | bucketed exposure, and the hedge that would be placed |
 | `GET /positions/orphans` | – | broker positions no strategy claims |
 | `POST /journal` | key | decision record |
 | `POST /strategies` | key | register a new strategy id |
+| `GET /exits?strategy_id=` | – | armed exits with trigger levels, and today's re-entry lockouts |
+| `DELETE /exits/{id}/{symbol}` | key | remove a name's exits and lift its lockout |
 
 `ExecutorClient` ([client/executor_client.py](client/executor_client.py)) wraps all of these,
 retries connection errors / timeouts / 502-503-504, never retries a 4xx, and alerts Telegram
@@ -143,7 +163,7 @@ source client/env.sh
 python3 client/local_strategy.py --dry-run                     # no executor contact at all
 python3 client/local_strategy.py --symbol AAPL --notional 500  # a real $500 order
 python3 client/local_strategy.py --symbol AAPL --flat          # close it
-./venv_algotrade/bin/python -m pytest tests/ -q                # 451 tests, ~9s
+./venv_algotrade/bin/python -m pytest tests/ -q                # ~700 tests, ~9s
 ```
 
 Do the open/close cycle on `test_suite_small_alloc` from any new machine before pointing

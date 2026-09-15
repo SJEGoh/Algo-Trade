@@ -14,8 +14,9 @@ from execution.central_execution import CentralExecutor, is_market_open
 from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
-from config import CONFIG, validate_config
+from config import CONFIG, GLOBAL, validate_config
 from portfolio import hedger
+from risk.exit_rules import ExitManager, ExitSpecError, parse_exits
 
 import threading
 import time
@@ -86,7 +87,11 @@ async def _startup(app: FastAPI):
     executor._alerter = alerter  # give executor access for read-only probe Telegram alerts
     recon = executor.start(host=IB_HOST, port=IB_PORT, client_id=SERVER_CLIENT_ID)
     executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
+    executor.exit_manager = ExitManager(executor, alert=_alert,
+                                        max_mark_age=GLOBAL.get("exit_mark_max_age_sec"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
+    threading.Thread(target=_exit_sampler, args=(float(GLOBAL.get("exit_check_sec", 30.0)),),
+                     daemon=True, name="exit-checks").start()
     app.state.startup_reconciliation = recon
     _last_reconcile.update({
         "matched": recon.get("matched") if isinstance(recon, dict) else recon,
@@ -123,9 +128,85 @@ def require_api_key(x_api_key: str = Header(default = "")) -> None:
 class KillRequest(BaseModel):
     flatten: bool = True
 
+def _plan_exits(sid: str, intents: list):
+    """Validate every intent's `exits` and apply same-session re-entry lockouts, BEFORE
+    anything is submitted. Returns (plan, blocked, refusal):
+
+      plan     {symbol: (target, spec, sec_type)} — what to arm once the submission is taken
+      blocked  {symbol: lockout} — intents rewritten IN PLACE to target 0
+      refusal  a rejection to return instead of submitting, or None
+
+    Fails closed on the whole submission: arming some of a book's stops and not others would
+    leave the strategy believing names are protected that are not."""
+    em = getattr(executor, "exit_manager", None)
+    plan, blocked, problems = {}, {}, []
+    for it in intents:
+        inst = it.get("instrument") or {}
+        sym = inst.get("symbol")
+        raw = it.get("exits")
+        try:
+            target = float(it.get("target_quantity"))
+        except (TypeError, ValueError):
+            target = None                     # the schema / coordinator refuses this one
+        if raw is not None and em is None:
+            problems.append(f"{sym}: exits sent but the exit manager is not running — "
+                            "they would not be enforced")
+            continue
+        try:
+            price = it.get("expected_price")
+            spec = parse_exits(raw, target, price if price is not None else it.get("limit_price"))
+        except ExitSpecError as e:
+            problems.append(f"{sym}: {e}")
+            continue
+        if em is not None and target:
+            lock = em.blocked(sid, sym, target)
+            if lock is not None:
+                blocked[sym] = lock
+                it["target_quantity"] = 0
+                target, spec = 0.0, None
+        plan[sym] = (target or 0.0, spec, inst.get("sec_type", "STK"))
+    if problems:
+        return plan, blocked, {"accepted": False,
+                               "reason": "invalid exits, nothing submitted: " + "; ".join(problems)}
+    return plan, blocked, None
+
+
+def _is_noop(result) -> bool:
+    return isinstance(result, dict) and str(result.get("reason", "")).startswith("no-op")
+
+
 @app.post("/orders", dependencies = [Depends(require_api_key)])
 def submit_order(intent: dict):
+    em = getattr(executor, "exit_manager", None)
+    exits = intent.pop("exits", None)
+    sid = intent.get("strategy_id")
+    sym = (intent.get("instrument") or {}).get("symbol")
+    plan, blocked = None, {}
+    if intent.get("intent_type") == "target_position":
+        probe = {"instrument": intent.get("instrument"), "exits": exits,
+                 "target_quantity": intent.get("target_quantity"),
+                 "expected_price": intent.get("expected_price"),
+                 "limit_price": intent.get("limit_price")}
+        plan, blocked, refusal = _plan_exits(sid, [probe])
+        if refusal:
+            return refusal
+        if sym in blocked:
+            intent["target_quantity"] = 0
+    elif exits is not None:
+        return {"accepted": False, "reason": "exits need an absolute target — send "
+                "intent_type target_position with target_quantity"}
+    elif em is not None and intent.get("side") in ("buy", "sell"):
+        lock = em.blocked(sid, sym, 1 if intent["side"] == "buy" else -1)
+        if lock is not None:
+            return {"accepted": False, "exits_blocked": {sym: lock},
+                    "reason": f"exit lockout: {sym} hit its {lock['kind']} this session — "
+                              f"a {intent['side']} would re-enter it"}
+
     result = executor.process_intent(intent)
+    if plan is not None and em is not None and (result.get("accepted") or _is_noop(result)):
+        em.set(sid, sym, *plan[sym])
+    if blocked:
+        result["exits_blocked"] = blocked
     # Alert order submission to orders topic
     if result.get("accepted"):
         symbol = intent.get("instrument", {}).get("symbol", "?")
@@ -144,6 +225,7 @@ class TargetRequest(BaseModel):
     quantity: float
     instrument: Optional[dict] = None
     price: Optional[float] = None
+    exits: Optional[dict] = None
 
 
 def _pool_preflight(is_future_only: bool) -> None:
@@ -164,10 +246,20 @@ def set_target(req: TargetRequest):
     coordinator re-nets and trades the account to the pooled net. Exit = quantity 0."""
     _fut = (req.instrument or {}).get("sec_type", "STK") == "FUT"
     _pool_preflight(_fut)
+    probe = {"instrument": {**(req.instrument or {}), "symbol": req.symbol},
+             "target_quantity": req.quantity, "expected_price": req.price, "exits": req.exits}
+    plan, blocked, refusal = _plan_exits(req.strategy_id, [probe])
+    if refusal:
+        return refusal
     result = executor.coordinator.set_target(
-        req.strategy_id, req.symbol, req.quantity,
+        req.strategy_id, req.symbol, probe["target_quantity"],
         instrument=req.instrument, price=req.price,
     )
+    em = getattr(executor, "exit_manager", None)
+    if em is not None and isinstance(result, dict) and result.get("accepted"):
+        em.set(req.strategy_id, req.symbol, *plan[req.symbol])
+    if isinstance(result, dict) and blocked:
+        result["exits_blocked"] = blocked
     crosses = result.get("internal_crosses", []) if isinstance(result, dict) else []
     cross_note = ""
     if crosses:
@@ -191,7 +283,18 @@ def submit_book(body: dict):
     fut_only = bool(intents) and all(
         (it.get("instrument") or {}).get("sec_type", "STK") == "FUT" for it in intents)
     _pool_preflight(fut_only)
+    plan, blocked, refusal = _plan_exits(sid, intents)
+    if refusal:
+        return refusal
     result = executor.coordinator.submit_book(sid, intents)
+    em = getattr(executor, "exit_manager", None)
+    if isinstance(result, dict):
+        accepted = bool(result.get("accepted"))
+        if em is not None and accepted:
+            em.replace_book(sid, plan)        # authoritative, exits included
+        result["exits"] = {"armed": sorted(s for s, (_q, spec, _t) in plan.items()
+                                           if spec and accepted),
+                           "blocked": blocked}
     orders = result.get("orders", []) if isinstance(result, dict) else []
     crosses = result.get("internal_crosses", []) if isinstance(result, dict) else []
     msg_parts = []
@@ -214,6 +317,8 @@ def submit_book(body: dict):
     n_orders = len(orders)
     n_crosses = len(crosses)
     summary = f"Book resync: {n_intents} intents, {n_orders} orders, {n_crosses} internal crosses"
+    if blocked:
+        summary += f", {len(blocked)} held flat by exit lockout ({', '.join(sorted(blocked))})"
     syms = list({it.get("instrument", {}).get("symbol", "?") for it in intents})
     import json as _json
     executor.logger_db.log_decision(
@@ -222,6 +327,33 @@ def submit_book(body: dict):
         symbols=syms,
     )
     return result
+
+
+@app.get("/exits")
+def get_exits(strategy_id: Optional[str] = None):
+    """Armed exits with their current trigger levels, and today's re-entry lockouts."""
+    em = getattr(executor, "exit_manager", None)
+    if em is None:
+        return {"enabled": False, "rules": {}, "lockouts": {}}
+    marks = {**_last_equity.get("marks", {}), **em.last_marks}   # the exit loop's are fresher
+    return {"enabled": True, **em.snapshot(marks, strategy_id)}
+
+
+@app.delete("/exits/{strategy_id}/{symbol}", dependencies=[Depends(require_api_key)])
+def clear_exit(strategy_id: str, symbol: str):
+    """Remove a name's exit rules AND lift its lockout — the manual override for a lockout
+    that should not stand (a stop hit on a bad print, say)."""
+    em = getattr(executor, "exit_manager", None)
+    if em is None:
+        raise HTTPException(status_code=503, detail="exit manager not initialised")
+    out = em.clear(strategy_id, symbol)
+    if not any(out.values()):
+        raise HTTPException(status_code=404,
+                            detail=f"no exit rule or lockout for {strategy_id} {symbol}")
+    executor.logger_db.log_decision(strategy_id, "exit",
+                                    f"exit rules/lockout for {symbol} cleared by hand: {out}",
+                                    symbols=[symbol])
+    return out
 
 
 @app.get("/net")
@@ -964,6 +1096,46 @@ def _equity_sampler(interval: float = 60.0):
             else:
                 log.error("equity sampler error (%d in a row): %s", _sampler_failures[0], e)
         _sampler_stop.wait(interval)   # sleep, wakes early on stop
+
+
+_exit_failures = [0]
+_EXIT_FAIL_ALERT_AFTER = 3
+_EXIT_FAIL_REALERT_EVERY = 60       # ~30 minutes at the default cadence
+
+
+def _check_exits() -> list:
+    """One exit pass: re-price every name with an armed exit straight from IB, then check.
+
+    Its own loop rather than a step in the equity sampler: exits run at their own, faster
+    cadence without doubling the equity history, and a failure in one cannot skip the other.
+    Runs even with nothing to price — lockout expiry and retries of closes that did not take
+    need no marks."""
+    em = getattr(executor, "exit_manager", None)
+    if em is None:
+        return []
+    symbols = em.watched_symbols()
+    marks = executor.get_marks(symbols) if symbols else {}
+    return em.check(marks, market_open=is_market_open())
+
+
+def _exit_sampler(interval: float = 30.0):
+    log = logging.getLogger("executor")
+    while not _sampler_stop.is_set():
+        started = time.monotonic()
+        try:
+            _check_exits()
+            _exit_failures[0] = 0
+        except Exception as e:
+            _exit_failures[0] += 1
+            n = _exit_failures[0]
+            if n == _EXIT_FAIL_ALERT_AFTER or (
+                    n > _EXIT_FAIL_ALERT_AFTER and n % _EXIT_FAIL_REALERT_EVERY == 0):
+                log.critical("EXIT CHECKS FAILING (%d in a row) — stop-losses, take-profits and "
+                             "trailing stops are NOT being enforced: %s", n, e)
+            else:
+                log.error("exit check failed (%d in a row): %s", n, e)
+        # a fixed cadence: a slow price fetch shortens the wait rather than stretching the cycle
+        _sampler_stop.wait(max(1.0, interval - (time.monotonic() - started)))
 
 
 def _enforce(log, snap: dict) -> None:

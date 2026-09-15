@@ -20,6 +20,21 @@ So this client:
   * fails LOUDLY: when it gives up it raises, and it can alert Telegram directly — the one
     channel that still works when the executor is the thing that's down.
 
+Stops, take-profits and trailing stops
+--------------------------------------
+Optional, per name. Put an `exits` object on the intent with any combination of
+
+    stop_price | stop_pct   take_profit_price | take_profit_pct   trail_amount | trail_pct
+
+(one of each pair; `*_pct` is a fraction of the strategy's average cost, 0.03 = 3%):
+
+    {"instrument": {...}, "target_quantity": 78, "expected_price": 319.97,
+     "exits": {"stop_pct": 0.03, "trail_pct": 0.05}}
+
+The executor enforces them — re-pricing every 30s and closing at market — and each
+submission replaces that name's exits. `RemoteStrategy.intent(..., stop_pct=0.03)` builds
+the object for you; `exits()` shows what is armed. The full rules are in client/README.md.
+
 Environment
 -----------
     EXECUTOR_URL        e.g. http://127.0.0.1:8000 (through a tunnel) — required
@@ -169,6 +184,52 @@ class ExecutorClient:
     def resolve_front(self, symbol: str, exchange: str = "NYMEX") -> dict:
         return self._request("GET", f"/resolve_front/{symbol}", params={"exchange": exchange})
 
+    def fills(self, limit: int = 50) -> dict:
+        """GET /fills — recent fills, each with its commission once IB has reported it."""
+        return self._request("GET", "/fills", params={"limit": limit})
+
+    def orders(self) -> dict:
+        return self._request("GET", "/orders")
+
+    def pending(self) -> dict:
+        """GET /pending — shares the executor still expects, and whether working orders
+        explain them. `unexplained` should be empty."""
+        return self._request("GET", "/pending")
+
+    def exposure(self, **policy) -> dict:
+        """GET /exposure — bucketed exposure, and the hedge that would be placed."""
+        return self._request("GET", "/exposure", params=policy or None)
+
+    def orphans(self) -> dict:
+        return self._request("GET", "/positions/orphans")
+
+    def strategies(self) -> dict:
+        return self._request("GET", "/strategies")
+
+    def strategy_status(self, strategy_id: str = None) -> dict:
+        return self._request("GET", f"/strategies/{self._sid(strategy_id)}/status")
+
+    def net(self) -> dict:
+        return self._request("GET", "/net")
+
+    def holdings(self, strategy_id: str = None) -> dict:
+        """symbol -> quantity this strategy actually HOLDS, cash left out.
+
+        Built from the strategy's book, which the executor moves only when an order owned by
+        this strategy fills — so this is the fill-confirmed position, not what was asked for."""
+        rows = (self.book(strategy_id) or {}).get("book", [])
+        return {r["symbol"]: float(r.get("quantity") or 0.0) for r in rows
+                if not r.get("is_cash") and float(r.get("quantity") or 0.0) != 0.0}
+
+    def strategy_pnl(self, strategy_id: str = None) -> dict:
+        """This strategy's realized P&L. `realized` is NET of commissions — the executor
+        deducts each fee as IB reports it — and `gross` adds them back."""
+        sid = self._sid(strategy_id)
+        body = self.pnl() or {}
+        realized = float((body.get("realized_pnl") or {}).get(sid, 0.0))
+        fees = float((body.get("fees") or {}).get(sid, 0.0))
+        return {"realized": realized, "fees": fees, "gross": realized + fees}
+
     def preflight(self) -> dict:
         """Check before generating a book: is the executor there, connected, and accepting?
 
@@ -187,32 +248,51 @@ class ExecutorClient:
     # ------------------------------------------------------------------ writes
     def submit_order(self, intent: dict) -> dict:
         """POST /orders. A domain rejection comes back as {"accepted": false, "reason": ...}
-        with HTTP 200 — that is the executor deciding, so it is RETURNED, not raised."""
+        with HTTP 200 — that is the executor deciding, so it is RETURNED, not raised.
+
+        `exits` may ride on an absolute-target intent (`target_quantity`) to arm a stop /
+        take-profit / trail for that name; the executor refuses them on a side+quantity
+        delta, which has no target to protect."""
         intent = dict(intent)
         intent.setdefault("strategy_id", self._sid(intent.get("strategy_id")))
         intent.setdefault("client_order_id", self.new_client_order_id(
             intent["strategy_id"], (intent.get("instrument") or {}).get("symbol", "x")))
         intent.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
         intent.setdefault("schema_version", "1.0")
+        # The executor's schema REQUIRES intent_type and order_type, and RemoteStrategy.intent()
+        # sets neither — so every order posted in orders mode failed validation and came back
+        # as a quiet {"accepted": false}. A target_quantity means an absolute target.
+        intent.setdefault("intent_type",
+                          "target_position" if "target_quantity" in intent else "delta")
+        intent.setdefault("order_type", "market")
+        intent.setdefault("time_in_force", "day")
         result = self._request("POST", "/orders", auth=True, json=intent)
-        if not result.get("accepted", True):
+        if not result.get("accepted", True) and not self.is_noop(result):
             log.warning("order rejected: %s", result.get("reason"))
         return result
+
+    @staticmethod
+    def is_noop(result: dict) -> bool:
+        """A target the book already meets is refused as `no-op: ...` — nothing to do, which
+        is not the executor saying no."""
+        return (not result.get("accepted", True)
+                and str(result.get("reason", "")).startswith("no-op"))
 
     def submit_orders(self, intents: list) -> dict:
         """Submit many intents, returning a summary instead of stopping at the first no.
 
         An unreachable executor still raises — that is not a per-order outcome, it means
         the rest of the book will not go in either."""
-        submitted, rejected = [], []
+        submitted, rejected, noop = [], [], []
         for intent in intents:
             result = self.submit_order(intent)
             symbol = (intent.get("instrument") or {}).get("symbol")
-            (submitted if result.get("accepted", True) else rejected).append(
-                {"symbol": symbol, **result})
+            bucket = (noop if self.is_noop(result)
+                      else submitted if result.get("accepted", True) else rejected)
+            bucket.append({"symbol": symbol, **result})
         if rejected:
             log.warning("%d of %d intents were rejected", len(rejected), len(intents))
-        return {"submitted": submitted, "rejected": rejected,
+        return {"submitted": submitted, "rejected": rejected, "noop": noop,
                 "ok": len(submitted), "refused": len(rejected)}
 
     def set_target(self, symbol: str, quantity: float, instrument: dict = None,
@@ -225,12 +305,33 @@ class ExecutorClient:
     def submit_book(self, intents: list, strategy_id: str = None) -> dict:
         """POST /targets — the authoritative whole book. Any name you stop mentioning gets
         closed, so this self-heals drift and is the right call for a remote strategy: one
-        request, absolute targets, safe to repeat."""
+        request, absolute targets, safe to repeat.
+
+        Authoritative for exits too: an intent's `exits` replace that name's rules, and a
+        name sent without them has none. One unenforceable exit refuses the whole book."""
         return self._request("POST", "/targets", auth=True, json={
             "strategy_id": self._sid(strategy_id),
-            "intents": [{"instrument": i["instrument"],
-                         "target_quantity": i["target_quantity"],
-                         "expected_price": i.get("expected_price")} for i in intents]})
+            "intents": [self._book_entry(i) for i in intents]})
+
+    @staticmethod
+    def _book_entry(intent: dict) -> dict:
+        # Built field by field so nothing unexpected rides along — which once meant `exits`
+        # was dropped here, and a strategy's stops never reached the executor.
+        entry = {"instrument": intent["instrument"],
+                 "target_quantity": intent["target_quantity"],
+                 "expected_price": intent.get("expected_price")}
+        if intent.get("exits"):
+            entry["exits"] = intent["exits"]
+        return entry
+
+    def exits(self, strategy_id: str = None) -> dict:
+        """GET /exits — this strategy's armed stop / take-profit / trailing rules with their
+        current trigger levels, and any names locked out of re-entry today."""
+        return self._request("GET", "/exits", params={"strategy_id": self._sid(strategy_id)})
+
+    def clear_exit(self, symbol: str, strategy_id: str = None) -> dict:
+        """DELETE /exits/{id}/{symbol} — drop a name's exit rules and lift its lockout."""
+        return self._request("DELETE", f"/exits/{self._sid(strategy_id)}/{symbol}", auth=True)
 
     # ------------------------------------------------------------------ acknowledgement
     @staticmethod
@@ -285,6 +386,78 @@ class ExecutorClient:
             log.error("order %s was never acknowledged by IB after %.0fs — it may not "
                       "exist at the broker", oid, timeout)
         return result
+
+    #: Order statuses that can no longer produce a fill.
+    FINAL_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive",
+                                "Reconciled_Stale"})
+
+    def wait_for_fills(self, targets: dict, order_ids: list = (), authoritative: bool = True,
+                       timeout: float = 60.0, poll: float = 2.0,
+                       strategy_id: str = None) -> dict:
+        """Block until this strategy's HOLDINGS match `targets`, or it is clear they won't.
+
+        Acknowledgement is not a fill. An order IB has accepted can rest unfilled, be cancelled
+        (a later rebalance replaces it; the end-of-day sweep removes it) or fill only in part —
+        and a cancelled order still reads as acknowledged. So this watches the one thing that
+        answers "did it trade": the strategy's own book, which the executor moves only when an
+        order owned by this strategy fills. A pooled order's `filled` count would be the wrong
+        thing to watch — it covers every strategy the order was for.
+
+        `authoritative=True` (book mode): a name held but missing from `targets` must reach
+        zero, because /targets closes it. Stops early once no order is left working, since
+        waiting longer cannot change the answer.
+
+        Returns {"filled": [...], "unfilled": {symbol: {"target", "held"}}, "reason",
+        "working_order_ids"}; `reason` is None when everything reached target.
+        """
+        sid = self._sid(strategy_id)
+        order_ids = list(order_ids or [])
+        deadline = time.time() + timeout
+        reason, working, want, unfilled = None, [], {}, {}
+        while True:
+            held = self.holdings(sid)
+            want = {sym: float(q) for sym, q in targets.items()}
+            if authoritative:
+                for sym in held:
+                    want.setdefault(sym, 0.0)
+            unfilled = {sym: {"target": q, "held": held.get(sym, 0.0)}
+                        for sym, q in want.items() if abs(held.get(sym, 0.0) - q) > 1e-6}
+            if not unfilled:
+                reason, working = None, []
+                break
+            if not order_ids:
+                reason = "no order was placed to close the gap"
+                break
+            acks = (self.acks(order_ids) or {}).get("acks", {})
+            working = [oid for oid in order_ids
+                       if (acks.get(str(oid)) or {}).get("ack") != "rejected"
+                       and (acks.get(str(oid)) or {}).get("status") not in self.FINAL_STATUSES]
+            if not working:
+                reason = "every order ended without reaching the target"
+                break
+            if time.time() >= deadline:
+                reason = f"not filled within {timeout:.0f}s"
+                break
+            time.sleep(min(poll, max(0.0, deadline - time.time())))
+
+        for sym, gap in unfilled.items():
+            log.error("%s %s: holding %g, target %g — %s",
+                      sid, sym, gap["held"], gap["target"], reason)
+        return {"filled": sorted(s for s in want if s not in unfilled), "unfilled": unfilled,
+                "reason": reason, "working_order_ids": working}
+
+    def add_strategy(self, strategy_id: str, capital_allocation: float, max_drawdown: float,
+                     starting_cash: float = None, created_by: str = "client") -> dict:
+        """POST /strategies — put a new strategy id on the executor's allowlist at runtime."""
+        body = {"strategy_id": strategy_id, "capital_allocation": capital_allocation,
+                "max_drawdown": max_drawdown, "created_by": created_by}
+        if starting_cash is not None:
+            body["starting_cash"] = starting_cash
+        return self._request("POST", "/strategies", auth=True, json=body)
+
+    def remove_strategy(self, strategy_id: str) -> dict:
+        """DELETE /strategies/{id} — the executor refuses while the strategy holds anything."""
+        return self._request("DELETE", f"/strategies/{strategy_id}", auth=True)
 
     def journal(self, event_type: str, summary: str, detail: str = "",
                 symbols: list = None, strategy_id: str = None) -> dict:

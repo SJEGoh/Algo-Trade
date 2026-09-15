@@ -673,8 +673,10 @@ class CentralExecutor(EClient, EWrapper):
                 self._price_results[reqId] = price
                 self._pending_price_reqs[reqId].set()   # unblock the waiting pull
 
-    def fetch_price(self, symbol: str, exchange: str = "SMART", timeout: float = 3.0) -> Optional[float]:
-        contract = self.get_stock_contract(symbol, exchange=exchange)
+    def fetch_price(self, symbol: str, exchange: str = "SMART", timeout: float = 3.0,
+                    contract: Contract = None) -> Optional[float]:
+        if contract is None:
+            contract = self.get_stock_contract(symbol, exchange=exchange)
 
         with self._order_id_lock:  # reuse a lock to hand out unique market-data reqIds
             self._mkt_data_req_id += 1
@@ -783,7 +785,11 @@ class CentralExecutor(EClient, EWrapper):
         def _one(sym):
             px = None
             try:
-                px = self.fetch_price(sym, timeout=timeout)   # concurrent, unique reqIds
+                contract = self._mark_contract(sym)
+                if contract is None:
+                    px = self.fetch_price(sym, timeout=timeout)   # concurrent, unique reqIds
+                else:
+                    px = self.fetch_price(sym, timeout=timeout, contract=contract)
             except Exception as e:
                 logger.warning("mark fetch failed for %s: %s", sym, e)
             with self._mark_lock:
@@ -796,6 +802,21 @@ class CentralExecutor(EClient, EWrapper):
         for t in threads: t.start()
         for t in threads: t.join(timeout=timeout + 1.0)
         return results
+
+    def _mark_contract(self, symbol: str) -> Optional[Contract]:
+        """The contract to price a FUTURES symbol with, or None to price it as a stock.
+
+        Every mark used to be requested as a stock, so a futures position got no mark at all:
+        its unrealized drawdown check skipped and its stops could never fire. The instrument
+        comes from the executor's own orders, or — after a restart, before any order — from
+        the netting coordinator's persisted state."""
+        inst = self._instruments.get(symbol) or (
+            getattr(getattr(self, "coordinator", None), "instrument", None) or {}).get(symbol)
+        if not inst or inst.get("sec_type", "STK") != "FUT":
+            return None
+        return self.get_future_contract(
+            symbol, exchange=inst.get("exchange", "NYMEX"),
+            last_trade_date=inst.get("last_trade_date"), multiplier=inst.get("multiplier"))
 
     def _reference_price(self, resolved_intent: dict) -> float:
         # limit orders: the limit price is the reference
@@ -1212,9 +1233,11 @@ class CentralExecutor(EClient, EWrapper):
             self._whatif_events.pop(oid, None)
             self._whatif.pop(oid, None)
 
-    def mark_is_fresh(self, symbol: str) -> bool:
-        """True if we have a mark for `symbol` no older than GLOBAL['mark_staleness_sec']."""
-        max_age = GLOBAL.get("mark_staleness_sec")
+    def mark_is_fresh(self, symbol: str, max_age: float = None) -> bool:
+        """True if we have a mark for `symbol` no older than `max_age` seconds — by default
+        GLOBAL['mark_staleness_sec']. Exits pass a tighter limit of their own."""
+        if max_age is None:
+            max_age = GLOBAL.get("mark_staleness_sec")
         if max_age is None:
             return symbol in self._mark_cache
         with self._mark_lock:

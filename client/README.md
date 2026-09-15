@@ -106,6 +106,10 @@ Hooks worth overriding: `describe()` (the journal line — record *why*), `journ
 Set `mode = "orders"` to post each intent to `/orders` individually instead of submitting a
 pooled book. Use `ExecutorClient` directly if you want none of this.
 
+Stops, take-profits and trailing stops are keyword arguments on the same call —
+`self.intent("AAPL", 78, 319.97, stop_pct=0.03, trail_pct=0.05)` — see
+[Stops, take-profits and trailing stops](#stops-take-profits-and-trailing-stops) below.
+
 ## Scheduling
 
 Nothing here schedules anything — use cron or a systemd timer on the strategy host. The
@@ -113,21 +117,138 @@ exit codes are meant for that:
 
 | code | meaning |
 |---|---|
-| `0` | submitted **and confirmed by the broker** (or deliberately skipped) |
+| `0` | submitted, confirmed by the broker **and filled** (or deliberately skipped) |
 | `1` | the executor refused, or the book was invalid |
 | `2` | executor unreachable — orders did **not** go in, Telegram already alerted |
-| `3` | the executor took the orders, **IB did not** — see below |
+| `3` | the executor took the orders, **IB did not** |
+| `4` | IB acknowledged the orders, but the book did **not** reach its targets in time |
 
-Code `3` is the one worth understanding. A submission returning `accepted: true` only means
-the executor handed the order to the socket; whether IB accepted it is a separate question.
-A gateway in read-only mode refuses every order while submissions still come back clean, so
-`run()` polls `/orders/acks` after submitting and will not report success until the broker
-has confirmed. Set `confirm_with_broker = False` to opt out, or raise `ack_timeout`
-(default 30s) for a slow gateway.
+Codes `3` and `4` are the ones worth understanding: each is a run that looks fine from one
+step earlier.
+
+**`3` — the broker refused.** A submission returning `accepted: true` only means the executor
+handed the order to the socket. A gateway in read-only mode refuses every order while
+submissions still come back clean, so `run()` polls `/orders/acks` and will not report success
+until IB has answered. `confirm_with_broker = False` opts out; `ack_timeout` (default 30s)
+sets the wait.
+
+**`4` — acknowledged, not filled.** IB taking an order is not the order trading. It can rest
+unfilled, be cancelled by a later rebalance or the end-of-day sweep, or fill in part — and a
+cancelled order still reads as acknowledged. So once the broker has answered, `run()` waits for
+the strategy's **own book** to reach its targets. That is the right thing to watch: the
+executor moves a strategy's position only when an order that strategy owns fills, whereas a
+pooled order's fill count covers every strategy it was for. In book mode a name you dropped
+must reach zero. The wait stops early once no order is left working. `fill_timeout` (default
+60s) sets it; a strategy that works resting limit orders should raise it or set
+`confirm_fills = False`.
+
+Realized P&L is **net of commissions** — the executor deducts each fee as IB reports it.
+`client.strategy_pnl()` returns `realized`, `fees` and `gross`, and `run()` logs them.
 
 ```cron
 35 15 * * 1-5  cd /home/ubuntu/strategy && ./venv/bin/python client/example_remote_strategy.py
 ```
+
+## Reading the executor's state
+
+Everything the strategy host can see, on `ExecutorClient`:
+
+| method | endpoint | what |
+|---|---|---|
+| `holdings()` | `/strategies/{id}/book` | this strategy's positions — they move only on its own fills |
+| `strategy_pnl()` | `/pnl` | realized P&L net of fees, the fees, and gross |
+| `acks(ids)`, `wait_for_acks()` | `/orders/acks` | did the broker take these orders |
+| `wait_for_fills(targets, ids)` | book + acks | did the book actually reach its targets |
+| `pending()` | `/pending` | shares the executor still expects, and whether working orders explain them |
+| `fills()`, `orders()` | `/fills`, `/orders` | recent fills (with commission) and working orders |
+| `exposure()`, `orphans()` | `/exposure`, `/positions/orphans` | bucketed exposure; positions no strategy claims |
+| `strategies()`, `strategy_status()` | `/strategies` | allocations and halt state |
+| `add_strategy()`, `remove_strategy()` | `POST` / `DELETE /strategies` | register a strategy id at runtime (needs the key) |
+| `exits()` | `/exits` | armed stops / take-profits / trails, their trigger levels, today's lockouts |
+| `clear_exit(symbol)` | `DELETE /exits/{id}/{symbol}` | drop a name's exits and lift its lockout (needs the key) |
+
+`mode = "orders"` posts each intent to `/orders`, and the client fills in the `intent_type` and
+`order_type` the executor requires. A target the book already meets comes back as a no-op and
+is not counted as a refusal; a real refusal — of one intent, or of a whole book — makes the run
+exit `1`.
+
+## Stops, take-profits and trailing stops
+
+Optional, per name, in any combination — or none:
+
+```python
+self.intent("AAPL", 78, 319.97, stop_pct=0.03)                        # stop only
+self.intent("NVDA", 40, 181.20, trail_pct=0.05)                       # trailing only
+self.intent("MSFT", 20, 505.10, stop_price=490, take_profit_pct=0.08) # both
+```
+
+| field | fires when, for a long (mirrored for a short) |
+|---|---|
+| `stop_price` / `stop_pct` | price falls to the level |
+| `take_profit_price` / `take_profit_pct` | price rises to the level |
+| `trail_amount` / `trail_pct` | price falls that far from its best mark since entry |
+
+`*_pct` values are fractions (`0.03` = 3%) of this strategy's **average cost**, which the
+executor records from the actual fills. So send exits **with the entry** — there is no need to
+wait for the fill to know where "3% below my fill" is, and waiting leaves the position
+unprotected for however long that takes.
+
+**Without `self.intent()`** — `ExecutorClient` directly, or anything that speaks HTTP — it is
+one more key on the intent:
+
+```python
+client.submit_book([
+    {"instrument": {"symbol": "AAPL", "asset_class": "equity",
+                    "sec_type": "STK", "exchange": "SMART"},
+     "target_quantity": 78, "expected_price": 319.97,
+     "exits": {"stop_pct": 0.03, "trail_pct": 0.05}},
+])
+```
+
+In orders mode the same object goes on a `target_position` intent posted to `/orders`; it is
+refused on a `side` + `quantity` delta, which has no target to protect.
+
+**Moving an exit after the fill.** Exits are resent with every book, so a later run can tighten
+them. The strategy's book carries its average cost:
+
+```python
+def generate_book(self, capital):
+    price = latest_price("AAPL")
+    held = {r["symbol"]: r for r in self.client.book()["book"] if not r.get("is_cash")}
+    exits = {"trail_pct": 0.05}
+    cost = (held.get("AAPL") or {}).get("avg_cost")
+    if cost and price > cost * 1.05:
+        exits["stop_price"] = cost            # up 5%: never let it turn into a loss
+    return [self.intent("AAPL", 78, price, **exits)]
+```
+
+**Checking what is armed.** `client.exits()` returns each name's rule, the position and average
+cost it is protecting, and `levels` — the price each exit fires at right now (a `*_pct` level
+appears once the name has filled; a trail's once it has been priced). Names that already
+exited today are under `lockouts`.
+
+How it behaves:
+
+- **Each submission replaces that name's exits.** Resend them to keep them, change them to move
+  them (a stop to breakeven, a tighter trail), leave them out to remove them. A trail keeps its
+  best mark when resent.
+- **The executor enforces them; nothing rests at IB.** A resting stop would be cancelled by
+  the next rebalance, and on a pooled position it would close other strategies' shares. Every
+  name with an armed exit is **re-priced from IB every 30 seconds** (equities only while the
+  market is open), and a price more than 65 seconds old is never acted on. A hit sets this
+  strategy's target for the name to zero and closes it with a **market order that skips ATR
+  and every other execution layer** — an exit left resting as a limit is not an exit. It is
+  journalled and posted to Telegram. Not tick-by-tick, so a fast gap can fill past the level,
+  and nothing is protected while the executor is down.
+- **Re-entry in the same direction is blocked for the rest of the session** (ET date).
+  Otherwise a strategy that still likes the name buys it straight back and the stop achieved
+  nothing. The book may keep asking for it; the executor holds it flat, reports it under
+  `exits.blocked`, and `run()` expects it flat rather than exiting `4`. The opposite direction
+  is allowed. `client.clear_exit("AAPL")` lifts a lockout by hand.
+- **One unenforceable exit refuses the whole submission** — an unknown field, both forms of
+  one kind, a percentage of 1 or more, a price stop already on the wrong side of the price.
+  `validate()` catches these before anything is sent.
+- Exits need an absolute target: book mode, or `intent_type: target_position` in orders mode.
 
 ## Proving the path before you trust it
 

@@ -29,6 +29,13 @@ class MomentumStrategy(RemoteStrategy):
     TOP_N = 4
     LOOKBACK_DAYS = 20
 
+    # Optional exits, enforced by the executor (client/README.md). Each is a fraction of the
+    # average cost, and None leaves that exit off — the defaults arm nothing, because this
+    # template submits as a live strategy id. e.g. STOP_PCT = 0.08, TRAIL_PCT = 0.05.
+    STOP_PCT = None
+    TAKE_PROFIT_PCT = None
+    TRAIL_PCT = None
+
     def generate_book(self, capital):
         import yfinance as yf
 
@@ -42,9 +49,14 @@ class MomentumStrategy(RemoteStrategy):
         # Every watchlist name is listed, with 0 for the ones we don't want. The book is
         # authoritative either way, but saying it explicitly puts "evaluated and rejected"
         # in the journal instead of silence.
+        # Exits go out WITH the entry — the executor measures the percentages from the fill,
+        # and resending them each run keeps a trailing stop's high. On a 0 target they are
+        # ignored.
         return [self.intent(symbol, int(per_name // float(bars[symbol].iloc[-1]))
                             if symbol in winners else 0,
-                            round(float(bars[symbol].iloc[-1]), 2))
+                            round(float(bars[symbol].iloc[-1]), 2),
+                            stop_pct=self.STOP_PCT, take_profit_pct=self.TAKE_PROFIT_PCT,
+                            trail_pct=self.TRAIL_PCT)
                 for symbol in self.WATCHLIST]
 
     def describe(self, book):

@@ -228,6 +228,7 @@ run_vecm.py
 
 ROADMAP.md
 KNOWN_ISSUES.md
+VNC.md
 
 # Deploy / infra
 ibgateway_compose/.env
