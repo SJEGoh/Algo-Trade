@@ -1,0 +1,123 @@
+name: algo-trade
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    env_file:
+      - ibgateway_compose/.env
+    volumes:
+      - ./ibgateway_compose/tws_settings:/config
+    ports:
+      - "127.0.0.1:4002:4004"
+      - "127.0.0.1:5901:5900"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/4004' 2>/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  executor:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      IB_HOST: ib-gateway
+      IB_PORT: 4004
+    ports:
+      - "0.0.0.0:8000:8000"
+    volumes:
+      - algo_db:/app/db
+      - algo_logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+  scheduler:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      executor:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      EXECUTOR_URL: http://executor:8000
+    healthcheck:
+      disable: true
+    command: ["bash", "-c", "while true; do python tools/day_scheduler.py; echo \"[$(date)] scheduler exited, sleeping until next day...\"; sleep 21600; done"]
+
+  # Read-only public front for the dashboard: forwards only the GETs the dashboard makes (see
+  # Caddyfile). Loopback-only here; Tailscale Funnel publishes it on :8443.
+  dashboard-proxy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - executor
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      disable: true
+
+  # Telegram control + watchdog. Deliberately a SEPARATE container: a bug here can't touch
+  # the process talking to IB, and it stays up to report the executor being down.
+  # depends_on is service_started, NOT service_healthy — a bot that waits for a healthy
+  # executor can't tell you the executor never became healthy.
+  telegram-control:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      executor:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      EXECUTOR_URL: http://executor:8000
+      TELEGRAM_STATE_PATH: /app/state/telegram_offset.json
+      # Replies go to the orders topic by default (TELEGRAM_THREAD_ORDERS). To move them:
+      # set TELEGRAM_CONTROL_THREAD to a thread id, to "here" (reply in the topic the
+      # command came from), or to "general" — here or in .env.
+      # TELEGRAM_CONTROL_THREAD: here
+    volumes:
+      - algo_control:/app/state
+    healthcheck:
+      disable: true
+    command: ["python", "tools/telegram_control.py"]
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      IB_HOST: ib-gateway
+      IB_PORT: 4004
+    volumes:
+      - algo_db_test:/app/db
+
+volumes:
+  algo_db:
+  algo_logs:
+  algo_db_test:
+  algo_control:   # telegram update offset — kept off the executor's DB volume
