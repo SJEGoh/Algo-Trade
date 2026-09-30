@@ -1,0 +1,28 @@
+# Read-only public front for the dashboard (docker compose service `dashboard-proxy`).
+#
+# Published with Tailscale Funnel on a port of its own, so the tailnet URL on 443 keeps going
+# straight to the executor for remote strategies:
+#     sudo tailscale funnel --bg --https=8443 8080     -> https://<host>.<tailnet>.ts.net:8443
+#     sudo tailscale funnel --https=8443 off           -> take it down
+#
+# Only the GETs the dashboard makes are forwarded. Everything else — /kill, /flatten, POST
+# /orders, /targets, /strategies writes, and every read the dashboard doesn't use — is a 404
+# here, whatever headers it carries. Paths match exactly: GET /orders passes, /orders/acks
+# does not. Add a path when the dashboard starts fetching a new endpoint.
+#
+# To require a password, generate a hash with `docker run --rm caddy:2 caddy hash-password`
+# and add inside the handle block:
+#     basic_auth {
+#         viewer <hash>
+#     }
+
+:8080 {
+	@dashboard {
+		method GET HEAD
+		path / /static/* /health /strategies /pnl /pnl/history /positions /orders /fills /equity /reconcile/status
+	}
+	handle @dashboard {
+		reverse_proxy executor:8000
+	}
+	respond 404
+}
