@@ -37,8 +37,56 @@ BASE_URL = os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8000")
 API_KEY = os.environ.get("EXECUTOR_API_KEY")
 STRATEGY_ID = "cross_sectional_momentum"
 
-UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA",
-            "JPM", "XOM", "JNJ", "PG", "KO", "WMT"]
+# S&P 500 constituents from SPY's holdings file (State Street, as of 29-Sep-2026).
+# Left out: BRK.B and BF.B (IB spells them 'BRK B' / 'BF B' and nothing maps them yet),
+# and the second share class of GOOGL / FOXA / NWSA (same company, same momentum).
+UNIVERSE = [
+    "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "AVGO", "META", "MU", "TSLA", "AMD", "LLY", "JPM",
+    "XOM", "JNJ", "V", "INTC", "WMT", "ABBV", "MA", "PLTR", "CSCO", "COST", "AMAT", "LRCX",
+    "CVX", "CAT", "MRK", "BAC", "PG", "UNH", "KO", "GE", "PANW", "PM", "NFLX", "HD",
+    "CRWD", "GS", "TXN", "KLAC", "GEV", "SNDK", "RTX", "TMO", "WFC", "ORCL", "MRVL", "MS",
+    "AMGN", "C", "LIN", "ANET", "APH", "IBM", "STX", "QCOM", "ADI", "VZ", "GILD", "CRM",
+    "DIS", "PEP", "ABT", "DE", "ETN", "WELL", "T", "MCD", "PFE", "WDC", "DELL", "UNP",
+    "SCHW", "AXP", "NEE", "BLK", "COP", "BA", "TJX", "ISRG", "UBER", "DHR", "NOW", "VRTX",
+    "BMY", "PLD", "GLW", "NEM", "PH", "PGR", "BKNG", "COF", "SPGI", "CB", "MO", "VLO",
+    "CVS", "MDT", "MPC", "SBUX", "FTNT", "ACN", "LOW", "LMT", "ADP", "FCX", "MCK", "PSX",
+    "EQIX", "TT", "BNY", "PWR", "SYK", "SO", "VRT", "CME", "ADBE", "HOOD", "HWM", "JCI",
+    "DDOG", "USB", "CDNS", "DUK", "PNC", "EMR", "CEG", "CSX", "MMM", "LITE", "BE", "BX",
+    "ICE", "ELV", "GD", "WMB", "APP", "MRSH", "HPE", "SNPS", "TMUS", "WBD", "AMT", "MAR",
+    "WM", "CMCSA", "TRV", "MRNA", "SHW", "ROST", "MDLZ", "SLB", "MSI", "REGN", "EOG", "INTU",
+    "CI", "HLT", "CMI", "TGT", "GM", "DASH", "UPS", "NSC", "ECL", "ORLY", "CL", "ITW",
+    "CTAS", "MCO", "NOC", "HON", "MPWR", "SPG", "ABNB", "AEP", "RCL", "KKR", "HCA", "BSX",
+    "FDX", "TER", "URI", "APD", "DLR", "KEYS", "TEL", "TDG", "KMI", "MNST", "NXPI", "PCAR",
+    "COR", "TRGP", "FIX", "AON", "AJG", "AME", "FAST", "COHR", "ALL", "TFC", "APO", "CRH",
+    "BKR", "OKE", "GWW", "D", "NUE", "CTVA", "CAH", "O", "SRE", "DVN", "EW", "AFL",
+    "MET", "DAL", "CIEN", "A", "BDX", "HONA", "WAB", "STT", "F", "GRMN", "ROK", "PSA",
+    "AZO", "HUM", "ETR", "PYPL", "FITB", "CVNA", "CARR", "VST", "VTR", "XEL", "LHX", "IQV",
+    "VMRK", "AMP", "WAT", "FERG", "P", "NKE", "ADSK", "MCHP", "COIN", "KDP", "IDXX", "EBAY",
+    "FLEX", "EXC", "VEEV", "RSG", "ILMN", "NTAP", "NDAQ", "CMG", "XYZ", "OXY", "PRU", "MSCI",
+    "AIG", "IBKR", "ADM", "ED", "WDAY", "SYY", "FANG", "YUM", "CBRE", "UAL", "TTWO", "DHI",
+    "KR", "ROP", "KVUE", "AXON", "HIG", "PEG", "BIIB", "EME", "WEC", "JBL", "IRM", "ODFL",
+    "KMB", "DXCM", "ACGL", "RMD", "CCL", "PAYX", "NTRS", "VMC", "MTB", "HBAN", "MTD", "CNC",
+    "EQT", "EXPE", "GEHC", "STLD", "ON", "ZTS", "MLM", "CCI", "EXR", "HPQ", "TDY", "AEE",
+    "RJF", "CBOE", "LYV", "WSM", "DG", "CFG", "PCG", "WTW", "WST", "ARES", "ATO", "HAL",
+    "Q", "IR", "AWK", "DGX", "CPAY", "DOV", "CTSH", "VICI", "DTE", "OTIS", "LH", "FFIV",
+    "CINF", "EXPD", "PPL", "HUBB", "FISV", "CNP", "ES", "PPG", "XYL", "VLTO", "HSY", "ULTA",
+    "SW", "EL", "SYF", "SMCI", "RF", "FE", "CPRT", "VRSN", "TPR", "CHD", "TROW", "CASY",
+    "PHM", "PFG", "DRI", "IFF", "VRSK", "DLTR", "RDDT", "INCY", "VTRS", "STE", "PKG", "EIX",
+    "LUV", "NRG", "OMC", "KHC", "CMS", "DOW", "AMCR", "EXE", "TPL", "SNA", "FSLR", "NI",
+    "GPN", "BR", "KEY", "EVRG", "GIS", "ZBRA", "DD", "CHRW", "IP", "GPC", "NDSN", "CF",
+    "BBY", "ESS", "BRO", "L", "ZBH", "SBAC", "FIS", "JBHT", "IEX", "RVTY", "BG", "STZ",
+    "FTV", "LNT", "TSCO", "EFX", "J", "CDW", "LEN", "AKAM", "LDOS", "NVR", "WRB", "HST",
+    "KIM", "BALL", "LYB", "APA", "PTC", "TSN", "CRL", "INVH", "WY", "DOC", "MAA", "IVZ",
+    "TXT", "RL", "TRMB", "FDXF", "MAS", "FICO", "SWK", "SWKS", "ALLE", "EG", "AIZ", "AVY",
+    "SOLV", "GL", "SJM", "ALB", "FOXA", "HAS", "ECHO", "GNRC", "CHTR", "MKC", "BAX", "TYL",
+    "REG", "GDDY", "IT", "LII", "TECH", "PNW", "GEN", "COO", "CSGP", "AES", "TKO", "DECK",
+    "NWSA", "JKHY", "HII", "LULU", "UDR", "DPZ", "CLX", "CPT", "LVS", "BXP", "ALGN", "BEN",
+    "FDS", "PODD", "APTV", "UHS", "ROL", "PNR", "FRT", "HSIC", "ARE", "MOS", "NCLH", "AOS",
+    "DVA", "HRL", "ERIE", "WYNN", "MGM", "PSKY",
+]
+
+# At most this many names held at once, half long and half short.
+MAX_POSITIONS = 20
 
 
 def build_strategy(allocation: float) -> MomentumStrategy:
@@ -47,7 +95,8 @@ def build_strategy(allocation: float) -> MomentumStrategy:
         secret_key=os.environ.get("ALPACA_SECRET"),
     )
     # allocation comes from the server (single source of truth), not a hardcoded default
-    return MomentumStrategy(data_provider, universe=UNIVERSE, capital_allocation=allocation)
+    return MomentumStrategy(data_provider, universe=UNIVERSE, capital_allocation=allocation,
+                            max_positions=MAX_POSITIONS)
 
 
 def submit(intent: dict) -> dict:
@@ -100,6 +149,7 @@ if __name__ == "__main__":
                 secret_key=os.environ.get("ALPACA_SECRET"),
             ),
             universe=UNIVERSE,
+            max_positions=MAX_POSITIONS,
         )
         for intent in strategy.generate_intents():
             print(intent)
@@ -137,10 +187,16 @@ if __name__ == "__main__":
     alloc = requests.get(f"{BASE_URL}/strategies/{STRATEGY_ID}/allocation", timeout=5).json()
     allocation = alloc["capital_allocation"]
 
+    # 3.5 what this strategy holds now, so names that drop out of the selection get closed.
+    # No book, no run: trading without it would buy the new names and never sell the old.
+    book = requests.get(f"{BASE_URL}/strategies/{STRATEGY_ID}/book", timeout=10).json()["book"]
+    held = {r["symbol"]: r["quantity"] for r in book if not r.get("is_cash") and r["quantity"]}
+    print(f"holding {len(held)} name(s): {held}")
+
     # 4. generate + submit
     strategy = build_strategy(allocation)
     print("=== generating intents ===")
-    intents = strategy.generate_intents()
+    intents = strategy.generate_intents(held=held)
     print(f"generated {len(intents)} intents (allocation={allocation:,.0f})")
 
     print("\n=== POSTing intents to executor ===")
