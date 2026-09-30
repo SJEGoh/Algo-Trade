@@ -454,6 +454,33 @@ At startup the executor reconciles its internal state against the broker. This i
 
 The repository also contains a standalone `main.py` harness specifically aimed at exercising recovery of open orders after a process restart.
 
+### Starting from scratch (new account)
+
+`tools/reset_history.py` moves every piece of persisted state out of `db/` into
+`db/archive/<UTC timestamp>/`: `executor.db` (orders, fills, P&L, fees, cash, positions,
+allocations, halts, exits, journal, equity curve), `netting.json`, `vecm_state.json` and
+`rrg_state.json`. Nothing is deleted; to undo, stop the executor and move the files back. On the
+next start every strategy begins with `config.CONFIG`'s allocation as its starting cash.
+
+The executor must be **stopped**, because it holds this state in memory and would write it straight
+back. The tool refuses while `/health` answers. It also warns if the ledger still shows open
+positions: flatten them on the old account first, or they turn up as orphans.
+
+On the EC2 box (docker compose, state in the `algo_db` volume):
+
+```bash
+git pull && docker compose build executor          # the image needs the tool
+docker compose stop executor scheduler telegram-control
+docker compose run --rm --no-deps executor python tools/reset_history.py --db-dir /app/db --dry-run
+docker compose run --rm --no-deps executor python tools/reset_history.py --db-dir /app/db
+# point ibgateway_compose/.env (TWS_USERID / TWS_PASSWORD / TRADING_MODE) at the new account
+docker compose up -d
+```
+
+Locally: `python3 tools/reset_history.py` against the repo's `db/`. Add `--keep-strategies` to carry
+strategies registered at runtime (`/addstrategy`) into the new database. `telegram_offset.json` is
+left alone.
+
 ## Monitoring and alerts
 
 The monitoring layer supports Telegram alerts for operational events. Alerts are intentionally sent asynchronously so an unavailable Telegram API does not block the trading path.
