@@ -4,11 +4,15 @@ Opt-in per strategy AND per name. An intent may carry an `exits` object with any
 combination of:
 
     stop_price | stop_pct              close when price moves against the position
-    take_profit_price | take_profit_pct close when price moves in its favour
+    take_profit_price | take_profit_pct | take_profit_offset
+                                       close when price moves in its favour
     trail_pct | trail_amount           close when price retraces from its best level
 
 `*_pct` values are fractions (0.05 = 5%) measured from the strategy's own average cost, so
-"2% below my fill" can be sent with the entry. A name with no `exits` has no rules; a
+"2% below my fill" can be sent with the entry. `take_profit_offset` is a price DISTANCE from
+that cost (a long exits at cost + offset, a short at cost - offset), for a target set in
+price units that cannot be known until the fill — e.g. "entry ± 2 x ATR" on an order that
+fills at the close. A name with no `exits` has no rules; a
 strategy that never sends them is untouched.
 
 Each submission REPLACES that name's rules (the book is authoritative, and so is what it
@@ -44,13 +48,13 @@ logger = logging.getLogger("executor.exits")
 
 ET = ZoneInfo("America/New_York")
 
-#: kind -> (absolute-price field, relative field). One of each pair at most.
+#: kind -> the fields that can set it (absolute price first). One field per kind at most.
 KINDS = {
     "stop": ("stop_price", "stop_pct"),
-    "take_profit": ("take_profit_price", "take_profit_pct"),
+    "take_profit": ("take_profit_price", "take_profit_pct", "take_profit_offset"),
     "trail": ("trail_amount", "trail_pct"),
 }
-FIELDS = frozenset(f for pair in KINDS.values() for f in pair)
+FIELDS = frozenset(f for fields in KINDS.values() for f in fields)
 
 #: Checked in this order: when a single mark crosses two levels, the loss-side exit names it.
 _CHECK_ORDER = ("stop", "trail", "take_profit")
@@ -84,9 +88,12 @@ def parse_exits(raw, target_quantity, expected_price=None):
             problems.append(f"{key} must be positive, got {value!r}")
             continue
         spec[key] = float(value)
-    for price_field, pct_field in KINDS.values():
-        if price_field in spec and pct_field in spec:
-            problems.append(f"set {price_field} or {pct_field}, not both")
+    for fields in KINDS.values():
+        given = [f for f in fields if f in spec]
+        if len(given) == 2:
+            problems.append(f"set {given[0]} or {given[1]}, not both")
+        elif len(given) > 2:
+            problems.append(f"set only one of {', '.join(given)}")
     if not spec and not problems:
         return None
     if not target_quantity:
@@ -107,14 +114,18 @@ def parse_exits(raw, target_quantity, expected_price=None):
         if tp is not None and (tp <= px if long else tp >= px):
             problems.append(f"take_profit_price {tp:g} is on the wrong side of {px:g} for a "
                             f"{side} — it would trigger immediately")
+        off = spec.get("take_profit_offset")
+        if off is not None and not long and off >= px:
+            problems.append(f"take_profit_offset {off:g} is at least the price {px:g} — a "
+                            "short's target would be at or below zero and never trigger")
     if problems:
         raise ExitSpecError("; ".join(problems))
     return spec
 
 
 def levels(rule: dict, avg_cost=None) -> dict:
-    """The price each armed exit fires at right now. A `*_pct` exit has no level until the
-    strategy holds the name at a known cost; a trail has none until it has an extreme."""
+    """The price each armed exit fires at right now. A `*_pct` or `*_offset` exit has no level
+    until the strategy holds the name at a known cost; a trail has none until it has an extreme."""
     d, spec, out = rule["direction"], rule["spec"], {}
     cost = avg_cost if avg_cost and avg_cost > 0 else None
     if "stop_price" in spec:
@@ -125,6 +136,8 @@ def levels(rule: dict, avg_cost=None) -> dict:
         out["take_profit"] = spec["take_profit_price"]
     elif "take_profit_pct" in spec and cost:
         out["take_profit"] = cost * (1 + d * spec["take_profit_pct"])
+    elif "take_profit_offset" in spec and cost:
+        out["take_profit"] = cost + d * spec["take_profit_offset"]
     extreme = rule.get("extreme")
     if extreme is not None:
         if "trail_pct" in spec:

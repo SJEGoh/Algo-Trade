@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from execution.central_execution import CentralExecutor, is_market_open
+from execution.central_execution import CentralExecutor, is_market_open, moc_cutoff_at
 from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
@@ -171,6 +171,27 @@ def _plan_exits(sid: str, intents: list):
     return plan, blocked, None
 
 
+#: How a /targets intent may ask to be traded. The pool sends market orders, or MOC orders
+#: for the close; anything else (a limit, say) it cannot honour.
+BOOK_ORDER_TYPES = ("market", "moc")
+
+
+def _check_book_order_types(intents: list):
+    """Refuse the WHOLE book, before anything is placed, when it asks for an execution the
+    pool cannot give: an unknown order_type would otherwise quietly trade at market, and an
+    MOC past the cutoff would be refused by the exchange after the rest of the book traded."""
+    bad = sorted({f"{(it.get('instrument') or {}).get('symbol')}: {it.get('order_type')!r}"
+                  for it in intents
+                  if it.get("order_type") not in (None,) + BOOK_ORDER_TYPES})
+    if bad:
+        return {"accepted": False,
+                "reason": f"unsupported order_type in book (allowed: {', '.join(BOOK_ORDER_TYPES)}), "
+                          f"nothing submitted: " + "; ".join(bad)}
+    if any(it.get("order_type") == "moc" for it in intents) and executor.moc_closed():
+        return {"accepted": False, "reason": executor.MOC_CLOSED_REASON}
+    return None
+
+
 def _is_noop(result) -> bool:
     return isinstance(result, dict) and str(result.get("reason", "")).startswith("no-op")
 
@@ -275,7 +296,8 @@ def set_target(req: TargetRequest):
 def submit_book(body: dict):
     """Net-pooling: full-book resync. Authoritative snapshot of a strategy's whole book;
     any name dropped from the book is closed. body = {strategy_id, intents:[{instrument,
-    target_quantity, expected_price}]}. Run periodically to self-heal drift."""
+    target_quantity, expected_price, order_type?}]}. Run periodically to self-heal drift.
+    order_type "moc" trades that name's change in the closing auction (default: market)."""
     sid = body.get("strategy_id")
     if not sid:
         raise HTTPException(status_code=422, detail="strategy_id required")
@@ -283,6 +305,9 @@ def submit_book(body: dict):
     fut_only = bool(intents) and all(
         (it.get("instrument") or {}).get("sec_type", "STK") == "FUT" for it in intents)
     _pool_preflight(fut_only)
+    refusal = _check_book_order_types(intents)
+    if refusal:
+        return refusal
     plan, blocked, refusal = _plan_exits(sid, intents)
     if refusal:
         return refusal
@@ -327,6 +352,106 @@ def submit_book(body: dict):
         symbols=syms,
     )
     return result
+
+
+class ChainRequest(BaseModel):
+    """Two legs, each an absolute target for the strategy: {instrument, target_quantity,
+    expected_price}. The executor prices both as ATR limits (buy below, sell above); the
+    first to fill leads and the other is hedged in proportion, through the pool."""
+    strategy_id: str
+    legs: list
+    atr_fraction: Optional[float] = Field(None, gt=0)
+    ttl_sec: Optional[float] = Field(None, gt=0)
+
+
+@app.post("/chains", dependencies=[Depends(require_api_key)])
+def submit_chain(body: ChainRequest):
+    """Place a chained two-leg order. Expires at now + ttl_sec, and never later than today's
+    MOC cutoff; on expiry what still rests is cancelled and the pair is left balanced."""
+    sid = body.strategy_id
+    _pool_preflight(False)
+    em = getattr(executor, "exit_manager", None)
+    problems, legs = [], []
+    for i, leg in enumerate(body.legs):
+        inst = (leg or {}).get("instrument") or {}
+        sym = inst.get("symbol")
+        where = sym or f"leg[{i}]"
+        try:
+            qty, px = float(leg["target_quantity"]), float(leg["expected_price"])
+        except (KeyError, TypeError, ValueError):
+            problems.append(f"{where}: needs a numeric target_quantity and expected_price")
+            continue
+        if not sym or inst.get("sec_type", "STK") != "STK":
+            problems.append(f"{where}: chain legs are equities with an instrument.symbol")
+            continue
+        if not (px > 0 and px == px and px != float("inf")):
+            problems.append(f"{where}: expected_price must be positive — the ATR limit is "
+                            "priced from it")
+            continue
+        if leg.get("exits"):
+            problems.append(f"{where}: chain legs take no exits — arm them with a book once "
+                            "the pair is on")
+            continue
+        held = executor.ledger.strategy_positions.get(sid, {}).get(sym, 0.0)
+        lock = em.blocked(sid, sym, qty) if em is not None else None   # as /targets does
+        if lock is not None:
+            problems.append(f"{where}: re-entry blocked — hit its {lock['kind']} this session")
+            continue
+        legs.append({"instrument": {"asset_class": "equity", "exchange": "SMART",
+                                    "sec_type": "STK", **inst},
+                     "target_quantity": qty, "expected_price": px, "held": held})
+    if problems:
+        return {"accepted": False, "reason": "chain refused, nothing placed: " + "; ".join(problems)}
+
+    # Price both legs BEFORE touching the book: an unavailable ATR refuses the chain rather
+    # than quietly sending a leg at market.
+    layer = executor.atr_layer
+    for leg in legs:
+        sym = leg["instrument"]["symbol"]
+        buy = leg["target_quantity"] > leg["held"]
+        lp = layer.compute_limit_price(sym, leg["expected_price"], buy, fraction=body.atr_fraction)
+        if lp is None:
+            return {"accepted": False,
+                    "reason": f"chain refused, nothing placed: ATR unavailable for {sym}"}
+        leg["limit_price"] = lp
+        leg["atr"] = layer._get_cached(sym)
+
+    now = time.time()
+    cutoff = moc_cutoff_at()
+    expires = cutoff.timestamp() if cutoff is not None else now
+    if body.ttl_sec:
+        expires = min(expires, now + body.ttl_sec)
+    if expires <= now:
+        return {"accepted": False, "reason": "chain refused, nothing placed: past today's "
+                "MOC cutoff — too close to the close for resting legs"}
+
+    result = executor.coordinator.chains.submit(sid, legs, expires, fraction=body.atr_fraction)
+    if result.get("accepted"):
+        c = result["chain"]
+        summary = f"Chain {c['id']}: " + ", ".join(
+            f"{l['symbol']} {l['delta']:+g} lmt {l['limit_price']:g}" for l in c["legs"])
+        _alert(f"\U0001f517 {sid} — {summary}", topic="orders")
+        import json as _json
+        executor.logger_db.log_decision(sid, "chain", summary,
+                                        detail=_json.dumps(c, default=str),
+                                        symbols=[l["symbol"] for l in c["legs"]])
+    return result
+
+
+@app.get("/chains")
+def list_chains(strategy_id: Optional[str] = None):
+    """Chained orders with each leg's limit, fills and progress; `lead_symbol` is the leg
+    that filled first."""
+    return {"chains": executor.coordinator.chains.snapshot(strategy_id)}
+
+
+@app.delete("/chains/{chain_id}", dependencies=[Depends(require_api_key)])
+def cancel_chain(chain_id: str):
+    """Cancel as on expiry: pull what rests, leave the pair balanced, send nothing at market."""
+    c = executor.coordinator.chains.cancel(chain_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail=f"no chain {chain_id}")
+    return c
 
 
 @app.get("/exits")
@@ -1118,10 +1243,28 @@ def _check_exits() -> list:
     return em.check(marks, market_open=is_market_open())
 
 
+def _expire_chains() -> list:
+    """Cancel chained orders past their expiry (on the exit loop's cadence)."""
+    co = getattr(executor, "coordinator", None)
+    if co is None:
+        return []
+    expired = co.chains.expire()
+    for c in expired:
+        _alert(f"\u23f1 Chain expired — {c['strategy_id']} {c['id']}: " + ", ".join(
+            f"{l['symbol']} {l['filled']:+g}/{l['delta']:+g}" for l in c["legs"]),
+            topic="orders")
+    return expired
+
+
 def _exit_sampler(interval: float = 30.0):
     log = logging.getLogger("executor")
     while not _sampler_stop.is_set():
         started = time.monotonic()
+        try:
+            _expire_chains()
+        except Exception as e:
+            log.critical("chain expiry failed — resting chain legs may outlive their "
+                         "expiry: %s", e)
         try:
             _check_exits()
             _exit_failures[0] = 0

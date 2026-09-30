@@ -202,15 +202,19 @@ class AtrPullbackLayer(ExecutionLayer):
         self.bar_size: str = cfg.get("bar_size", "5 mins")
         self.duration: str = cfg.get("duration", "2 D")
 
-    def compute_limit_price(self, symbol: str, price: float, is_buy: bool) -> Optional[float]:
+    def compute_limit_price(self, symbol: str, price: float, is_buy: bool,
+                            fraction: float = None) -> Optional[float]:
+        """`fraction` overrides the configured atr_fraction for this one price (chained
+        orders pass their own)."""
         atr = self._get_atr(symbol)
         if atr is None or atr <= 0:
             logger.warning("ATR unavailable for %s — falling through to market order", symbol)
             return None
+        f = self.atr_fraction if fraction is None else fraction
         if is_buy:
-            lp = round(price - self.atr_fraction * atr, 2)
+            lp = round(price - f * atr, 2)
         else:
-            lp = round(price + self.atr_fraction * atr, 2)
+            lp = round(price + f * atr, 2)
         return lp if lp > 0 else None
 
     def _build_metadata(self, symbol: str, price: float,

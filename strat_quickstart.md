@@ -98,7 +98,8 @@ for. Realized P&L from `/pnl` is net of commissions; `fees` is what was deducted
 
 **7. Exits are optional, per name, and enforced by the executor.**
 `self.intent(..., stop_pct=0.03)`, `trail_pct=0.05`, `take_profit_pct=0.08` — or the
-`stop_price` / `take_profit_price` / `trail_amount` forms — in any combination, or none. On
+`stop_price` / `take_profit_price` / `trail_amount` forms, or `take_profit_offset` (a price
+distance from the fill, e.g. 2 × ATR) — in any combination, or none. On
 the wire (curl, `ExecutorClient` directly) it is `"exits": {"stop_pct": 0.03}` on the intent.
 `client.exits()` shows each armed exit and the price it fires at. Send
 them WITH the entry: `*_pct` is measured from the average cost the executor records from the
@@ -107,6 +108,17 @@ removes them. Armed names are re-priced from IB every 30s and nothing rests at I
 rebalance would cancel a resting stop). A hit closes the name at market, skipping ATR and any
 other execution layer, and blocks re-entry in the same direction until
 the next session; `run()` expects a blocked name flat. One invalid exit refuses the whole book.
+
+**8. `order_type="moc"` trades a name at the close.** `self.intent(..., order_type="moc")`
+sends that name's change to the closing auction; send exits as quantity 0 with it (a name
+dropped from the book closes at market, now). From 15:50 ET (`GLOBAL["moc_cutoff_min"]`) a
+book with any `moc` entry is refused whole. An MOC fills at 16:00, so a run submitting one
+should set `confirm_fills = False`. Details in client/README.md.
+
+**9. Chained orders enter two legs together.** `client.submit_chain([leg_a, leg_b],
+atr_fraction=0.5, ttl_sec=1800)`: both rest as ATR-priced limits, the first to fill leads,
+and the other is hedged in proportion through the pool at market. On expiry what rests is
+cancelled, nothing goes at market, and the pair is left balanced. See client/README.md.
 
 ## Adding a strategy id
 
@@ -150,6 +162,9 @@ Existing ids worth knowing: `test_suite_small_alloc` ($1k cap — use this for s
 | `POST /journal` | key | decision record |
 | `POST /strategies` | key | register a new strategy id |
 | `GET /exits?strategy_id=` | – | armed exits with trigger levels, and today's re-entry lockouts |
+| `POST /chains` | key | chained two-leg order: ATR-priced limits, other leg hedged on fill |
+| `GET /chains?strategy_id=` | – | chains with each leg's limit, fills and progress |
+| `DELETE /chains/{id}` | key | cancel a chain; the pair is left balanced |
 | `DELETE /exits/{id}/{symbol}` | key | remove a name's exits and lift its lockout |
 
 `ExecutorClient` ([client/executor_client.py](client/executor_client.py)) wraps all of these,

@@ -185,13 +185,15 @@ self.intent("MSFT", 20, 505.10, stop_price=490, take_profit_pct=0.08) # both
 | field | fires when, for a long (mirrored for a short) |
 |---|---|
 | `stop_price` / `stop_pct` | price falls to the level |
-| `take_profit_price` / `take_profit_pct` | price rises to the level |
+| `take_profit_price` / `take_profit_pct` / `take_profit_offset` | price rises to the level |
 | `trail_amount` / `trail_pct` | price falls that far from its best mark since entry |
 
 `*_pct` values are fractions (`0.03` = 3%) of this strategy's **average cost**, which the
 executor records from the actual fills. So send exits **with the entry** — there is no need to
 wait for the fill to know where "3% below my fill" is, and waiting leaves the position
-unprotected for however long that takes.
+unprotected for however long that takes. `take_profit_offset` is the same idea in price units:
+a distance from the average cost (long: cost + offset, short: cost − offset), for a target like
+"entry ± 2 × ATR" on an order whose fill price is unknown when the book is sent.
 
 **Without `self.intent()`** — `ExecutorClient` directly, or anything that speaks HTTP — it is
 one more key on the intent:
@@ -249,6 +251,72 @@ How it behaves:
   one kind, a percentage of 1 or more, a price stop already on the wrong side of the price.
   `validate()` catches these before anything is sent.
 - Exits need an absolute target: book mode, or `intent_type: target_position` in orders mode.
+
+## Trading at the close (MOC)
+
+A book entry can ask for its change to be traded in the closing auction instead of now:
+
+```python
+self.intent("AAPL", 78, 319.97, order_type="moc")   # enter at today's close
+self.intent("MSFT", 0, 505.10, order_type="moc")    # exit at today's close
+```
+
+On the wire it is `"order_type": "moc"` on the `/targets` intent (or on an `/orders` intent;
+omitted means market). How it behaves:
+
+- **Send exits at 0 with `order_type="moc"`.** A name simply left out of the book is closed
+  too, but at market, straight away.
+- **The cutoff is enforced up front.** From `GLOBAL["moc_cutoff_min"]` (10) minutes before the
+  close — 15:50 ET, 12:50 on an early close — a book containing any `moc` entry is refused
+  whole, nothing placed. Resend it as market, or submit earlier.
+- **Mixed with other strategies**, a symbol's close-auction shares and immediate shares go out
+  as separate orders, each owned by the strategies that asked for it, so fills land on the
+  right books.
+- **Past the cutoff an MOC order is locked in.** The exchange will not cancel it, so a later
+  rebalance of that symbol (another strategy, or the hedger) leaves it working and sizes its
+  own order around it. `/kill` and `/flatten` still try to cancel it and log CRITICAL: if the
+  exchange refuses, it executes at the close.
+- **Stops, take-profits and halts close at market**, whatever style the book asked for.
+- Before the cutoff an MOC is an ordinary working order: until the close prints, the
+  strategy's holdings have not moved, so `run()` with `confirm_fills` will report `4`. Set
+  `confirm_fills = False` for an MOC book and check the book after the close.
+- Only `market` and `moc` are accepted in a book; anything else refuses the whole book
+  rather than quietly trading at market.
+
+## Chained two-leg orders
+
+Enter a pair (or a stock and its hedge) without legging risk sitting open:
+
+```python
+client.submit_chain([
+    {"instrument": {"symbol": "AAPL", "asset_class": "equity", "exchange": "SMART"},
+     "target_quantity": 100, "expected_price": 231.40},
+    {"instrument": {"symbol": "SPY", "asset_class": "equity", "exchange": "SMART"},
+     "target_quantity": -35, "expected_price": 655.10},
+], atr_fraction=0.5, ttl_sec=1800)
+```
+
+- **Targets are absolute**, like a book: the strategy's position in each symbol after the chain.
+- **The executor prices both legs** with its ATR layer (IB intraday bars, `ATR_EXECUTION`):
+  a buy rests at `expected_price − f·ATR`, a sell at `expected_price + f·ATR`, with `f` from
+  `atr_fraction` (default: the layer's). No ATR for a leg refuses the whole chain.
+- **The first leg to fill leads.** The other leg's limit is pulled and it is completed
+  through the pool — netted against other strategies, the rest at market — in proportion
+  to the lead's fill: 30 of 100 lead shares sends 30% of the hedge. The lead keeps resting at
+  its ATR price, and each further fill tops the hedge up.
+- **Expiry** is `ttl_sec`, and never later than the MOC cutoff (15:50 ET). Whatever still
+  rests is cancelled and **nothing is sent at market**: an unfilled chain did nothing, a part-
+  filled one is a smaller but balanced pair. A fill that beats the cancel is kept and hedged.
+  `client.cancel_chain(id)` does the same by hand.
+- **Something else taking a leg over stops the chain**: an exit rule firing on a leg, or
+  `/target` on it, leaves the other leg balanced; a `/targets` book for the strategy
+  restates every target, chained legs included, and trades them its own way.
+- A leg must actually trade, the two symbols must differ, and a symbol can't have an
+  unfilled earlier target outstanding or be in another working chain. Legs are equities and
+  carry no exits; arm those with a book once the pair is on.
+- If another strategy re-nets a leg's symbol, the leg is re-placed at the same limit (it
+  loses its queue place). Chains survive an executor restart with the netting state.
+- `client.chains()` shows each leg's limit, fills and progress, and which leg led.
 
 ## Proving the path before you trust it
 

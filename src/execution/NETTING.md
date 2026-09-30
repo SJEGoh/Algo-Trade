@@ -82,15 +82,17 @@ Both entry points end in `_rebalance(symbols)`. **No strategy position moves her
 move only when the broker reports a fill (next section). For each affected symbol:
 
 1. `target = net()[symbol]` — the new pooled target (sum of all desired books).
-2. If `target` already equals the ledger's **effective** position (filled + pending), place
-   nothing — re-running the same target is a clean no-op. The one exception: strategies whose
+2. If `target` already equals the ledger's **effective** position (filled + pending), and every
+   working order is still being worked the way its owners now want (see *Execution styles*),
+   place nothing — re-running the same target is a clean no-op. The one exception: strategies whose
    gaps cancel out *exactly* (s1 wants +60, s2 wants −60) with no working order to settle
    them. A single order for zero shares would never fill, so neither position could ever
    move; the buyers and the sellers are sent to IB as **two orders**, each owned by its side.
-3. Otherwise cancel any stale in-flight order for the symbol, recompute
-   `delta = target − effective_position`, snapshot each strategy's gap (`want − filled`), call
-   `executor.place_net_order(symbol, delta, instrument, ref_price)`, and **record those gaps
-   as the order's owners** against its order id.
+3. Otherwise cancel any stale in-flight order for the symbol (except MOC orders past the
+   cutoff, which can't be cancelled), recompute `delta = target − effective_position`,
+   snapshot each strategy's gap (`want − filled`, minus what a locked MOC order will still
+   deliver), split the gaps by execution style, call `executor.place_net_order(...)` once per
+   group, and **record each group's gaps as that order's owners** against its order id.
 
 `place_net_order` submits the pooled order under the synthetic id `__net__` and records the
 pending at the **net** level only (`record_net_pending`). Opposing legs still net into one
@@ -101,6 +103,65 @@ fills, at the real fill price.
 reference price the moment an order was made, with no fill, which broke the rule that a
 position moves only on a fill. It remains available as `NettingCoordinator(...,
 internal_crossing=True)`, and `tests/test_internal_crossing.py` pins the algorithm with it on.
+
+## Execution styles — market, close, resting limit
+
+Each strategy's outstanding change in a symbol has a style, held in `exec_style[sid][sym]`
+(absent = market). Every new target restates it.
+
+| style | set by | goes out as |
+|---|---|---|
+| market | default; any `urgent=True` target (stops, take-profits, trails) and halts | `MKT` (ATR may transform it for ATR strategies) |
+| `moc` | `/targets` or `/orders` intent with `order_type: "moc"` | `MOC`, today's closing auction |
+| `limit` | a chained order's leg (`execution/chains.py`) | `LMT` at the chain's ATR price, for that strategy alone |
+
+`_place` sends one order per style group, each owned by its own strategies: the limit legs
+(one order per strategy), then the MOC gaps, then the rest at market with any unowned
+residue. Mixed styles on one symbol therefore cost two orders instead of one net order. That
+is deliberate: a close-auction share and an immediate share can't be the same order. A limit
+leg whose gap has flipped direction goes at market, since its price was set for the other side.
+
+**Restyling.** Each order's owner record stores the style it was placed with. If the quantity
+is unchanged but the owners' style is not, the order is cancelled and re-placed. Examples: a
+chain's hedge leg switching from resting limit to market, or a stop firing on a name whose
+MOC exit is already working. Without this, "already covered by working orders" would leave
+the old order in place.
+
+**The MOC cutoff** (`GLOBAL["moc_cutoff_min"]`, 10 minutes before the session close: 15:50 ET,
+12:50 on early closes). From then on the executor refuses new MOC orders (a `/targets` book
+with any `moc` entry is refused whole), and a working MOC order is **locked**: the exchange
+won't cancel it, so a rebalance leaves it working and sizes its new order around it
+(`_net_of_locked`), instead of trading the same shares twice. An MOC gap still uncovered
+after the cutoff (its order was rejected, say) goes at market with a warning. `/kill` and
+`/flatten` still try to cancel locked orders and log CRITICAL; if refused, those orders
+execute at the close.
+
+## Chained two-leg orders (`execution/chains.py`)
+
+A chain moves one strategy to new targets in two symbols without leaving one leg unhedged.
+`ChainManager` lives on the coordinator (`coord.chains`) and only drives the coordinator's
+own paths:
+
+1. **Submit** (`POST /chains`): the server prices each leg with the ATR layer (buy
+   `price − f·ATR`, sell `price + f·ATR`) and refuses the chain if ATR is missing. The
+   manager validates the legs (two distinct symbols, each actually trading, no unfilled
+   earlier target, not already in a chain), sets both as desired targets with `limit` style,
+   runs the allocation check, and rebalances.
+2. **React**: `attribute_fill` calls `chains.on_fill(symbol)` after booking every fill. The
+   first leg with progress leads. The other leg is set, urgently, to
+   `start + round(lead_progress × delta)`, which pulls its resting limit (restyling) and
+   sends the proportional amount through the pool. Further lead fills top it up; the hedge
+   never unwinds shares it already holds.
+3. **End**: expiry (`ttl_sec`, capped at the MOC cutoff, checked on the exit loop every 30s)
+   and `DELETE /chains/{id}` cancel what rests without sending anything at market. With no
+   fills, both legs go back to their starting targets; while legging, the lead is set to what
+   filled and the hedge already matches. Late fills after that are kept (the lead's target
+   moves up to the position) and hedged.
+4. **Takeover**: a `set_target` on a leg by anything but the chain (an exit rule, `/target`)
+   supersedes it and stops the other leg as on expiry. `submit_book` and `halt` supersede
+   every chain of the strategy without unwinding, since they restate every target anyway.
+
+Statuses: `working` → `legging` → `done`, or `expired` / `cancelled` / `superseded`.
 
 ## Fill attribution — to the order's owners
 
@@ -149,15 +210,24 @@ behind another's offsetting position. A strategy the risk manager has already ha
 
 ## Persistence
 
-If constructed with `state_path`, the coordinator writes `desired`, `instrument`, and
-`ref_price` to JSON on every accepted change and reloads them on start, so desired books
-survive a server restart. The server wires this to `db/netting.json`.
+If constructed with `state_path`, the coordinator writes `desired`, `instrument`,
+`ref_price`, `exec_style` and `chains` to JSON on every accepted change (and on every chain
+step) and reloads them on start, so desired books, pending MOC/limit styles and working
+chains survive a server restart. After a restart a chain still hedges: the resting leg's
+fill is attributed by the desired book and moves the position, and that is what the chain
+reacts to. Order owner records are still not persisted (see above). The server wires this to
+`db/netting.json`.
 
 ## HTTP surface (FastAPI server)
 
 - `POST /target` — incremental. Body: `{strategy_id, symbol, quantity, instrument?, price?}`.
 - `POST /targets` — full-book resync. Body: `{strategy_id, intents:[{instrument,
-  target_quantity, expected_price}]}`.
+  target_quantity, expected_price, order_type?, exits?}]}`. `order_type` is `market`
+  (default) or `moc`; anything else refuses the whole book.
+- `POST /chains` — chained two-leg order. Body: `{strategy_id, legs:[{instrument,
+  target_quantity, expected_price}] x2, atr_fraction?, ttl_sec?}`.
+- `GET /chains?strategy_id=` — chains, each leg's limit, fills, progress, and the lead.
+- `DELETE /chains/{id}` — cancel as on expiry.
 - `GET /net` — inspect the pooled net book and every strategy's desired book (read-only).
 
 The coordinator is created in the server's lifespan and attached as `executor.coordinator`;
@@ -176,3 +246,6 @@ the executor's `place_net_order` / `execDetails` net-fill routing do the rest.
 
 Owner-based attribution — positions move only on the owning order's fill, late fills on
 cancelled orders, exact offsets as two orders — is in `tests/test_fill_owned_attribution.py`.
+MOC styles, the cutoff and locked MOC orders are in `tests/test_moc_orders.py`; chained orders
+(ATR limits, proportional hedging, expiry, takeover, restart, the endpoint) in
+`tests/test_chains.py`.

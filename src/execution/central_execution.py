@@ -36,8 +36,8 @@ def _market_calendar(exchange: str):
 _schedule_cache: dict = {}   # (exchange, date) -> (open_dt, close_dt) or None
 
 
-def is_market_open(exchange: str = "NYSE") -> bool:
-    now_et = datetime.now(pytz.timezone("America/New_York"))
+def _session_window(exchange: str, now_et: datetime):
+    """(open, close) of the session on now_et's date, or None when there is no session."""
     key = (exchange, now_et.date())
     if key not in _schedule_cache:
         sched = _market_calendar(exchange).schedule(start_date=now_et.date(), end_date=now_et.date())
@@ -47,8 +47,35 @@ def is_market_open(exchange: str = "NYSE") -> bool:
             o = sched.iloc[0]["market_open"].tz_convert("America/New_York")
             c = sched.iloc[0]["market_close"].tz_convert("America/New_York")
             _schedule_cache[key] = (o, c)
-    window = _schedule_cache[key]
+    return _schedule_cache[key]
+
+
+def is_market_open(exchange: str = "NYSE") -> bool:
+    now_et = datetime.now(pytz.timezone("America/New_York"))
+    window = _session_window(exchange, now_et)
     return window is not None and window[0] <= now_et <= window[1]
+
+
+def moc_cutoff_passed(exchange: str = "NYSE", now: datetime = None) -> bool:
+    """Has today's market-on-close entry window shut?
+
+    The cutoff is GLOBAL['moc_cutoff_min'] minutes before the session's close — 15:50 ET on a
+    normal day, 12:50 on a 13:00 early close. Past it the exchange refuses new MOC orders AND
+    cancels of existing ones, so this gates both: an MOC submitted late fails closed instead
+    of being rejected at the exchange, and a working MOC is treated as certain to execute.
+    A day with no session counts as past the cutoff: there is no close to trade into."""
+    now_et = now or datetime.now(pytz.timezone("America/New_York"))
+    cutoff = moc_cutoff_at(exchange, now_et)
+    return cutoff is None or now_et >= cutoff
+
+
+def moc_cutoff_at(exchange: str = "NYSE", now: datetime = None):
+    """Today's MOC cutoff as an ET datetime, or None when there is no session today."""
+    now_et = now or datetime.now(pytz.timezone("America/New_York"))
+    window = _session_window(exchange, now_et)
+    if window is None:
+        return None
+    return window[1] - pd.Timedelta(minutes=GLOBAL.get("moc_cutoff_min", 10))
 
 import logging
 logger = logging.getLogger("executor")
@@ -78,7 +105,8 @@ class OrderIntent(BaseModel):
     # used only when intent_type == "target_position" — signed, no "side" needed
     target_quantity: Optional[float] = None
 
-    order_type: Literal["market", "limit"]
+    #: "moc" = market-on-close: executes in the closing auction at the close price
+    order_type: Literal["market", "limit", "moc"]
     limit_price: Optional[float] = None
     time_in_force: str = "day"
     metadata: dict = Field(default_factory=dict)
@@ -103,9 +131,12 @@ class OrderIntent(BaseModel):
             if self.side is not None or self.quantity is not None:
                 raise ValueError("'side'/'quantity' should not be set for target_position intents — use 'target_quantity'")
 
-        if self.order_type == "market" and self.expected_price is None:
+        if self.order_type in ("market", "moc") and self.expected_price is None:
             raise ValueError("expected_price is required for market orders "
                          "(a systematic strategy always has a reference price at signal time)")
+        if self.order_type == "moc" and self.time_in_force != "day":
+            raise ValueError("a market-on-close order is for today's close — time_in_force "
+                             f"must be 'day', got {self.time_in_force!r}")
         return self
 
 class CentralExecutor(EClient, EWrapper):
@@ -360,6 +391,8 @@ class CentralExecutor(EClient, EWrapper):
 
         if intent["order_type"] == "market":
             order.orderType = "MKT"
+        elif intent["order_type"] == "moc":
+            order.orderType = "MOC"
         elif intent["order_type"] == "limit":
             order.orderType = "LMT"
             order.lmtPrice = intent["limit_price"]
@@ -375,6 +408,8 @@ class CentralExecutor(EClient, EWrapper):
 
         tif_map = {"day": "DAY", "gtc": "GTC"}
         order.tif = tif_map.get(intent.get("time_in_force", "day"), "DAY")
+        if order.orderType == "MOC":
+            order.tif = "DAY"                   # IB takes MOC as a DAY order only
         order.eTradeOnly = False
         order.firmQuoteOnly = False
         return order
@@ -475,11 +510,15 @@ class CentralExecutor(EClient, EWrapper):
         }
         return order_id
 
-    def place_net_order(self, symbol: str, delta: float, instrument: dict, ref_price, urgent: bool = False):
+    def place_net_order(self, symbol: str, delta: float, instrument: dict, ref_price,
+                        urgent: bool = False, order_type: str = "market",
+                        limit_price: float = None):
         """Pooled net order (coordinator path): trade the whole net delta for a symbol
         under the synthetic '__net__' strategy. Pending is tracked at the NET level via
         record_net_pending (NOT per-strategy); the fill is decomposed into per-strategy
-        sub-fills by the coordinator in execDetails. `delta` is signed (buy>0 / sell<0)."""
+        sub-fills by the coordinator in execDetails. `delta` is signed (buy>0 / sell<0).
+        order_type "moc" sends it to the closing auction, "limit" rests it at limit_price (a
+        chained-order leg); the ATR layer leaves both alone."""
         if abs(delta) < 1e-9:
             return None
         instrument = dict(instrument or {"symbol": symbol})
@@ -491,10 +530,14 @@ class CentralExecutor(EClient, EWrapper):
             "instrument": instrument,
             "side": side,
             "quantity": abs(delta),
-            "order_type": "market",
+            "order_type": order_type if order_type in ("moc", "limit") else "market",
             "time_in_force": "day",
             "expected_price": ref_price,
         }
+        if intent["order_type"] == "limit":
+            if not limit_price or limit_price <= 0:
+                raise ValueError(f"{sym}: a limit net order needs a positive limit_price")
+            intent["limit_price"] = float(limit_price)
         # --- ATR execution layer: transform market -> limit-at-pullback ---
         # Skip ATR for urgent orders (flatten / kill_switch) — must close at market.
         # For pooled orders (strategy_id == "__net__"), the ATR layer's strategy filter
@@ -618,6 +661,8 @@ class CentralExecutor(EClient, EWrapper):
             return {"accepted": False,
                     "reason": "market closed — order not submitted "
                               "(set metadata.allow_when_closed=true to queue for open)"}
+        if intent.order_type == "moc" and self.moc_closed():
+            return {"accepted": False, "reason": self.MOC_CLOSED_REASON}
         if self._should_pool(intent):
             return self._submit_pooled(intent)
         with self._dedup_lock:
@@ -922,6 +967,10 @@ class CentralExecutor(EClient, EWrapper):
         Marking PendingCancel also stops a second path cancelling the same order again.
         Returns False if the cancel could not be sent (pending is then left untouched)."""
         st = self.order_status.get(order_id)
+        if st is not None and self._moc_locked(st):
+            logger.critical("cancelling MOC order %s (%s) after the MOC cutoff — the exchange "
+                            "normally refuses this, and then it EXECUTES at the close (%s)",
+                            order_id, st.get("symbol"), reason or "cancel")
         try:
             self.cancelOrder(order_id)
         except Exception as e:
@@ -933,11 +982,36 @@ class CentralExecutor(EClient, EWrapper):
         return True
 
     def _cancel_open_orders_for_symbol(self, symbol: str) -> None:
+        """Cancel the symbol's working orders before a new target is sized — except MOC orders
+        past the cutoff, which the exchange will not cancel. Those stay working and stay in
+        pending, so the replacement is sized around them instead of trading their shares twice."""
         for order_id, status in list(self.order_status.items()):
             if status["symbol"] == symbol and status["status"] in ("PreSubmitted", "Submitted"):
+                if self._moc_locked(status):
+                    logger.info("keeping MOC order %s for %s — past the cutoff it cannot be "
+                                "cancelled, so the new target is sized around it",
+                                order_id, symbol)
+                    continue
                 logger.info("Cancelling stale open order %s for %s before resolving new target",
                             order_id, symbol)
                 self.cancel_order(order_id, "rebalance")
+
+    MOC_CLOSED_REASON = ("MOC cutoff passed — today's closing auction no longer takes new "
+                         "orders; nothing submitted (resend as market, or tomorrow)")
+
+    def moc_closed(self) -> bool:
+        return moc_cutoff_passed()
+
+    def _moc_locked(self, status: dict) -> bool:
+        """A working MOC order past the cutoff: it will execute at the close, whatever we do."""
+        return status.get("order_type") == "moc" and self.moc_closed()
+
+    def locked_orders(self, symbol: str) -> list:
+        """Working orders for `symbol` that can no longer be cancelled (MOC past the cutoff)."""
+        return [oid for oid, st in self.order_status.items()
+                if st.get("symbol") == symbol
+                and st.get("status") in ("PreSubmitted", "Submitted", "PendingSubmit")
+                and self._moc_locked(st)]
 
     # ------------------------------------------------------------------
     # Fill / position callbacks — all delegate to the ledger
@@ -1952,6 +2026,7 @@ class CentralExecutor(EClient, EWrapper):
             intent.target_quantity,                     # already signed
             instrument=intent.instrument.model_dump(),  # carries sec_type/multiplier/exchange
             price=intent.expected_price or intent.limit_price,
+            order_type="moc" if intent.order_type == "moc" else "market",
         )
         if not r.get("accepted"):
             return {"accepted": False, "reason": r.get("reason", "rejected by coordinator")}

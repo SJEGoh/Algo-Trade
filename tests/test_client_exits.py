@@ -57,6 +57,7 @@ class Strat(RemoteStrategy):
     ({"trail_pct": 5}, "fraction"),
     ({"stop_price": 105}, "wrong side"),
     ({"take_profit_price": -1}, "positive"),
+    ({"take_profit_offset": 2, "take_profit_price": 110}, "not both"),
 ])
 def test_a_bad_exit_never_leaves_the_strategy(exits, message):
     e = RemoteStrategy.intent("AAPL", 10, 100.0)
@@ -113,3 +114,16 @@ def test_a_refused_book_exits_1_without_waiting_for_fills():
     assert Strat(client=c).run() == RemoteStrategy.EXIT_REFUSED
     assert c.fill_calls == []
     assert "allocation cap exceeded" in c.journalled[-1]
+
+
+def test_offset_exit_and_moc_ride_along_to_the_book():
+    e = RemoteStrategy.intent("AAPL", 10, 100.0, take_profit_offset=4.2, order_type="moc")
+    Strat(client=object()).validate([e])
+    wire = ExecutorClient._book_entry(e)
+    assert wire["exits"] == {"take_profit_offset": 4.2} and wire["order_type"] == "moc"
+
+
+def test_an_order_type_the_book_cannot_trade_never_leaves_the_strategy():
+    e = RemoteStrategy.intent("AAPL", 10, 100.0, order_type="limit")
+    with pytest.raises(StrategyError, match="order_type"):
+        Strat(client=object()).validate([e])

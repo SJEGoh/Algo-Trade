@@ -322,7 +322,32 @@ class ExecutorClient:
                  "expected_price": intent.get("expected_price")}
         if intent.get("exits"):
             entry["exits"] = intent["exits"]
+        if intent.get("order_type"):
+            entry["order_type"] = intent["order_type"]
         return entry
+
+    def submit_chain(self, legs: list, atr_fraction: float = None, ttl_sec: float = None,
+                     strategy_id: str = None) -> dict:
+        """POST /chains — two legs, each {instrument, target_quantity, expected_price} with an
+        ABSOLUTE target. The executor rests both as ATR-priced limits; the first to fill
+        leads and the other is hedged in proportion through the pool, at market. Expires at
+        ttl_sec (never later than the MOC cutoff): what rests is cancelled, pair balanced."""
+        body = {"strategy_id": self._sid(strategy_id),
+                "legs": [{"instrument": l["instrument"], "target_quantity": l["target_quantity"],
+                          "expected_price": l.get("expected_price")} for l in legs]}
+        if atr_fraction is not None:
+            body["atr_fraction"] = atr_fraction
+        if ttl_sec is not None:
+            body["ttl_sec"] = ttl_sec
+        return self._request("POST", "/chains", auth=True, json=body)
+
+    def chains(self, strategy_id: str = None) -> dict:
+        """GET /chains — this strategy's chained orders, legs, fills and progress."""
+        return self._request("GET", "/chains", params={"strategy_id": self._sid(strategy_id)})
+
+    def cancel_chain(self, chain_id: str) -> dict:
+        """DELETE /chains/{id} — pull what rests; the pair is left balanced."""
+        return self._request("DELETE", f"/chains/{chain_id}", auth=True)
 
     def exits(self, strategy_id: str = None) -> dict:
         """GET /exits — this strategy's armed stop / take-profit / trailing rules with their

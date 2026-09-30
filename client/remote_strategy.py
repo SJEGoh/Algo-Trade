@@ -131,8 +131,9 @@ class RemoteStrategy(ABC):
                exchange: str = "SMART", asset_class: str = "equity",
                multiplier: float = None, *, stop_price: float = None,
                stop_pct: float = None, take_profit_price: float = None,
-               take_profit_pct: float = None, trail_pct: float = None,
-               trail_amount: float = None) -> dict:
+               take_profit_pct: float = None, take_profit_offset: float = None,
+               trail_pct: float = None, trail_amount: float = None,
+               order_type: str = None) -> dict:
         """Build one intent in the shape the executor expects.
 
         `price` is not decoration: it becomes `expected_price`, which the executor uses to
@@ -141,7 +142,11 @@ class RemoteStrategy(ABC):
 
         Exits are optional and independent — pass any combination, or none. `*_pct` values
         are fractions (0.02 = 2%) of the strategy's average cost, so they can go out with
-        the entry. The executor enforces them; see client/README.md."""
+        the entry; `take_profit_offset` is a price distance from that cost (e.g. 2 x ATR).
+        The executor enforces them; see client/README.md.
+
+        `order_type="moc"` trades this name's change in today's closing auction instead of
+        now — send the name at 0 with it to close at the close. Default: market."""
         instrument = {"symbol": symbol, "asset_class": asset_class,
                       "sec_type": sec_type, "exchange": exchange}
         if multiplier is not None:
@@ -151,15 +156,21 @@ class RemoteStrategy(ABC):
         exits = {k: v for k, v in (("stop_price", stop_price), ("stop_pct", stop_pct),
                                    ("take_profit_price", take_profit_price),
                                    ("take_profit_pct", take_profit_pct),
+                                   ("take_profit_offset", take_profit_offset),
                                    ("trail_pct", trail_pct), ("trail_amount", trail_amount))
                  if v is not None}
         if exits:
             entry["exits"] = exits
+        if order_type is not None:
+            entry["order_type"] = order_type
         return entry
 
-    #: exit field pairs — one of each at most
-    EXIT_PAIRS = (("stop_price", "stop_pct"), ("take_profit_price", "take_profit_pct"),
+    #: exit fields by kind — one of each kind at most
+    EXIT_PAIRS = (("stop_price", "stop_pct"),
+                  ("take_profit_price", "take_profit_pct", "take_profit_offset"),
                   ("trail_amount", "trail_pct"))
+    #: how a book entry may ask to be traded (see the executor's /targets)
+    ORDER_TYPES = ("market", "moc")
 
     def validate(self, book: list) -> None:
         """Refuse to send a book that cannot be valued — the same fail-closed rule the
@@ -190,6 +201,10 @@ class RemoteStrategy(ABC):
                 problems.append(f"{where}: expected_price must be positive and finite, "
                                 f"got {price!r} — the allocation cap is computed from it")
 
+            if entry.get("order_type") not in (None,) + self.ORDER_TYPES:
+                problems.append(f"{where}: order_type must be one of {self.ORDER_TYPES}, "
+                                f"got {entry.get('order_type')!r}")
+
             if (entry.get("instrument") or {}).get("sec_type") == "FUT" \
                     and not (entry.get("instrument") or {}).get("multiplier"):
                 problems.append(f"{where}: a futures leg needs instrument.multiplier, or its "
@@ -213,9 +228,12 @@ class RemoteStrategy(ABC):
             if k in allowed and (isinstance(v, bool) or not isinstance(v, (int, float))
                                  or not math.isfinite(v) or v <= 0):
                 out.append(f"{where}: {k} must be a positive number, got {v!r}")
-        for a, b in self.EXIT_PAIRS:
-            if exits.get(a) is not None and exits.get(b) is not None:
-                out.append(f"{where}: set {a} or {b}, not both")
+        for fields in self.EXIT_PAIRS:
+            given = [f for f in fields if exits.get(f) is not None]
+            if len(given) == 2:
+                out.append(f"{where}: set {given[0]} or {given[1]}, not both")
+            elif len(given) > 2:
+                out.append(f"{where}: set only one of {', '.join(given)}")
         if out:
             return out
         qty, price = entry.get("target_quantity"), entry.get("expected_price")

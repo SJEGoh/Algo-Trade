@@ -137,6 +137,11 @@ def test_a_flat_target_ignores_its_exits_rather_than_refusing_the_book():
     ({"take_profit_price": 95}, 10, "wrong side"),     # a long's target below it
     ({"stop_price": 95}, -10, "wrong side"),           # a short's stop below it
     ({"take_profit_pct": 1.2}, -10, "fraction"),       # a short can't gain more than 100%
+    ({"take_profit_offset": 5, "take_profit_pct": 0.05}, 10, "not both"),
+    ({"take_profit_offset": 5, "take_profit_pct": 0.05, "take_profit_price": 120}, 10,
+     "only one of"),
+    ({"take_profit_offset": 100}, -10, "never trigger"),  # a short's target at zero
+    ({"take_profit_offset": -2}, 10, "positive"),
 ])
 def test_an_exit_that_cannot_be_enforced_as_written_is_refused(raw, qty, message):
     with pytest.raises(ExitSpecError, match=message):
@@ -180,6 +185,24 @@ def test_take_profit_fires_for_longs_and_shorts(ex, em):
     fired = em.check({"AAPL": 110.0, "TSLA": 179.0})
     assert sorted((f["symbol"], f["kind"]) for f in fired) == [
         ("AAPL", "take_profit"), ("TSLA", "take_profit")]
+
+
+def test_take_profit_offset_is_a_distance_from_the_fill(ex, em):
+    """entry ± k·ATR for an order that fills at the close: the level cannot be known when the
+    book is sent, so it is sent as a distance and anchored to the executor's own cost."""
+    hold(ex, "s1", "AAPL", 10, 100.0)
+    hold(ex, "s1", "TSLA", -10, 200.0)
+    em.set("s1", "AAPL", 10, {"take_profit_offset": 6.0})
+    em.set("s1", "TSLA", -10, {"take_profit_offset": 6.0})
+    assert em.check({"AAPL": 105.99, "TSLA": 194.01}) == []
+    fired = em.check({"AAPL": 106.0, "TSLA": 194.0})
+    assert sorted((f["symbol"], f["level"]) for f in fired) == [
+        ("AAPL", 106.0), ("TSLA", 194.0)]
+
+
+def test_an_offset_target_waits_for_the_fill(ex, em):
+    em.set("s1", "AAPL", 10, {"take_profit_offset": 6.0})     # entry not filled yet
+    assert em.check({"AAPL": 1_000.0}) == []
 
 
 def test_a_trailing_stop_follows_the_high_and_fires_on_the_retrace(ex, em):

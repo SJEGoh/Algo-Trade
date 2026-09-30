@@ -157,6 +157,11 @@ GLOBAL = {
     "exit_check_sec": 30.0,
     "exit_mark_max_age_sec": 65.0,
 
+    # Market-on-close: new MOC orders are refused, and working ones are treated as
+    # uncancellable, from this many minutes before the session close (NYSE: 15:50 ET, or
+    # 12:50 on an early close). Match your broker's cutoff; IBKR's for NYSE is 15:50.
+    "moc_cutoff_min": 10,
+
     # Auto-reconnect to IB on an unexpected disconnect (then reconcile + recover open orders).
     "auto_reconnect": True,
     "reconnect_max_attempts": 30,

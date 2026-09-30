@@ -72,7 +72,8 @@ Strategies communicate with the executor through HTTP. The main execution endpoi
 
 - `POST /orders` — submit a single order intent
 - `POST /target` — set an absolute target for one symbol within a strategy
-- `POST /targets` — submit an authoritative full-book target snapshot
+- `POST /targets` — submit an authoritative full-book target snapshot (per name: `order_type` market or `moc` for the closing auction, and optional `exits`)
+- `POST /chains`, `GET /chains`, `DELETE /chains/{id}` — chained two-leg orders: both legs rest as ATR-priced limits, the first to fill leads and the other is hedged in proportion through the pool
 - `POST /reconcile` — reconcile internal state with the broker
 - `POST /flatten` — cancel open orders and flatten positions without enabling the kill switch
 - `POST /kill` — activate the kill switch, optionally flattening positions

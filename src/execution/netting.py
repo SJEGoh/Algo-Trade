@@ -12,6 +12,14 @@ Two ways a strategy updates its book:
     self-heals drift and closes any name the strategy stopped mentioning. Run periodically.
 
 Invariant maintained:  sum_over_strategies(strategy_positions[*][sym]) == net position[sym].
+
+Execution style. A target may ask to be traded at the CLOSE (order_type "moc") instead of
+now. The style belongs to the strategy's outstanding change, so a symbol whose gaps mix
+styles goes out as two orders — the close-auction part and the immediate part — each owned
+by its own strategies. Past the MOC cutoff a working MOC order can no longer be cancelled:
+a rebalance leaves it working and sizes the rest around it. A "limit" style (set by a chained
+order, execution/chains.py) rests that strategy's change at its own limit price, re-placed
+at the same price whenever the symbol is re-netted.
 """
 from __future__ import annotations
 
@@ -21,6 +29,8 @@ import math
 import threading
 import time
 from pathlib import Path
+
+from execution.chains import ChainManager
 
 _EPS = 1e-9
 
@@ -47,6 +57,12 @@ class NettingCoordinator:
         #: across restarts, so a persisted entry could attach to an unrelated order in the
         #: next session.
         self.order_owners = {}
+        #: {strategy_id: {symbol: "moc" | {"type": "limit", "price": p, "chain": id}}} — how
+        #: the outstanding change is traded. Absent means at market. Every new target
+        #: restates it.
+        self.exec_style = {}
+        #: chained two-leg orders (execution/chains.py), persisted with the books
+        self.chains = ChainManager(self)
         self.state_path = Path(state_path) if state_path else None
         self._lock = threading.RLock()
         self._load()
@@ -60,6 +76,8 @@ class NettingCoordinator:
                                 for s, b in d.get("desired", {}).items()}
                 self.instrument = d.get("instrument", {})
                 self.ref_price = {k: float(v) for k, v in d.get("ref_price", {}).items()}
+                self.exec_style = d.get("exec_style", {})
+                self.chains.load(d.get("chains"))
             except Exception:
                 pass
 
@@ -67,7 +85,8 @@ class NettingCoordinator:
         if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(json.dumps(
-                {"desired": self.desired, "instrument": self.instrument, "ref_price": self.ref_price}))
+                {"desired": self.desired, "instrument": self.instrument, "ref_price": self.ref_price,
+                 "exec_style": self.exec_style, "chains": self.chains.dump()}))
 
     # ---------------- helpers ----------------
     def _mult(self, sym):
@@ -187,21 +206,29 @@ class NettingCoordinator:
         return out
 
     # ---------------- book updates ----------------
-    def set_target(self, sid, symbol, qty, instrument=None, price=None, urgent: bool = False):
+    def set_target(self, sid, symbol, qty, instrument=None, price=None, urgent: bool = False,
+                   order_type: str = "market", chain_id: str = None):
         """Incremental: set ONE symbol's target for a strategy, then re-net it.
 
         urgent=True sends the resulting order at market, past ATR and any other execution
         layer — for system exits (stops, trailing stops) that must close now, not rest as a
-        limit waiting for a pullback that is the very move the stop is getting out of."""
+        limit waiting for a pullback that is the very move the stop is getting out of.
+        order_type="moc" trades this change in the closing auction instead.
+        A caller other than the chain itself (chain_id None) takes a working chain's symbol
+        over: the chain stops, and its other leg is left balanced."""
         with self._lock:
             if not self.ex.risk_manager.is_active(sid):
                 return {"accepted": False, "reason": f"{sid} not active"}
+            if chain_id is None and self.chains.active_on(sid, symbol):
+                self.chains.supersede(sid, [symbol])
             if instrument is not None:
                 self.instrument[symbol] = instrument
             self._set_ref_price(symbol, price)
             before_gross, before_unvaluable = self._exposure(sid)
             book = self.desired.setdefault(sid, {})
             prev = book.get(symbol)
+            prev_style = self._style(sid, symbol)
+            self._set_style(sid, symbol, "market" if urgent else order_type)
             if qty == 0:
                 book.pop(symbol, None)
             else:
@@ -214,6 +241,7 @@ class NettingCoordinator:
                     book.pop(symbol, None)
                 else:
                     book[symbol] = prev
+                self._set_style(sid, symbol, prev_style)
                 return rejection
             self._save()
             rebal = self._rebalance({symbol}, urgent=urgent)
@@ -224,9 +252,11 @@ class NettingCoordinator:
         with self._lock:
             if not self.ex.risk_manager.is_active(sid):
                 return {"accepted": False, "reason": f"{sid} not active"}
-            new_book = {}
+            new_book, styles = {}, {}
             for it in intents:
                 sym = it["instrument"]["symbol"]
+                if it.get("order_type") == "moc":
+                    styles[sym] = "moc"
                 self.instrument[sym] = it["instrument"]
                 # NOT `or 0.0` — an absent price must stay absent so the allocation check
                 # can reject the book, instead of valuing the leg at zero and passing it.
@@ -243,6 +273,11 @@ class NettingCoordinator:
             if rejection is not None:
                 self.desired[sid] = old
                 return rejection
+            # The book states every target, chained legs included: it takes them over.
+            self.chains.supersede(sid, unwind=False)
+            # Replaces the strategy's styles wholesale. A name sent at 0 with order_type moc
+            # closes in the auction; a name simply left out of the book closes at market.
+            self.exec_style[sid] = styles
             self._save()
             rebal = self._rebalance(set(old) | set(new_book))
             return {"accepted": True, **rebal}
@@ -252,6 +287,8 @@ class NettingCoordinator:
         with self._lock:
             old = self.desired.get(sid) or {}
             self.desired[sid] = {}
+            self.chains.supersede(sid, unwind=False)
+            self.exec_style.pop(sid, None)      # a halt closes now, not at the close
             self._save()
             return self._rebalance(set(old))
 
@@ -353,12 +390,12 @@ class NettingCoordinator:
                 gaps[sid] = want - have
         return gaps
 
-    def _register(self, oid, sym, gaps, delta):
-        """Freeze who an order is for, at the moment it is placed."""
+    def _register(self, oid, sym, gaps, delta, style="market"):
+        """Freeze who an order is for, and how it was worked, at the moment it is placed."""
         if oid is None:
             return
         self.order_owners[oid] = {"symbol": sym, "gaps": dict(gaps),
-                                  "delta": float(delta), "filled": 0.0}
+                                  "delta": float(delta), "filled": 0.0, "style": style}
         status = getattr(self.ex, "order_status", None)
         if isinstance(status, dict) and oid in status:
             status[oid]["owners"] = dict(gaps)            # visible on /orders
@@ -378,6 +415,104 @@ class NettingCoordinator:
             out.append(oid)
         return out
 
+    # ---------------- execution style ----------------
+    def _style(self, sid, sym):
+        st = self.exec_style.get(sid, {}).get(sym, "market")
+        return st["type"] if isinstance(st, dict) else st
+
+    def _set_style(self, sid, sym, style):
+        if style == "moc" or isinstance(style, dict):
+            self.exec_style.setdefault(sid, {})[sym] = style
+        else:
+            self.exec_style.get(sid, {}).pop(sym, None)
+            if not self.exec_style.get(sid, True):
+                self.exec_style.pop(sid, None)
+
+    def _moc_closed(self):
+        closed = getattr(self.ex, "moc_closed", None)
+        return bool(closed()) if callable(closed) else False
+
+    def _style_key(self, sid, sym):
+        st = self.exec_style.get(sid, {}).get(sym, "market")
+        return ("limit", st["price"]) if isinstance(st, dict) else st
+
+    def _restyled(self, sym):
+        """Is a working order for `sym` worked differently from how its owners now want it?
+        The quantity can be unchanged while the style is not — a chain's hedge leg turning
+        from a resting limit to market, a stop firing on a name whose MOC exit is working —
+        and "already covered by working orders" would otherwise leave the old order as is.
+        Locked MOC orders are not counted: they cannot be replaced."""
+        locked = getattr(self.ex, "locked_orders", None)
+        keep = set(locked(sym)) if callable(locked) else set()
+        for oid in self._working_orders(sym):
+            rec = self.order_owners[oid]
+            if oid in keep:
+                continue
+            if any(self._style_key(s, sym) != rec.get("style", "market") for s in rec["gaps"]):
+                return True
+        return False
+
+    def _net_of_locked(self, sym, gaps):
+        """Take out of each strategy's gap what its uncancellable (post-cutoff MOC) orders
+        will still deliver. Those orders stay working, so a new order must not be owned by
+        the same shares twice."""
+        locked = getattr(self.ex, "locked_orders", None)
+        oids = locked(sym) if callable(locked) else []
+        if not oids:
+            return gaps
+        gaps = dict(gaps)
+        for oid in oids:
+            rec = self.order_owners.get(oid)
+            if rec is None or abs(rec["delta"]) < _EPS:
+                logger.warning("MOC order %s for %s is locked in but has no recorded owners — "
+                               "its fill will be attributed by the desired book", oid, sym)
+                continue
+            left = 1.0 - rec["filled"] / rec["delta"]
+            for sid, g in rec["gaps"].items():
+                gaps[sid] = gaps.get(sid, 0.0) - g * left
+        return {sid: g for sid, g in gaps.items() if abs(g) > _EPS}
+
+    def _place(self, sym, delta, gaps, urgent):
+        """Send `delta` for `sym`: the gaps of strategies that asked for the close go to the
+        closing auction as their own order, each resting chain leg as its own limit order,
+        and the rest (with any unowned residue) at market."""
+        placed = []
+        # A limit was priced for one side (buy below / sell above); a gap the other way
+        # would make it marketable at a bad price, so that goes at market instead.
+        limits = {} if urgent else {s: g for s, g in gaps.items()
+                                    if self._style(s, sym) == "limit"
+                                    and g * self.exec_style[s][sym]["side"] > 0}
+        for s, g in limits.items():
+            px = self.exec_style[s][sym]["price"]
+            oid = self.ex.place_net_order(sym, g, self.instrument.get(sym),
+                                          self.ref_price.get(sym), urgent=False,
+                                          order_type="limit", limit_price=px)
+            self._register(oid, sym, {s: g}, g, style=("limit", px))
+            placed.append({"symbol": sym, "delta": g, "order_id": oid,
+                           "order_type": "limit", "limit_price": px})
+        delta -= sum(limits.values())
+        gaps = {s: g for s, g in gaps.items() if s not in limits}
+        moc = {} if urgent else {s: g for s, g in gaps.items() if self._style(s, sym) == "moc"}
+        if moc and self._moc_closed():
+            logger.warning("%s: MOC cutoff has passed with %s still wanting the close — "
+                           "sending at market instead", sym, sorted(moc))
+            moc = {}
+        moc_qty = sum(moc.values())
+        if abs(moc_qty) > _EPS:
+            oid = self.ex.place_net_order(sym, moc_qty, self.instrument.get(sym),
+                                          self.ref_price.get(sym), urgent=False,
+                                          order_type="moc")
+            self._register(oid, sym, moc, moc_qty, style="moc")
+            placed.append({"symbol": sym, "delta": moc_qty, "order_id": oid,
+                           "order_type": "moc"})
+        rest, rest_gaps = delta - moc_qty, {s: g for s, g in gaps.items() if s not in moc}
+        if abs(rest) > _EPS:
+            oid = self.ex.place_net_order(sym, rest, self.instrument.get(sym),
+                                          self.ref_price.get(sym), urgent=urgent)
+            self._register(oid, sym, rest_gaps, rest)
+            placed.append({"symbol": sym, "delta": rest, "order_id": oid})
+        return placed
+
     @staticmethod
     def _is_exact_offset(gaps):
         return (any(g > 0 for g in gaps.values()) and any(g < 0 for g in gaps.values())
@@ -391,11 +526,8 @@ class NettingCoordinator:
         buys = {s: g for s, g in gaps.items() if g > 0}
         sells = {s: g for s, g in gaps.items() if g < 0}
         for side in (buys, sells):
-            qty = sum(side.values())
-            oid = self.ex.place_net_order(sym, qty, self.instrument.get(sym),
-                                          self.ref_price.get(sym), urgent=urgent)
-            self._register(oid, sym, side, qty)
-            placed.append({"symbol": sym, "delta": qty, "order_id": oid, "offset_leg": True})
+            for p in self._place(sym, sum(side.values()), side, urgent):
+                placed.append({**p, "offset_leg": True})
         logger.info("Offsetting legs for %s sent as two orders: %+g / %+g",
                     sym, sum(buys.values()), sum(sells.values()))
         return placed
@@ -419,7 +551,8 @@ class NettingCoordinator:
             placed = []
             for sym in symbols:
                 target = net.get(sym, 0.0)
-                if abs(target - self.ex.ledger.effective_position(sym)) < _EPS:
+                if (abs(target - self.ex.ledger.effective_position(sym)) < _EPS
+                        and not self._restyled(sym)):
                     # Covered by filled + working orders — unless strategies offset each
                     # other exactly and nothing is working to settle them.
                     gaps = self._owner_gaps(sym)
@@ -428,19 +561,24 @@ class NettingCoordinator:
                     continue
                 self.ex._cancel_open_orders_for_symbol(sym)      # cancel stale in-flight first
                 delta = target - self.ex.ledger.effective_position(sym)
-                gaps = self._owner_gaps(sym)
+                gaps = self._net_of_locked(sym, self._owner_gaps(sym))
                 if abs(delta) < _EPS:
                     if self._is_exact_offset(gaps):
                         placed += self._place_offsetting_legs(sym, gaps, urgent)
                     continue
-                oid = self.ex.place_net_order(sym, delta, self.instrument.get(sym),
-                                              self.ref_price.get(sym), urgent=urgent)
-                self._register(oid, sym, gaps, delta)
-                placed.append({"symbol": sym, "delta": delta, "order_id": oid})
+                placed += self._place(sym, delta, gaps, urgent)
             return {"orders": placed, "internal_crosses": crosses}
 
     # ---------------- fill attribution ----------------
     def attribute_fill(self, symbol, filled_signed, price, order_id=None):
+        """Book a fill (see _attribute), then let any chained order on the symbol react to it
+        — the hedge leg goes out on the same event that moved the position."""
+        with self._lock:
+            attributed = self._attribute(symbol, filled_signed, price, order_id)
+            self.chains.on_fill(symbol)
+            return attributed
+
+    def _attribute(self, symbol, filled_signed, price, order_id=None):
         """Book a fill to the strategies that OWNED the order that filled.
 
         Owners and their shares were frozen when the order was placed, so a fill cannot be
