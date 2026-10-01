@@ -14,7 +14,7 @@ from execution.central_execution import CentralExecutor, is_market_open, moc_cut
 from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
-from config import CONFIG, GLOBAL, validate_config
+from config import CONFIG, GLOBAL, is_funded, validate_config
 from portfolio import hedger
 from risk.exit_rules import ExitManager, ExitSpecError, parse_exits
 
@@ -479,6 +479,24 @@ def clear_exit(strategy_id: str, symbol: str):
                                     f"exit rules/lockout for {symbol} cleared by hand: {out}",
                                     symbols=[symbol])
     return out
+
+
+@app.get("/price/{symbol}")
+def get_price(symbol: str):
+    """Last price for an equity: a market-data snapshot from IB, else the equity sampler's
+    last mark. For sizing and the risk check's notional — not a quote to trade against."""
+    sym = symbol.strip().upper()
+    price, source = None, None
+    if executor.isConnected():
+        try:
+            price, source = executor.fetch_price(sym), "ib"
+        except Exception as e:
+            logger.warning("price fetch for %s failed: %s", sym, e)
+    if not price or price <= 0:
+        price, source = (_last_equity.get("marks") or {}).get(sym), "last_mark"
+    if not price or price <= 0:
+        raise HTTPException(status_code=503, detail=f"no price available for {sym}")
+    return {"symbol": sym, "price": float(price), "source": source}
 
 
 @app.get("/net")
@@ -1281,6 +1299,7 @@ def list_strategies():
             "capital_allocation": cfg["capital_allocation"],
             "max_drawdown": cfg["max_drawdown"],
             "active": executor.risk_manager.is_active(sid),
+            "funded": is_funded(sid, cfg),
         }
         for sid, cfg in CONFIG.items()
     ]}
@@ -1299,6 +1318,27 @@ _STALE_SKIP_ALERT_AFTER = 5
 # UNREALIZED losses, so it failing repeatedly has to page rather than log quietly.
 _sampler_failures = [0]
 _SAMPLER_FAIL_ALERT_AFTER = 3
+
+
+def _portfolio_totals(strategies: dict) -> dict:
+    """Portfolio balance sheet: the sum of every strategy's positions and cash. Cached for
+    the dashboard and Telegram (GET /equity).
+
+    An UNFUNDED strategy (test fixture, demo, hedge overlay — see config.is_funded) has no
+    real capital behind its allocation, so only what it has actually done counts: its
+    positions and P&L, never its nominal starting cash. Its cash enters as cash - basis,
+    which keeps  nav == cash + position_value  and  equity == nav - starting_cash  for the
+    totals exactly as for each strategy."""
+    keys = ("cash", "position_value", "nav", "starting_cash", "realized", "unrealized", "equity")
+    totals = dict.fromkeys(keys, 0.0)
+    for sid, v in strategies.items():
+        basis = 0.0 if is_funded(sid) else v.get("starting_cash", 0.0)
+        for k in keys:
+            totals[k] += v.get(k, 0.0)
+        totals["cash"] -= basis
+        totals["nav"] -= basis
+        totals["starting_cash"] -= basis
+    return totals
 
 
 def _equity_sampler(interval: float = 60.0):
@@ -1332,17 +1372,7 @@ def _equity_sampler(interval: float = 60.0):
                     )
                 except Exception as e:
                     log.error("equity snapshot not recorded for %s: %s", strat, e)
-            # Portfolio balance sheet: NAV is the sum of every position of every strategy,
-            # cash included. Cached for the dashboard (GET /equity).
-            totals = {
-                "cash": sum(v.get("cash", 0.0) for v in visible.values()),
-                "position_value": sum(v.get("position_value", 0.0) for v in visible.values()),
-                "nav": sum(v.get("nav", 0.0) for v in visible.values()),
-                "starting_cash": sum(v.get("starting_cash", 0.0) for v in visible.values()),
-                "realized": sum(v.get("realized", 0.0) for v in visible.values()),
-                "unrealized": sum(v.get("unrealized", 0.0) for v in visible.values()),
-                "equity": sum(v.get("equity", 0.0) for v in visible.values()),
-            }
+            totals = _portfolio_totals(visible)
             _last_equity.update({"ts": ts, "strategies": visible, "totals": totals,
                                  "marks": {k: v for k, v in marks.items() if v is not None}})
             # ---- risk enforcement -------------------------------------------------

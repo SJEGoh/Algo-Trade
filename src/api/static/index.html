@@ -468,8 +468,11 @@ function renderEquity() {
     if (!rows.length) { box.innerHTML = `<div class="empty">no snapshots yet</div>`; return; }
     // capital basis per strategy: live cash book first, else its configured allocation
     const startCash = (state.data.positions?.starting_cash) || {};
-    const alloc = {};
-    ((state.data.strategies?.strategies) || []).forEach(s => (alloc[s.strategy_id] = s.capital_allocation));
+    const alloc = {}, unfunded = new Set();
+    ((state.data.strategies?.strategies) || []).forEach(s => {
+      alloc[s.strategy_id] = s.capital_allocation;
+      if (s.funded === false) unfunded.add(s.strategy_id);
+    });
     const basisOf = (sid) => startCash[sid] ?? alloc[sid] ?? 0;
 
     const ts = [...new Set(rows.map(r => r.ts))].sort();
@@ -489,7 +492,8 @@ function renderEquity() {
         const v = byTs[t][sid];
         if (v != null) last[sid] = v;
         series[sid].push(last[sid]);
-        total += last[sid];
+        // same rule as the server's totals: an unfunded strategy adds its P&L, not its basis
+        total += unfunded.has(sid) ? last[sid] - basisOf(sid) : last[sid];
       });
       overall.push(total);
     });

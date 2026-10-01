@@ -192,6 +192,26 @@ ATR_EXECUTION = {
 
 
 # ---------------------------------------------------------------------------
+# Funded vs unfunded strategies. Every strategy's capital_allocation seeds its cash, which
+# is right for capital actually set aside — but test fixtures, demo rows and the hedge
+# overlay (whose allocation is a notional ceiling, see above) have none behind them, and
+# counting their starting cash put ~$1.1M of money that doesn't exist into portfolio NAV.
+# Portfolio totals count an unfunded strategy's P&L and positions, never its starting cash.
+# A config or runtime entry can override with "funded": True / False.
+# ---------------------------------------------------------------------------
+UNFUNDED_PREFIXES = ("test_suite", "halt_test", "demo_")
+UNFUNDED_STRATEGIES = frozenset({"hedge_overlay"})
+
+
+def is_funded(strategy_id: str, entry: dict = None) -> bool:
+    entry = CONFIG.get(strategy_id, {}) if entry is None else entry
+    if "funded" in entry:
+        return bool(entry["funded"])
+    return (strategy_id not in UNFUNDED_STRATEGIES
+            and not strategy_id.startswith(UNFUNDED_PREFIXES))
+
+
+# ---------------------------------------------------------------------------
 # Config validation — a strategy missing `capital_allocation` or `max_drawdown` has NO
 # allocation cap and NO drawdown halt, silently: drawdown_status returns "not breached"
 # when either key is absent, so a typo disables the protection rather than announcing it.

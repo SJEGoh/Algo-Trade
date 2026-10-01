@@ -197,6 +197,10 @@ def cmd_help(args, ctx) -> str:
         "\nControl (allow-listed users):\n"
         "  /halt <strategy> [noflatten]   stop a strategy, close its book\n"
         "  /resume <strategy>             clear a halt\n"
+        "  /buy <sym> <qty> [strategy]    open or add, at market *\n"
+        "  /sell <sym> <qty> [strategy]   reduce, or go short *\n"
+        "  /close <sym> [strategy]        take that strategy to flat *\n"
+        "        no strategy = discretionary\n"
         "  /flatten [strategy]            close a book, keep trading enabled *\n"
         "  /kill                          stop everything and flatten *\n"
         "  /unkill                        re-enable order flow *\n"
@@ -566,6 +570,101 @@ def cmd_delstrategy(args, ctx) -> str:
     return f"\U0001f5d1 {sid} removed from the allowlist."
 
 
+DEFAULT_TRADE_STRATEGY = "discretionary"
+TRADE_USAGE = ("usage: /buy <symbol> <qty> [strategy] | /sell <symbol> <qty> [strategy] | "
+               f"/close <symbol> [strategy]   (no strategy = {DEFAULT_TRADE_STRATEGY})")
+
+
+def _trade_plan(verb: str, args) -> dict:
+    """Turn /buy, /sell or /close into an absolute target for one strategy and symbol.
+
+    Builds on the strategy's DESIRED quantity where it has one, not just what has filled:
+    two quick /buy 10s must end at 20, and a target still working would otherwise be
+    counted from zero again."""
+    if verb == "close":
+        if len(args) not in (1, 2):
+            raise ValueError(TRADE_USAGE)
+        sym, qty_txt = args[0], None
+        sid = args[1] if len(args) == 2 else DEFAULT_TRADE_STRATEGY
+    else:
+        if len(args) not in (2, 3):
+            raise ValueError(TRADE_USAGE)
+        sym, qty_txt = args[0], args[1]
+        sid = args[2] if len(args) == 3 else DEFAULT_TRADE_STRATEGY
+    sym = sym.strip().upper()
+    if not sym.isalpha():
+        raise ValueError(f"{sym!r} doesn't look like a stock symbol")
+
+    strategies = {s["strategy_id"]: s for s in api_get("/strategies").get("strategies", [])}
+    if sid not in strategies:
+        raise ValueError(f"unknown strategy {sid} — /strategies lists them")
+    if not strategies[sid].get("active"):
+        raise ValueError(f"{sid} is halted — /resume {sid} first")
+
+    held = next((float(r["quantity"]) for r in api_get(f"/strategies/{sid}/book").get("book", [])
+                 if r.get("symbol") == sym and not r.get("is_cash")), 0.0)
+    desired = (api_get("/net").get("desired") or {}).get(sid, {})
+    current = float(desired.get(sym, held))
+
+    if verb == "close":
+        if abs(current) < 1e-9 and abs(held) < 1e-9:
+            raise ValueError(f"{sid} holds no {sym}")
+        target = 0.0
+    else:
+        try:
+            qty = float(qty_txt)
+        except ValueError:
+            raise ValueError(TRADE_USAGE)
+        if qty <= 0 or qty != int(qty):
+            raise ValueError("quantity must be a whole number of shares above 0")
+        target = current + qty if verb == "buy" else current - qty
+
+    price = float(api_get(f"/price/{sym}")["price"])
+    return {"strategy": sid, "symbol": sym, "held": held, "current": current,
+            "target": target, "price": price,
+            "allocation": strategies[sid].get("capital_allocation")}
+
+
+def _trade_preview(verb: str, args, ctx) -> str:
+    p = _trade_plan(verb, args)
+    delta = p["target"] - p["current"]
+    lines = [f"{'BUY' if delta > 0 else 'SELL'} {abs(delta):g} {p['symbol']}  ({p['strategy']})",
+             f"position {p['current']:g} -> {p['target']:g}   "
+             f"~{money(abs(delta) * p['price'])} at {p['price']:,.2f}, market",
+             f"{p['strategy']} allocation {money(p['allocation'])} (gross cap)"]
+    if abs(p["current"] - p["held"]) > 1e-9:
+        lines.append(f"(holds {p['held']:g} now; {p['current']:g} is its working target)")
+    if p["strategy"] != DEFAULT_TRADE_STRATEGY:
+        lines.append(f"Note: {p['strategy']}'s next run restates its whole book and may undo this.")
+    return "\n".join(lines)
+
+
+def _trade_run(verb: str, args, ctx) -> str:
+    p = _trade_plan(verb, args)                  # re-planned: the position may have moved
+    r = api_post("/target", {
+        "strategy_id": p["strategy"], "symbol": p["symbol"], "quantity": p["target"],
+        "price": p["price"],
+        "instrument": {"symbol": p["symbol"], "asset_class": "equity", "sec_type": "STK",
+                       "exchange": "SMART"}})
+    if not r.get("accepted", True):
+        return f"❌ refused: {r.get('reason', r)}"
+    orders = [o.get("order_id") for o in r.get("orders", []) if o.get("order_id")]
+    crossed = r.get("internal_crosses") or []
+    done = (f"order {', '.join(f'#{o}' for o in orders)} sent" if orders
+            else "crossed internally with another strategy, nothing sent" if crossed
+            else "already at target, nothing sent")
+    return (f"✅ {p['strategy']} {p['symbol']} target {p['target']:g} — {done}.\n"
+            "/orders shows it working; /positions once filled.")
+
+
+def preview_buy(args, ctx): return _trade_preview("buy", args, ctx)
+def preview_sell(args, ctx): return _trade_preview("sell", args, ctx)
+def preview_close(args, ctx): return _trade_preview("close", args, ctx)
+def cmd_buy(args, ctx): return _trade_run("buy", args, ctx)
+def cmd_sell(args, ctx): return _trade_run("sell", args, ctx)
+def cmd_close(args, ctx): return _trade_run("close", args, ctx)
+
+
 EXECSET_USAGE = ("usage: /execset <layer> on | off | all | only <id> [id ...] | "
                  "add <id> [id ...] | remove <id> [id ...]   (/exec lists the layers)")
 
@@ -697,6 +796,10 @@ COMMANDS = {
                            preview=preview_addstrategy),
     "delstrategy": Command(cmd_delstrategy, restricted=True, confirm=True,
                            preview=preview_delstrategy),
+    # hand-placed trades — they move money like /allocate does
+    "buy":         Command(cmd_buy, restricted=True, confirm=True, preview=preview_buy),
+    "sell":        Command(cmd_sell, restricted=True, confirm=True, preview=preview_sell),
+    "close":       Command(cmd_close, restricted=True, confirm=True, preview=preview_close),
     # changes how every order of those strategies is placed from now on
     "execset":     Command(cmd_execset, restricted=True, confirm=True,
                            preview=preview_execset),
