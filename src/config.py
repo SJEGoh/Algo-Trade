@@ -175,6 +175,9 @@ GLOBAL = {
 # buy a little cheaper on a normal intraday pullback.  Unfilled orders are
 # cancelled before the close (POST /atr/cancel from day_scheduler).
 # ---------------------------------------------------------------------------
+# `enabled` and `strategies` are defaults only: once changed at runtime (Telegram
+# /execset atr ..., POST /execution/atr) the saved setting wins at every restart, and
+# editing them here does nothing until that row is gone. /exec shows what is in force.
 ATR_EXECUTION = {
     "enabled": True,                 # flip to True to activate
     "atr_period": 14,                 # ATR lookback in intraday bars

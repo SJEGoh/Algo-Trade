@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import threading
 import time
@@ -162,6 +163,16 @@ class EventLogger:
                 CREATE TABLE IF NOT EXISTS exit_state (
                     id         INTEGER PRIMARY KEY CHECK (id = 1),
                     state      TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                -- Runtime on/off and strategy list for each execution layer (ATR, and any
+                -- added later), set by POST /execution/{layer} or Telegram /execset. A row
+                -- wins over the layer's config.py block at startup, so a change survives a
+                -- restart. strategies is a JSON list; empty means every strategy.
+                CREATE TABLE IF NOT EXISTS execution_settings (
+                    layer      TEXT PRIMARY KEY,
+                    enabled    INTEGER NOT NULL,
+                    strategies TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
@@ -550,6 +561,26 @@ class EventLogger:
                 "updated_at = excluded.updated_at",
                 (state_json, self._now()))
             self._conn.commit()
+
+    def save_execution_settings(self, layer: str, enabled: bool, strategies: list) -> None:
+        """Raises on failure — the caller must not apply a setting that would revert at the
+        next restart."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO execution_settings (layer, enabled, strategies, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(layer) DO UPDATE SET "
+                "enabled = excluded.enabled, strategies = excluded.strategies, "
+                "updated_at = excluded.updated_at",
+                (layer, 1 if enabled else 0, json.dumps(list(strategies)), self._now()))
+            self._conn.commit()
+
+    def load_execution_settings(self) -> dict:
+        """layer -> {"enabled": bool, "strategies": [...]}, for layers changed at runtime."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT layer, enabled, strategies FROM execution_settings").fetchall()
+        return {layer: {"enabled": bool(en), "strategies": list(json.loads(st))}
+                for layer, en, st in rows}
 
     def load_exit_state(self):
         with self._lock:

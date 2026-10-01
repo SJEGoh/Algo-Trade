@@ -204,6 +204,10 @@ class CentralExecutor(EClient, EWrapper):
 
         # make meta class to replace this like self.execution_strat 
         self.atr_layer = AtrPullbackLayer(ATR_EXECUTION, executor=self)
+        # Every execution layer by the name /execution and Telegram /execset use. A new
+        # layer goes in here to be switchable at runtime — and still needs wiring into the
+        # order paths that call atr_layer.transform today.
+        self.execution_layers = {"atr": self.atr_layer}
 
         # Historical data infrastructure (used by ATR layer)
         self._hist_data: Dict[int, list] = {}          # reqId -> [BarData, ...]
@@ -2193,6 +2197,22 @@ class CentralExecutor(EClient, EWrapper):
             # Loud: every intent from an unrestored strategy is rejected as "not active".
             logger.critical("failed to restore runtime strategies — any strategy added "
                             "since the last restart will have its orders REJECTED: %s", e)
+
+        # Execution layers switched on/off or re-scoped at runtime (/execution/{layer}).
+        # Each layer's config.py block is only the default until the first change.
+        try:
+            for name, saved in self.logger_db.load_execution_settings().items():
+                layer = self.execution_layers.get(name)
+                if layer is None:
+                    logger.warning("saved setting for unknown execution layer %r ignored", name)
+                    continue
+                layer.enabled = saved["enabled"]
+                layer.strategies = list(saved["strategies"])
+                logger.warning("restored %s execution: %s, strategies=%s", name,
+                               "on" if saved["enabled"] else "off",
+                               saved["strategies"] or "all")
+        except Exception as e:
+            logger.error("failed to restore execution-layer settings (using config.py's): %s", e)
 
         # restore runtime allocation changes (CONFIG holds the defaults)
         try:

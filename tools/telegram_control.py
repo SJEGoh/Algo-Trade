@@ -193,6 +193,7 @@ def cmd_help(args, ctx) -> str:
         "  /fills [n]      recent fills\n"
         "  /strategies     allocations and halt state\n"
         "  /journal [n]    recent decisions\n"
+        "  /exec           execution layers (ATR ...): on/off, strategies\n"
         "\nControl (allow-listed users):\n"
         "  /halt <strategy> [noflatten]   stop a strategy, close its book\n"
         "  /resume <strategy>             clear a halt\n"
@@ -205,6 +206,9 @@ def cmd_help(args, ctx) -> str:
         "  /addstrategy <id> <amount> [dd]  put a new strategy on the\n"
         "        allowlist, e.g. /addstrategy pairs_v2 150k 10%  *\n"
         "  /delstrategy <id>              remove one (must be flat) *\n"
+        "  /execset <layer> on|off|all    switch an execution layer, or put\n"
+        "        it on every strategy; also: only|add|remove <id..>, e.g.\n"
+        "        /execset atr all  *\n"
         "  /reconcile                     resync with the broker\n"
         "  /reset_daily                   reset the daily loss baseline\n"
         "\n* needs /confirm <token> within "
@@ -562,6 +566,95 @@ def cmd_delstrategy(args, ctx) -> str:
     return f"\U0001f5d1 {sid} removed from the allowlist."
 
 
+EXECSET_USAGE = ("usage: /execset <layer> on | off | all | only <id> [id ...] | "
+                 "add <id> [id ...] | remove <id> [id ...]   (/exec lists the layers)")
+
+
+def _layer_describe(enabled: bool, strategies: list) -> str:
+    who = ", ".join(strategies) if strategies else "all strategies"
+    return f"ON for {who}" if enabled else f"OFF (set for {who})"
+
+
+def _exec_plan(args) -> tuple:
+    """(layer, body for POST /execution/<layer>, current state, new state) from /execset.
+
+    all / only / add also switch the layer on — asking for it on a strategy means you want
+    it. A layer reads an EMPTY strategy list as "every strategy", so removing the last one
+    is refused rather than quietly applying the layer to everything."""
+    if len(args) < 2:
+        raise ValueError(EXECSET_USAGE)
+    layers = {l["layer"]: l for l in api_get("/execution").get("layers", [])}
+    name = args[0].lower()
+    if name not in layers:
+        raise ValueError(f"unknown execution layer {name!r} — have: {', '.join(layers)}")
+    enabled = bool(layers[name].get("enabled"))
+    current = list(layers[name].get("strategies") or [])
+    known = [s["strategy_id"] for s in api_get("/strategies").get("strategies", [])]
+    verb, ids = args[1].lower(), [a.strip() for a in args[2:] if a.strip()]
+
+    unknown = [s for s in ids if s not in known]
+    if unknown:
+        raise ValueError(f"unknown strategy: {', '.join(unknown)} — /strategies lists them")
+
+    if verb in ("on", "off") and not ids:
+        new_enabled, new = verb == "on", current
+    elif verb == "all" and not ids:
+        new_enabled, new = True, []
+    elif verb == "only" and ids:
+        new_enabled, new = True, list(dict.fromkeys(ids))
+    elif verb == "add" and ids:
+        if not current:
+            raise ValueError(f"{name} already covers all strategies — use "
+                             f"/execset {name} only <id> to narrow it")
+        new_enabled, new = True, current + [s for s in ids if s not in current]
+    elif verb == "remove" and ids:
+        base = current or known                 # "all" -> spell the list out, minus these
+        missing = [s for s in ids if s not in base]
+        if missing:
+            raise ValueError(f"{', '.join(missing)} is not on {name}")
+        new_enabled, new = enabled, [s for s in base if s not in ids]
+        if not new:
+            raise ValueError(f"that would leave no strategies on {name} — use "
+                             f"/execset {name} off")
+    else:
+        raise ValueError(EXECSET_USAGE)
+
+    body = {"enabled": new_enabled, "strategies": new if new else "all"}
+    return (name, body, _layer_describe(enabled, current),
+            _layer_describe(new_enabled, new))
+
+
+def cmd_exec(args, ctx) -> str:
+    layers = api_get("/execution").get("layers", [])
+    if not layers:
+        return "no execution layers"
+    lines = [f"{l['layer']}: {_layer_describe(bool(l.get('enabled')), l.get('strategies') or [])}"
+             f" — {l.get('pending_orders', 0)} working" for l in layers]
+    return ("Execution layers\n" + "\n".join(lines) +
+            "\nExits, flatten, kill and MOC always go at market.\n"
+            "Change one with /execset <layer> ...")
+
+
+def preview_execset(args, ctx) -> str:
+    name, _, before, after = _exec_plan(args)
+    note = ""
+    if args[1].lower() == "remove" and before.endswith("all strategies"):
+        note = ("\nThis spells out today's strategies; one added later will not be on "
+                f"{name} until you /execset {name} add it.")
+    return (f"{name} execution\nnow   {before}\nafter {after}\n"
+            "Applies to orders placed from now on; orders already working are left alone."
+            + note)
+
+
+def cmd_execset(args, ctx) -> str:
+    name, body, _, _ = _exec_plan(args)          # re-planned: the state may have moved
+    body["changed_by"] = ctx.get("user", "telegram")
+    r = api_post(f"/execution/{name}", body)
+    return (f"\u2705 {name} execution "
+            f"{_layer_describe(bool(r.get('enabled')), r.get('strategies') or [])}"
+            "\nSaved — it survives a restart.")
+
+
 def _int_arg(args, default):
     try:
         return max(1, min(50, int(args[0])))
@@ -586,6 +679,7 @@ COMMANDS = {
     "fills":       Command(cmd_fills),
     "strategies":  Command(cmd_strategies),
     "journal":     Command(cmd_journal),
+    "exec":        Command(cmd_exec),
     # protective: no confirmation, because a speed bump in front of de-risking is a bug
     "halt":        Command(cmd_halt, restricted=True),
     "resume":      Command(cmd_resume, restricted=True),
@@ -603,6 +697,9 @@ COMMANDS = {
                            preview=preview_addstrategy),
     "delstrategy": Command(cmd_delstrategy, restricted=True, confirm=True,
                            preview=preview_delstrategy),
+    # changes how every order of those strategies is placed from now on
+    "execset":     Command(cmd_execset, restricted=True, confirm=True,
+                           preview=preview_execset),
 }
 
 # token -> (command, args, user_id, expires_at)

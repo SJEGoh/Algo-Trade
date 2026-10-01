@@ -2,7 +2,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Literal, Optional, Union
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -657,6 +657,146 @@ def get_orphans():
         ],
         "count": len(orphans),
     }
+
+
+_WORKING_STATUSES = ("PendingSubmit", "PreSubmitted", "Submitted")
+
+
+def _bucket_snapshot(sid: str, sym: str) -> dict:
+    led = executor.ledger
+    return {"strategy_id": sid,
+            "quantity": led.strategy_positions.get(sid, {}).get(sym, 0.0),
+            "avg_cost": led.strategy_avg_cost.get(sid, {}).get(sym, 0.0),
+            "realized": led.strategy_realized_pnl.get(sid, 0.0)}
+
+
+@app.post("/positions/{symbol}/close_unowned", dependencies=[Depends(require_api_key)])
+def close_unowned(symbol: str):
+    """Close a position that only an internal bucket (__net__, flatten_all, kill_switch)
+    holds — shares at the broker that no strategy owns.
+
+    The market order is placed under that bucket's id, so its fill lands back in the same
+    bucket and nets it to zero; /flatten's orphan sweep books the close to flatten_all
+    instead, which zeroes the account but leaves __net__ and flatten_all holding equal and
+    opposite phantom lots. Refuses whenever the close could touch shares a real strategy
+    owns, or the records for the symbol don't add up — those want /positions/transfer."""
+    sym = symbol.strip().upper()
+    led = executor.ledger
+    internal = {sid: led.strategy_positions.get(sid, {}).get(sym, 0.0)
+                for sid in executor.INTERNAL_SIDS}
+    internal = {sid: q for sid, q in internal.items() if abs(q) > 1e-9}
+    if not internal:
+        raise HTTPException(status_code=404, detail=f"no internal bucket holds {sym}")
+    if len(internal) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{sym} is split across {internal} — /positions/transfer it into one "
+                   "bucket first")
+    (owner, qty), = internal.items()
+    real = {sid: pos.get(sym) for sid, pos in led.strategy_positions.items()
+            if sid not in executor.INTERNAL_SIDS and abs(pos.get(sym, 0.0)) > 1e-9}
+    if real:
+        raise HTTPException(
+            status_code=409,
+            detail=f"strategies also hold {sym} ({real}) — a close at the account would trade "
+                   "their shares too. Correct the records with /positions/transfer instead.")
+    account = led.current_positions.get(sym, 0.0)
+    if abs(account - qty) > 1e-6:
+        raise HTTPException(
+            status_code=409,
+            detail=f"records for {sym} don't add up: account {account:g}, {owner} {qty:g} — "
+                   "run /reconcile first")
+    working = sorted(oid for oid, st in executor.order_status.items()
+                     if st.get("symbol") == sym and st.get("status") in _WORKING_STATUSES)
+    if working:
+        raise HTTPException(status_code=409,
+                            detail=f"{sym} has working order(s) {working} — cancel them first")
+    if not executor.isConnected():
+        raise HTTPException(status_code=503, detail="not connected to IB")
+    if executor._enforce_market_hours and not is_market_open():
+        raise HTTPException(status_code=409, detail="market closed")
+    inst = executor._instruments.get(sym) or {"symbol": sym, "asset_class": "equity",
+                                              "sec_type": "STK", "exchange": "SMART"}
+    if inst.get("sec_type", "STK") != "STK" or led.multipliers.get(sym, 1.0) != 1.0:
+        raise HTTPException(status_code=422,
+                            detail=f"{sym} is not a plain equity — close it manually")
+
+    intent = {
+        "client_order_id": f"unowned-{sym}-{int(time.time() * 1000)}",
+        "strategy_id": owner,                  # the fill nets this bucket back to zero
+        "instrument": inst,
+        "side": "sell" if qty > 0 else "buy",
+        "quantity": abs(qty),
+        "order_type": "market",
+        "time_in_force": "day",
+        "expected_price": (executor._ref_value.get(sym)
+                           or led.strategy_avg_cost.get(owner, {}).get(sym) or None),
+    }
+    order_id = executor.place_order(intent)
+    summary = f"closing unowned {qty:+g} {sym} held by {owner}: {intent['side']} {abs(qty):g}"
+    executor.logger_db.log_decision(owner, "close_unowned", summary, detail=f"order {order_id}")
+    _alert(f"\U0001f9f9 {summary} (order {order_id})", topic="orders")
+    return {"symbol": sym, "bucket": owner, "closing": qty, "order_id": order_id}
+
+
+class TransferRequest(BaseModel):
+    """Move part of one bucket's position into another — a records-only correction. No
+    order is sent: the account's position does not change, only who it is booked to.
+    `quantity` is signed as `from_strategy` holds it: +7 moves a long 7, -7 a short 7."""
+    symbol: str
+    from_strategy: str
+    to_strategy: str
+    quantity: float
+    price: Optional[float] = Field(default=None, gt=0)
+    reason: str = ""
+
+
+@app.post("/positions/transfer", dependencies=[Depends(require_api_key)])
+def transfer_position(req: TransferRequest):
+    """Re-book shares between strategies (or internal buckets) without trading.
+
+    Booked as an internal cross at `price` (default: the source's average cost), so it is
+    zero-sum: the account position, total cash and the sum of strategy positions are all
+    unchanged, and each side's cash, average cost and realized P&L move exactly as for a
+    real cross at that price. It only moves shares the source actually holds — it can never
+    increase or flip the source's position, so it cannot invent exposure."""
+    sym = req.symbol.strip().upper()
+    src, dst = req.from_strategy.strip(), req.to_strategy.strip()
+    known = set(CONFIG) | set(executor.INTERNAL_SIDS)
+    for sid in (src, dst):
+        if sid not in known:
+            raise HTTPException(status_code=404, detail=f"unknown strategy {sid}")
+    if src == dst:
+        raise HTTPException(status_code=422, detail="from_strategy and to_strategy are the same")
+    q = float(req.quantity)
+    led = executor.ledger
+    held = led.strategy_positions.get(src, {}).get(sym, 0.0)
+    if abs(q) < 1e-9 or held * q <= 0 or abs(q) > abs(held) + 1e-9:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{src} holds {held:g} {sym} — quantity must be part of that, same sign")
+    price = req.price or led.strategy_avg_cost.get(src, {}).get(sym)
+    if not price or price <= 0:
+        raise HTTPException(status_code=422, detail=f"no price for {sym} — pass one")
+
+    before = {"from": _bucket_snapshot(src, sym), "to": _bucket_snapshot(dst, sym)}
+    led.apply_internal_cross(sym, -q, price, src)
+    led.apply_internal_cross(sym, q, price, dst)
+    after = {"from": _bucket_snapshot(src, sym), "to": _bucket_snapshot(dst, sym)}
+
+    summary = f"transferred {q:+g} {sym} from {src} to {dst} at {price:g}"
+    detail = f"{req.reason or 'records correction'}; before={before}; after={after}"
+    for sid in (src, dst):
+        executor.logger_db.log_decision(sid, "position_transfer", summary, detail=detail)
+    try:
+        led.save_state(executor.logger_db)
+    except Exception as e:
+        logger.critical("position transfer applied but NOT saved — it reverts on restart: %s", e)
+        raise HTTPException(status_code=500,
+                            detail=f"applied in memory but NOT saved (reverts on restart): {e}")
+    _alert(f"\U0001f501 {summary}", topic="orders")
+    return {"symbol": sym, "price": price, "before": before, "after": after,
+            "account_position": led.current_positions.get(sym, 0.0)}
 
 
 @app.get("/pnl")
@@ -1396,10 +1536,12 @@ def atr_cancel_unfilled():
 
 @app.get("/atr/status")
 def atr_status():
-    """Current ATR execution layer state."""
+    """Current ATR execution layer state. `strategies` empty means every strategy."""
     layer = executor.atr_layer
     return {
         "enabled": layer.enabled,
+        "strategies": list(layer.strategies),
+        "skip_exits": layer.skip_exits,
         "atr_period": layer.atr_period,
         "atr_fraction": layer.atr_fraction,
         "bar_size": layer.bar_size,
@@ -1408,3 +1550,75 @@ def atr_status():
         "cached_symbols": list(layer._cache.keys()),
         "cached_atrs": {s: round(v[0], 4) for s, v in layer._cache.items()},
     }
+
+
+def _layer_status(name: str, layer) -> dict:
+    return {"layer": name, "enabled": layer.enabled, "strategies": list(layer.strategies),
+            "skip_exits": layer.skip_exits,
+            "pending_orders": len(layer.pending_order_ids())}
+
+
+@app.get("/execution")
+def execution_layers():
+    """Every execution layer (ATR, and any added later): on/off and the strategies it
+    applies to. `strategies` empty means every strategy."""
+    return {"layers": [_layer_status(n, l) for n, l in executor.execution_layers.items()]}
+
+
+class ExecutionLayerRequest(BaseModel):
+    """Change which orders an execution layer reworks. Omitted fields keep their current
+    value. `strategies` is a list of ids or "all"; an empty list is refused, because a layer
+    reads [] as "every strategy" — the opposite of what it looks like."""
+    enabled: Optional[bool] = None
+    strategies: Optional[Union[List[str], Literal["all"]]] = None
+    changed_by: str = ""
+
+
+@app.post("/execution/{layer_name}", dependencies=[Depends(require_api_key)])
+def set_execution_layer(layer_name: str, req: ExecutionLayerRequest):
+    """Turn an execution layer on or off and choose its strategies, without a restart.
+    PERSISTS BEFORE it takes effect and is restored at startup, where it wins over the
+    layer's block in config.py. Affects orders placed from now on; orders already working
+    stay as they are (ATR limits until they fill or the end-of-day sweep cancels them)."""
+    layer = executor.execution_layers.get(layer_name)
+    if layer is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown execution layer {layer_name!r} — have: "
+                   f"{', '.join(executor.execution_layers)}")
+    enabled = layer.enabled if req.enabled is None else bool(req.enabled)
+    if req.strategies is None:
+        strategies = list(layer.strategies)
+    elif req.strategies == "all":
+        strategies = []
+    else:
+        strategies = list(dict.fromkeys(s.strip() for s in req.strategies if s.strip()))
+        if not strategies:
+            raise HTTPException(
+                status_code=422,
+                detail=f"an empty list would apply {layer_name} to EVERY strategy — send "
+                       "\"all\" for that, or enabled=false to turn it off")
+        unknown = [s for s in strategies if s not in CONFIG]
+        if unknown:
+            raise HTTPException(status_code=422,
+                                detail=f"unknown strategy: {', '.join(unknown)}")
+
+    try:
+        executor.logger_db.save_execution_settings(layer_name, enabled, strategies)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"could not persist the {layer_name} setting, so it was "
+                                   f"NOT changed: {e}")
+
+    before = ("on" if layer.enabled else "off", list(layer.strategies))
+    layer.enabled = enabled
+    layer.strategies = strategies
+
+    applies = ", ".join(strategies) if strategies else "all strategies"
+    summary = f"{layer_name} execution {'ON' if enabled else 'OFF'} — {applies}"
+    executor.logger_db.log_decision(
+        f"{layer_name}_execution", "execution_config", summary,
+        detail=f"was {before[0]} for {before[1] or 'all'}; "
+               f"changed_by={req.changed_by or 'api'}")
+    _alert(f"\u2699\ufe0f {summary}", topic="orders")
+    return _layer_status(layer_name, layer)
