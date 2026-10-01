@@ -19,7 +19,7 @@
 :8080 {
 	@dashboard {
 		method GET HEAD
-		path / /static/* /health /strategies /pnl /pnl/history /positions /orders /fills /equity /reconcile/status
+		path / /static/* /health /strategies /pnl /pnl/history /positions /orders /fills /equity /reconcile/status /account
 	}
 	handle @dashboard {
 		reverse_proxy executor:8000

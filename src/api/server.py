@@ -481,6 +481,60 @@ def clear_exit(strategy_id: str, symbol: str):
     return out
 
 
+_ACCOUNT_TTL = 30.0
+_account_cache: dict = {"ts": 0.0, "accounts": None}
+_account_lock = threading.Lock()
+
+
+@app.get("/account")
+def account_summary():
+    """IB's own numbers for the account — net liquidation (its NAV), cash, gross positions,
+    margin — next to the strategy ledger's NAV from /equity.
+
+    The two differ by design: the ledger only counts capital allocated to strategies, IB
+    counts the whole account. `unallocated` is the gap. Cached for 30s (the dashboard polls
+    every few seconds and IB allows only two account-summary requests at once). Never an
+    HTTP error for "IB didn't answer": `available: false` with the last good figures, so a
+    slow gateway doesn't mark the whole dashboard stale."""
+    with _account_lock:
+        now = time.time()
+        if now - _account_cache["ts"] >= _ACCOUNT_TTL and executor.isConnected():
+            try:
+                fresh = executor.fetch_account_summary()
+            except Exception as e:
+                logger.warning("account summary failed: %s", e)
+                fresh = None
+            if fresh:
+                _account_cache.update(ts=now, accounts=fresh)
+        accounts, ts = _account_cache["accounts"], _account_cache["ts"]
+    if not accounts:
+        return {"available": False, "accounts": [], "net_liquidation": None}
+
+    def total(tag):
+        vals = [v.get(tag) for v in accounts.values() if isinstance(v.get(tag), float)]
+        return sum(vals) if vals else None
+
+    net_liq = total("NetLiquidation")
+    strategies_nav = (_last_equity.get("totals") or {}).get("nav")
+    return {
+        "available": True,
+        "as_of": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+        "age_sec": round(time.time() - ts, 1),
+        "accounts": [{"account": a, **v} for a, v in sorted(accounts.items())],
+        "net_liquidation": net_liq,
+        "total_cash": total("TotalCashValue"),
+        "gross_position_value": total("GrossPositionValue"),
+        "unrealized_pnl": total("UnrealizedPnL"),
+        "realized_pnl": total("RealizedPnL"),
+        "available_funds": total("AvailableFunds"),
+        "buying_power": total("BuyingPower"),
+        "maint_margin": total("MaintMarginReq"),
+        "strategies_nav": strategies_nav,
+        "unallocated": (net_liq - strategies_nav
+                        if net_liq is not None and strategies_nav is not None else None),
+    }
+
+
 @app.get("/price/{symbol}")
 def get_price(symbol: str):
     """Last price for an equity: a market-data snapshot from IB, else the equity sampler's

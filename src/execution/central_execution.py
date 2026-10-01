@@ -209,6 +209,13 @@ class CentralExecutor(EClient, EWrapper):
         # order paths that call atr_layer.transform today.
         self.execution_layers = {"atr": self.atr_layer}
 
+        # Account summary (IB's own view: net liquidation, cash, margin). Request ids start far
+        # above the market-data counter, which climbs by thousands a day.
+        self._acct_req_id = 1_000_000_000
+        self._acct_lock = threading.Lock()
+        self._acct_rows: Dict[int, dict] = {}            # reqId -> {account: {tag: value}}
+        self._acct_events: Dict[int, threading.Event] = {}
+
         # Historical data infrastructure (used by ATR layer)
         self._hist_data: Dict[int, list] = {}          # reqId -> [BarData, ...]
         self._hist_events: Dict[int, threading.Event] = {}  # reqId -> Event
@@ -749,6 +756,56 @@ class CentralExecutor(EClient, EWrapper):
             with self._price_req_lock:
                 self._pending_price_reqs.pop(req_id, None)
                 self._price_results.pop(req_id, None)
+
+    # ------------------------------------------------------------------
+    # Account summary — IB's numbers for the whole account, not the strategy ledger's
+    # ------------------------------------------------------------------
+    ACCOUNT_TAGS = ("NetLiquidation", "TotalCashValue", "GrossPositionValue", "UnrealizedPnL",
+                    "RealizedPnL", "AvailableFunds", "BuyingPower", "MaintMarginReq")
+
+    def fetch_account_summary(self, timeout: float = 5.0) -> Optional[dict]:
+        """{account_id: {tag: value, "currency": ...}} from one reqAccountSummary, or None if
+        IB doesn't answer in time. One-shot: the subscription is cancelled straight after,
+        since IB allows only two open at once."""
+        with self._acct_lock:
+            self._acct_req_id += 1
+            req_id = self._acct_req_id
+            event = threading.Event()
+            self._acct_rows[req_id] = {}
+            self._acct_events[req_id] = event
+        try:
+            self.reqAccountSummary(req_id, "All", ",".join(self.ACCOUNT_TAGS))
+            if not event.wait(timeout=timeout):
+                logger.warning("account summary timed out")
+                return None
+            with self._acct_lock:
+                return dict(self._acct_rows.get(req_id) or {})
+        finally:
+            try:
+                self.cancelAccountSummary(req_id)
+            except Exception:
+                pass
+            with self._acct_lock:
+                self._acct_rows.pop(req_id, None)
+                self._acct_events.pop(req_id, None)
+
+    def accountSummary(self, reqId: int, account: str, tag: str, value: str,
+                       currency: str) -> None:
+        with self._acct_lock:
+            rows = self._acct_rows.get(reqId)
+            if rows is None:
+                return
+            entry = rows.setdefault(account, {"currency": currency})
+            try:
+                entry[tag] = float(value)
+            except (TypeError, ValueError):
+                entry[tag] = value
+
+    def accountSummaryEnd(self, reqId: int) -> None:
+        with self._acct_lock:
+            event = self._acct_events.get(reqId)
+        if event is not None:
+            event.set()
 
     # ------------------------------------------------------------------
     # Historical data (IBKR reqHistoricalData) — used by ATR layer

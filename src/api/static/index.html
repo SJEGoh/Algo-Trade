@@ -288,14 +288,22 @@ function renderNavBar() {
   bar.hidden = false;
   const pnl = t.equity ?? 0;
   const ret = t.starting_cash ? (pnl / t.starting_cash) * 100 : null;
-  bar.innerHTML = [
+  const parts = [
     `<span><span class="k">NAV</span><b>${money(t.nav)}</b></span>`,
     `<span><span class="k">cash</span>${money(t.cash)}</span>`,
     `<span><span class="k">positions</span>${money(t.position_value)}</span>`,
     `<span><span class="k">P&L</span><span class="${signClass(pnl)}">${money(pnl)}` +
       (ret == null ? "" : ` (${ret >= 0 ? "+" : ""}${ret.toFixed(2)}%)`) + `</span></span>`,
     `<span><span class="k">capital</span><span class="dim">${money(t.starting_cash)}</span></span>`,
-  ].join("");
+  ];
+  // IB's own figure for the whole account; the NAV above covers strategy capital only
+  const a = state.data.account;
+  if (a?.available) {
+    parts.push(`<span><span class="k">IB NAV</span><b>${money(a.net_liquidation)}</b></span>`);
+    if (a.unallocated != null)
+      parts.push(`<span><span class="k">unallocated</span><span class="dim">${money(a.unallocated)}</span></span>`);
+  }
+  bar.innerHTML = parts.join("");
 }
 
 // Orders we sent that IB has not acknowledged. Shown SEPARATELY rather than mixed into
@@ -539,6 +547,7 @@ const FEEDS = [
   ["equity", api.equity.bind(api), null],
   ["equityhist", () => api._get("/pnl/history"), null, 30000],
   ["reconcile", () => api._get("/reconcile/status"), null],
+  ["account", () => api._get("/account"), null, 30000],
 ];
 
 const _lastFetch = {};   // feed key -> ms timestamp of its last attempt

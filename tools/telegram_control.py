@@ -244,6 +244,14 @@ def cmd_status(args, ctx) -> str:
     except Exception as e:
         lines.append(f"(equity unavailable: {e})")
     try:
+        acct = api_get("/account")
+        if acct.get("available"):
+            lines.append(f"IB NAV {money(acct.get('net_liquidation'))}  "
+                         f"(unallocated {money(acct.get('unallocated'))}, "
+                         f"buying power {money(acct.get('buying_power'))})")
+    except Exception as e:
+        lines.append(f"(IB account unavailable: {e})")
+    try:
         working = [o for o in api_get("/orders").get("orders", [])
                    if o.get("status") in ("Submitted", "PreSubmitted")]
         halted = [s["strategy_id"] for s in api_get("/strategies").get("strategies", [])
