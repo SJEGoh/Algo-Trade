@@ -2,6 +2,8 @@
 
 > Central execution for systematic trading strategies.
 
+Link: https://executor.tail82fc30.ts.net
+
 **Algo-Trade** is a Python-based trading execution platform designed to give multiple systematic strategies a single, controlled path to market. Strategies generate **order intents**; a central executor handles broker connectivity, validation, risk checks, order submission, position/ledger state, reconciliation, netting, monitoring, and operational controls.
 
 The project is largely inspired by the idea of a centralised execution team: strategies should decide **what** they want to trade, while the execution layer decides **whether and how** those intentions can safely reach the broker.
