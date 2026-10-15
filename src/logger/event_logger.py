@@ -721,18 +721,73 @@ class EventLogger:
         cols = ["entry_id", "ts", "strategy_id", "event_type", "summary", "detail", "symbols"]
         return [dict(zip(cols, r)) for r in rows]
 
-    def get_equity_history(self, strategy_id=None, since=None) -> list:
+    def compact_equity_snapshots(self, older_than: datetime, bucket_sec: int = 3600) -> int:
+        """Thin every snapshot before `older_than` to the LAST one per strategy per
+        `bucket_sec`. Idempotent. Works one day-sized window at a time, taking the lock per
+        window, so a first pass over a large backlog never stalls fills or the sampler for
+        long. Returns rows deleted."""
+        bucket = max(60, int(bucket_sec))
+        step = bucket * max(1, 86400 // bucket)   # whole buckets per window, ~one day
+        cutoff = int(older_than.timestamp()) // bucket * bucket
+        try:
+            with self._lock:
+                first = self._conn.execute(
+                    "SELECT CAST(strftime('%s', MIN(ts)) AS INTEGER) FROM equity_snapshots"
+                ).fetchone()[0]
+        except Exception as e:
+            logger.error("compact_equity_snapshots failed: %s", e)
+            return 0
+        if first is None:
+            return 0
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+        deleted = 0
+        start = first // step * step
+        while start < cutoff:
+            end = min(start + step, cutoff)
+            try:
+                with self._lock:
+                    cur = self._conn.execute(
+                        "DELETE FROM equity_snapshots WHERE ts >= ? AND ts < ? AND snap_id NOT IN ("
+                        " SELECT MAX(snap_id) FROM equity_snapshots WHERE ts >= ? AND ts < ?"
+                        f" GROUP BY strategy_id, CAST(strftime('%s', ts) AS INTEGER) / {bucket})",
+                        (iso(start), iso(end), iso(start), iso(end)))
+                    self._conn.commit()
+                    deleted += max(cur.rowcount, 0)
+            except Exception as e:
+                logger.error("compact_equity_snapshots failed at %s: %s", iso(start), e)
+                break
+            start = end
+        return deleted
+
+    def get_equity_history(self, strategy_id=None, since=None, max_points: int = 0) -> list:
+        """`max_points` > 0 downsamples to at most ~that many points per strategy, keeping the
+        LAST snapshot in each time bucket. The sampler writes one row per strategy per minute
+        around the clock, so the raw table grows without bound — returning all of it from
+        /pnl/history got the executor OOM-killed."""
         cols = ["ts", "strategy_id", "realized", "unrealized", "equity"]
         if self._has_nav_cols:
             cols += list(self.NAV_COLUMNS)
-        q = f"SELECT {', '.join(cols)} FROM equity_snapshots"
         conds, params = [], []
         if strategy_id: conds.append("strategy_id = ?"); params.append(strategy_id)
         if since:       conds.append("ts >= ?");         params.append(since)
-        if conds: q += " WHERE " + " AND ".join(conds)
-        q += " ORDER BY ts ASC"
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
         try:
             with self._lock:
+                bucket = 0
+                if max_points > 0:
+                    lo, hi = self._conn.execute(
+                        "SELECT CAST(strftime('%s', MIN(ts)) AS INTEGER), "
+                        "CAST(strftime('%s', MAX(ts)) AS INTEGER) FROM equity_snapshots" + where,
+                        tuple(params)).fetchone()
+                    if lo is not None and hi is not None:
+                        bucket = max(60, -(-(hi - lo) // max_points))   # ceil, never finer than the sampler
+                if bucket:
+                    q = (f"SELECT {', '.join(cols)} FROM equity_snapshots WHERE snap_id IN ("
+                         f"SELECT MAX(snap_id) FROM equity_snapshots{where} "
+                         f"GROUP BY strategy_id, CAST(strftime('%s', ts) AS INTEGER) / {int(bucket)}"
+                         f") ORDER BY ts ASC")
+                else:
+                    q = f"SELECT {', '.join(cols)} FROM equity_snapshots{where} ORDER BY ts ASC"
                 rows = self._conn.execute(q, tuple(params)).fetchall()
         except Exception as e:
             logger.error("get_equity_history failed: %s", e)

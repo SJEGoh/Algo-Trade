@@ -20,7 +20,7 @@ from risk.exit_rules import ExitManager, ExitSpecError, parse_exits
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 
 # .env lives at repo root (one level above src/) — same pattern as main.py
@@ -90,6 +90,7 @@ async def _startup(app: FastAPI):
     executor.exit_manager = ExitManager(executor, alert=_alert,
                                         max_mark_age=GLOBAL.get("exit_mark_max_age_sec"))
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
+    threading.Thread(target=_equity_compactor, daemon=True, name="equity-compactor").start()
     threading.Thread(target=_exit_sampler, args=(float(GLOBAL.get("exit_check_sec", 30.0)),),
                      daemon=True, name="exit-checks").start()
     app.state.startup_reconciliation = recon
@@ -1397,6 +1398,8 @@ def _portfolio_totals(strategies: dict) -> dict:
 
 def _equity_sampler(interval: float = 60.0):
     log = logging.getLogger("executor")
+    closed_every = float(GLOBAL.get("equity_closed_sample_sec", 900.0))
+    last_recorded = None   # monotonic time of the last snapshot written to history
     while not _sampler_stop.is_set():
         try:
             symbols = set()
@@ -1412,10 +1415,19 @@ def _equity_sampler(interval: float = 60.0):
                                       "starting_cash": basis, "unmarked": []})
             _INTERNAL = {"__net__", "flatten_all", "kill_switch"}
             visible = {}
+            # Risk runs every cycle; history is written every cycle only while the market is
+            # open — overnight and weekend minutes are mostly flat lines that bloat the table.
+            now_mono = time.monotonic()
+            record = (last_recorded is None or is_market_open()
+                      or now_mono - last_recorded >= closed_every)
+            if record:
+                last_recorded = now_mono
             for strat, v in snap.items():
                 if strat in _INTERNAL:
                     continue
                 visible[strat] = v
+                if not record:
+                    continue
                 # Recording history must never cost us a risk check — see the enforcement
                 # block below.
                 try:
@@ -1445,6 +1457,27 @@ def _equity_sampler(interval: float = 60.0):
             else:
                 log.error("equity sampler error (%d in a row): %s", _sampler_failures[0], e)
         _sampler_stop.wait(interval)   # sleep, wakes early on stop
+
+
+def _equity_compactor(first_delay: float = 300.0, every: float = 86400.0):
+    """Once a day, thin equity history older than GLOBAL['equity_compact_after_days'] to one
+    snapshot per strategy per GLOBAL['equity_compact_bucket_sec']. The first pass waits a few
+    minutes so it never competes with startup reconciliation."""
+    log = logging.getLogger("executor")
+    if _sampler_stop.wait(first_delay):
+        return
+    while True:
+        try:
+            days = float(GLOBAL.get("equity_compact_after_days", 7))
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            n = executor.logger_db.compact_equity_snapshots(
+                cutoff, bucket_sec=int(GLOBAL.get("equity_compact_bucket_sec", 3600)))
+            if n:
+                log.info("equity history compacted: %d snapshot(s) older than %gd removed", n, days)
+        except Exception as e:
+            log.error("equity history compaction failed: %s", e)
+        if _sampler_stop.wait(every):
+            return
 
 
 _exit_failures = [0]
@@ -1585,8 +1618,12 @@ def get_journal(strategy: Optional[str] = None, event_type: Optional[str] = None
 
 
 @app.get("/pnl/history")
-def pnl_history(strategy: Optional[str] = None, since: Optional[str] = None):
-    return {"history": executor.logger_db.get_equity_history(strategy_id=strategy, since=since)}
+def pnl_history(strategy: Optional[str] = None, since: Optional[str] = None,
+                max_points: int = 1500):
+    """Downsampled to ~max_points per strategy (last snapshot per bucket); max_points=0
+    returns every raw row — only safe with a narrow `since`."""
+    return {"history": executor.logger_db.get_equity_history(
+        strategy_id=strategy, since=since, max_points=max(0, max_points))}
 
 
 @app.get("/resolve_front/{symbol}")

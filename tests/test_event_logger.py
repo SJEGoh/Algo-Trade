@@ -159,3 +159,47 @@ def test_write_failure_does_not_raise(db):
 def test_close_is_safe(db):
     db.log_order(1, _order_intent())
     db.close()  # should not raise
+
+
+def test_equity_history_downsamples_to_last_snapshot_per_bucket(db):
+    # 3 days of per-minute snapshots for two strategies: the shape that OOM-killed /pnl/history
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    n = 3 * 24 * 60
+    for i in range(n):
+        ts = (t0 + timedelta(minutes=i, seconds=0.5)).isoformat()
+        for sid in ("a", "b"):
+            db.log_equity(ts, sid, 0.0, float(i), float(i))
+
+    raw = db.get_equity_history()
+    assert len(raw) == 2 * n
+
+    rows = db.get_equity_history(max_points=100)
+    per = {sid: [r for r in rows if r["strategy_id"] == sid] for sid in ("a", "b")}
+    assert all(90 <= len(v) <= 101 for v in per.values())
+    assert [r["ts"] for r in rows] == sorted(r["ts"] for r in rows)
+    # the newest snapshot always survives, so the chart's right edge is live
+    assert per["a"][-1]["equity"] == float(n - 1)
+
+    assert len(db.get_equity_history(strategy_id="a", max_points=100)) == len(per["a"])
+
+
+def test_compact_equity_snapshots_thins_only_old_rows(db):
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    for i in range(4 * 24 * 60):                        # 4 days, per minute, two strategies
+        ts = (t0 + timedelta(minutes=i)).isoformat()
+        for sid in ("a", "b"):
+            db.log_equity(ts, sid, 0.0, 0.0, float(i))
+    cutoff = t0 + timedelta(days=2)
+
+    removed = db.compact_equity_snapshots(cutoff, bucket_sec=3600)
+    rows = db.get_equity_history()
+    old = [r for r in rows if r["ts"] < cutoff.isoformat()]
+    new = [r for r in rows if r["ts"] >= cutoff.isoformat()]
+    assert len(old) == 2 * 48                            # one per strategy per hour
+    assert len(new) == 2 * 2 * 24 * 60                   # untouched
+    assert removed == 2 * 2 * 24 * 60 - len(old)
+    # the survivor of each hour is its last minute
+    assert {r["equity"] for r in old if r["strategy_id"] == "a"} == {float(h * 60 + 59) for h in range(48)}
+    assert db.compact_equity_snapshots(cutoff, bucket_sec=3600) == 0   # idempotent

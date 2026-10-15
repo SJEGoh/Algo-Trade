@@ -162,6 +162,15 @@ GLOBAL = {
     # 12:50 on an early close). Match your broker's cutoff; IBKR's for NYSE is 15:50.
     "moc_cutoff_min": 10,
 
+    # Equity history size. The sampler checks risk every 60s regardless, but only RECORDS a
+    # snapshot every 60s while NYSE is open — outside the session, once per closed_sample_sec
+    # (still often enough to catch futures moving overnight). Rows older than compact_after_days
+    # are thinned to the last snapshot per compact_bucket_sec, once a day. Unbounded minute data
+    # grew to ~1M rows and got the executor OOM-killed serving /pnl/history.
+    "equity_closed_sample_sec": 900.0,
+    "equity_compact_after_days": 7,
+    "equity_compact_bucket_sec": 3600,
+
     # Auto-reconnect to IB on an unexpected disconnect (then reconcile + recover open orders).
     "auto_reconnect": True,
     "reconnect_max_attempts": 30,

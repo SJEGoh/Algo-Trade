@@ -116,3 +116,32 @@ def test_equity_endpoint_serves_the_cached_snapshot(sampled):
     assert body["totals"]["nav"] == pytest.approx(151_000.0)
     assert body["marks"] == {"AAPL": 60.0}
     assert body["strategies"]["alpha"]["position_value"] == pytest.approx(6_000.0)
+
+
+def _run_cycles(n, interval=0.01):
+    """Run the sampler for n cycles; return how many times _enforce ran."""
+    server._sampler_stop.clear()
+    calls = []
+    t = threading.Thread(target=server._equity_sampler, args=(interval,), daemon=True)
+    orig = server._enforce
+    server._enforce = lambda log, snap: (calls.append(1), len(calls) >= n and server._sampler_stop.set())
+    try:
+        t.start()
+        t.join(timeout=5)
+    finally:
+        server._enforce = orig
+        server._sampler_stop.clear()
+    return len(calls)
+
+
+@pytest.mark.parametrize("market_open, expected", [(True, 5), (False, 1)])
+def test_history_is_thinned_outside_market_hours_but_risk_still_runs(
+        tmp_path, monkeypatch, market_open, expected):
+    db = EventLogger(db_path=tmp_path / "executor.db")
+    monkeypatch.setattr(server, "executor", FakeExecutor(db))
+    monkeypatch.setattr(server, "CONFIG", CFG)
+    monkeypatch.setattr(server, "is_market_open", lambda: market_open)
+    assert _run_cycles(5) == 5                                  # risk checked every cycle
+    per = [r for r in db.get_equity_history() if r["strategy_id"] == "alpha"]
+    assert len(per) == expected                                 # closed: first cycle only
+    db.close()
