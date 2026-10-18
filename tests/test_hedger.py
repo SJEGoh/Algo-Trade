@@ -208,3 +208,36 @@ def test_per_bucket_policies_override_the_default():
              policies={"software": BucketPolicy(0.50, 0.45, 0.40)})
     acted = {d.bucket for d in p.decisions if d.quantity}
     assert acted == {"semiconductors"}
+
+
+# ---------------------------------------------------------------------------
+# GET /exposure prices the hedge instrument itself
+# ---------------------------------------------------------------------------
+def test_exposure_endpoint_prices_a_hedge_instrument_nobody_holds(monkeypatch):
+    """The sampler only marks HELD symbols. SMH was never held, so it had no price, the plan
+    failed closed and the first hedge could never go on — reported as 'unhedgeable', exit 0."""
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    import api.server as server
+
+    fetched = []
+
+    def get_marks(symbols):
+        fetched.append(sorted(symbols))
+        return {s: 250.0 for s in symbols}
+
+    ex = SimpleNamespace(
+        ledger=SimpleNamespace(strategy_positions={"orb": {"NVDA": 400.0}},   # 400 x 100 = 40k
+                               multipliers={}),
+        _instruments={}, get_marks=get_marks)
+    monkeypatch.setattr(server, "executor", ex)
+    monkeypatch.setitem(server._last_equity, "marks", {"NVDA": 100.0})
+    monkeypatch.setitem(server._last_equity, "totals", {"nav": 1_000_000.0})
+
+    r = TestClient(server.app).get("/exposure", params={"trigger": 0.03, "target": 0.02,
+                                                        "release": 0.015}).json()
+    assert fetched == [["SMH"]]
+    assert r["unhedgeable"] == {}
+    assert r["book"] == [{"instrument": {"symbol": "SMH", "asset_class": "equity",
+                                         "sec_type": "STK", "exchange": "SMART"},
+                          "target_quantity": -80.0, "expected_price": 250.0}]   # 20k / 250

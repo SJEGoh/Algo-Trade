@@ -661,6 +661,16 @@ def get_exposure(trigger: float = 0.30, target: float = 0.25, release: float = 0
                (executor.ledger.strategy_positions.get(hedger.HEDGE_STRATEGY_ID) or {}).items()
                if abs(qty) > 1e-9}
 
+    # The sampler only marks symbols somebody HOLDS, so a hedge ETF nobody holds yet had no
+    # price, plan() failed closed on it, and the first hedge could never be placed: every
+    # bucket over its trigger was reported "unhedgeable" and the run exited green. Price the
+    # instrument of every bucket that could act (past release), plus anything already held.
+    wanted = {hedger.DEFAULT_HEDGE_INSTRUMENTS.get(b) for b, e in exposures.items()
+              if abs(e.fraction) > policy.release} | set(current)
+    missing = sorted(s for s in wanted if s and not (marks.get(s) or 0) > 0)
+    if missing:
+        marks.update({s: px for s, px in executor.get_marks(missing).items() if px})
+
     plan = hedger.plan(exposures, nav, prices=marks, default_policy=policy,
                        current_hedge=current, unpriced=unpriced)
     return {
