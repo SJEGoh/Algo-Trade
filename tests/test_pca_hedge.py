@@ -199,3 +199,30 @@ def test_run_hedge_pca_report_prints_and_submits_nothing(monkeypatch, tmp_path, 
         assert run_hedge.main(["--model", "pca", "--dry-run", "--any-time"]) == run_hedge.EXIT_OK
     text = caplog.text
     assert "PC1" in text and "leg" in text and "NOT submitted" in text
+
+
+def test_exclude_is_a_what_if_on_the_measured_book(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    import api.server as server
+
+    test_exposure_pca_endpoint_is_read_only(monkeypatch, tmp_path)   # fake executor: N0 only
+    server.executor.ledger.strategy_positions["pairs"] = {"IWM": -2_000.0}
+    server._last_equity["marks"]["IWM"] = 200.0            # held, so the sampler marks it
+    api = TestClient(server.app)
+
+    full = api.get("/exposure/pca").json()
+    without = api.get("/exposure/pca", params={"exclude": ["iwm"]}).json()
+    no_pairs = api.get("/exposure/pca", params={"exclude_strategy": ["pairs"]}).json()
+
+    assert "IWM" in full["exposures"][0]["top_contributors"]
+    assert "IWM" not in without["exposures"][0]["top_contributors"]
+    assert without["exposures"][0]["exposure"] > full["exposures"][0]["exposure"]   # short gone
+    assert no_pairs["exposures"][0]["exposure"] == pytest.approx(without["exposures"][0]["exposure"])
+    assert without["excluded"] == {"symbols": ["IWM"], "strategies": []}
+    assert server.executor.ledger.strategy_positions["pairs"] == {"IWM": -2_000.0}  # untouched
+
+
+def test_exclude_needs_the_pca_model():
+    import run_hedge
+    with pytest.raises(SystemExit):
+        run_hedge.main(["--dry-run", "--exclude", "IWM"])

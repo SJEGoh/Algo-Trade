@@ -58,11 +58,17 @@ def main(argv=None) -> int:
                     help="default 0.30 for buckets (exposure), 0.006 for pca (daily vol)")
     ap.add_argument("--target", type=float, default=None)
     ap.add_argument("--release", type=float, default=None)
+    ap.add_argument("--exclude", nargs="+", default=[], metavar="SYMBOL",
+                    help="pca: measure the book as if these symbols were not held (what-if)")
+    ap.add_argument("--exclude-strategy", nargs="+", default=[], metavar="STRATEGY",
+                    help="pca: measure the book without these strategies' holdings")
     ap.add_argument("--ack-timeout", type=float, default=60.0)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.any_time and not args.dry_run:
         ap.error("--any-time only works with --dry-run — a live hedge never trades a closed market")
+    if (args.exclude or args.exclude_strategy) and args.model != "pca":
+        ap.error("--exclude / --exclude-strategy are what-ifs for --model pca")
     if args.model == "pca" and not args.dry_run:
         ap.error("--model pca is report-only until it has been watched against the bucket "
                  "hedge — add --dry-run")
@@ -147,8 +153,16 @@ def report_pca(client, args) -> int:
     """Print the factor hedge the executor would place. Submits nothing."""
     params = {k: v for k, v in (("trigger", args.trigger), ("target", args.target),
                                 ("release", args.release)) if v is not None}
+    if args.exclude:
+        params["exclude"] = args.exclude
+    if args.exclude_strategy:
+        params["exclude_strategy"] = args.exclude_strategy
     view = client._request("GET", "/exposure/pca", params=params or None)
     pol = view["policy"]
+    ex = view.get("excluded") or {}
+    if ex.get("symbols") or ex.get("strategies"):
+        log.warning("WHAT-IF — book measured without symbols %s, strategies %s",
+                    ex.get("symbols") or "-", ex.get("strategies") or "-")
     log.info("NAV %s   (%d days of history; gate = daily vol share of NAV, trigger %.2f%% "
              "/ target %.2f%% / release %.2f%%)", f"{view['nav']:,.0f}", view["history_days"],
              pol["trigger"] * 100, pol["target"] * 100, pol["release"] * 100)

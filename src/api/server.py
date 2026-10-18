@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Literal, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -693,13 +693,18 @@ _pca_cache = {"history": None, "prev_weights": None}
 
 @app.get("/exposure/pca")
 def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: float = 0.004,
-                     components: int = 3, hedge_components: int = 2, lookback: int = 250):
+                     components: int = 3, hedge_components: int = 2, lookback: int = 250,
+                     exclude: Optional[List[str]] = Query(None),
+                     exclude_strategy: Optional[List[str]] = Query(None)):
     """Statistical factor exposure, and the ETF hedge that WOULD be placed. Read-only.
 
     PCA of a fixed ETF universe (pca_hedge.FACTOR_UNIVERSE); every holding regressed on the
     factor returns; a factor is shaved only when its contribution to the book's daily vol
     (share of NAV) passes `trigger`. Knows nothing about the strategies. The first call of a
-    day pulls a year of daily bars per symbol from IB and can take a minute or two."""
+    day pulls a year of daily bars per symbol from IB and can take a minute or two.
+
+    `exclude` (symbols) and `exclude_strategy` drop holdings from the measured book — a
+    what-if ("without the IWM short"), never a change to anything held."""
     nav = float((_last_equity.get("totals") or {}).get("nav") or 0.0)
     if nav <= 0:
         raise HTTPException(status_code=503,
@@ -711,10 +716,14 @@ def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: flo
 
     marks = dict((_last_equity.get("marks") or {}))
     positions = {sid: dict(pos) for sid, pos in executor.ledger.strategy_positions.items()}
-    values, unpriced = pca_hedge.position_values(positions, marks,
-                                                 dict(executor.ledger.multipliers))
     current = {sym: qty for sym, qty in (positions.get(hedger.HEDGE_STRATEGY_ID) or {}).items()
                if abs(qty) > 1e-9}
+    drop_syms = {s.upper() for s in (exclude or [])}
+    drop_sids = set(exclude_strategy or [])
+    what_if = {sid: {s: q for s, q in pos.items() if s.upper() not in drop_syms}
+               for sid, pos in positions.items() if sid not in drop_sids}
+    values, unpriced = pca_hedge.position_values(what_if, marks,
+                                                 dict(executor.ledger.multipliers))
 
     if _pca_cache["history"] is None:
         _pca_cache["history"] = pca_hedge.DailyHistoryCache(
@@ -758,6 +767,7 @@ def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: flo
         "book": p.book,
         "coverage": {**p.coverage, "unpriced_symbols": sorted(unpriced)},
         "history_days": int(len(model.returns)),
+        "excluded": {"symbols": sorted(drop_syms), "strategies": sorted(drop_sids)},
         "policy": {"trigger": trigger, "target": target, "release": release,
                    "hedge_components": hedge_components},
     }
