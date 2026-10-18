@@ -3,6 +3,7 @@
 
     python3 run_hedge.py --dry-run     # print the plan, submit nothing
     python3 run_hedge.py --dry-run --any-time   # ...even with the market closed
+    python3 run_hedge.py --model pca --dry-run  # statistical factor hedge (report-only)
     python3 run_hedge.py               # submit it
 
 Asks the executor for `GET /exposure`, which buckets every holding and decides which buckets
@@ -50,19 +51,28 @@ def main(argv=None) -> int:
     ap.add_argument("--any-time", action="store_true",
                     help="with --dry-run: plan even when the market is closed (marks are "
                          "the last prices IB has, so treat sizes as approximate)")
-    ap.add_argument("--trigger", type=float, default=0.30)
-    ap.add_argument("--target", type=float, default=0.25)
-    ap.add_argument("--release", type=float, default=0.20)
+    ap.add_argument("--model", choices=["buckets", "pca"], default="buckets",
+                    help="buckets: sector exposure share of NAV (live). pca: factor risk as "
+                         "daily vol share of NAV (report-only for now, needs --dry-run)")
+    ap.add_argument("--trigger", type=float, default=None,
+                    help="default 0.30 for buckets (exposure), 0.006 for pca (daily vol)")
+    ap.add_argument("--target", type=float, default=None)
+    ap.add_argument("--release", type=float, default=None)
     ap.add_argument("--ack-timeout", type=float, default=60.0)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.any_time and not args.dry_run:
         ap.error("--any-time only works with --dry-run — a live hedge never trades a closed market")
+    if args.model == "pca" and not args.dry_run:
+        ap.error("--model pca is report-only until it has been watched against the bucket "
+                 "hedge — add --dry-run")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-    client = ExecutorClient(strategy_id=HEDGE_STRATEGY_ID)
+    # the first PCA call of a day pulls a year of daily bars per holding from IB
+    client = ExecutorClient(strategy_id=HEDGE_STRATEGY_ID,
+                            **({"timeout": 300.0, "retries": 1} if args.model == "pca" else {}))
     health = client.preflight()
     if not health.get("market_open"):
         if not args.any_time:
@@ -70,8 +80,14 @@ def main(argv=None) -> int:
             return EXIT_OK
         log.warning("market closed — planning anyway (--any-time); prices are stale")
 
+    if args.model == "pca":
+        return report_pca(client, args)
+
+    defaults = {"trigger": 0.30, "target": 0.25, "release": 0.20}
     view = client._request("GET", "/exposure", params={
-        "trigger": args.trigger, "target": args.target, "release": args.release})
+        k: v if v is not None else defaults[k]
+        for k, v in (("trigger", args.trigger), ("target", args.target),
+                     ("release", args.release))})
 
     log.info("NAV %s", f"{view['nav']:,.0f}")
     for e in view["exposures"]:
@@ -124,6 +140,44 @@ def main(argv=None) -> int:
         return EXIT_NOT_ACKED
 
     log.info("hedge confirmed at the broker: %d leg(s)", len(acks["live"]))
+    return EXIT_OK
+
+
+def report_pca(client, args) -> int:
+    """Print the factor hedge the executor would place. Submits nothing."""
+    params = {k: v for k, v in (("trigger", args.trigger), ("target", args.target),
+                                ("release", args.release)) if v is not None}
+    view = client._request("GET", "/exposure/pca", params=params or None)
+    pol = view["policy"]
+    log.info("NAV %s   (%d days of history; gate = daily vol share of NAV, trigger %.2f%% "
+             "/ target %.2f%% / release %.2f%%)", f"{view['nav']:,.0f}", view["history_days"],
+             pol["trigger"] * 100, pol["target"] * 100, pol["release"] * 100)
+    for f in view["factors"]:
+        top = ", ".join(f"{s} {w:+.2f}" for s, w in list(f["weights"].items())[:5])
+        log.info("   %-4s explains %5.1f%%  vol %.2f%%/day   %s",
+                 f["factor"], f["explained"] * 100, f["daily_vol"] * 100, top)
+    log.info("   PC1 explains >= 60%% of the universe: %s (reported, not used to decide)",
+             view["pc1_explains_60pct"])
+    for e in view["exposures"]:
+        top = ", ".join(f"{s} {v:+,.0f}" for s, v in e["top_contributors"].items())
+        log.info("   %-4s exposure %+12s (%+6.1f%% NAV)  risk %.2f%%/day  hedge %+10s — %s",
+                 e["factor"], f"{e['exposure']:,.0f}", e["fraction"] * 100,
+                 e["vol_contribution"] * 100, f"{e['hedge_notional']:,.0f}", e["reason"])
+        if top:
+            log.info("          largest: %s", top)
+    cov = view["coverage"]
+    if cov.get("factor_r2") is not None:
+        log.info("factors explain %.0f%% of the measured book's daily moves (value-weighted R²)",
+                 cov["factor_r2"] * 100)
+    if cov.get("unpriced_symbols"):
+        log.error("UNPRICED (no mark, not measured): %s", cov["unpriced_symbols"])
+    if cov.get("unmeasured_symbols"):
+        log.error("NO USABLE HISTORY (not measured, %s): %s",
+                  f"{cov['unmeasured_notional']:,.0f}", cov["unmeasured_symbols"])
+    for leg in view["book"]:
+        log.info("   leg  %-5s %+8.0f  @ %s", leg["instrument"]["symbol"],
+                 leg["target_quantity"], leg["expected_price"])
+    log.info("dry run — %d leg(s) NOT submitted", len(view["book"]))
     return EXIT_OK
 
 

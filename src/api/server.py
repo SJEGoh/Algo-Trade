@@ -15,7 +15,7 @@ from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
 from config import CONFIG, GLOBAL, is_funded, validate_config
-from portfolio import hedger
+from portfolio import hedger, pca_hedge
 from risk.exit_rules import ExitManager, ExitSpecError, parse_exits
 
 import threading
@@ -685,6 +685,81 @@ def get_exposure(trigger: float = 0.30, target: float = 0.25, release: float = 0
         "coverage": plan.coverage,
         "unhedgeable": plan.unhedgeable,
         "policy": {"trigger": trigger, "target": target, "release": release},
+    }
+
+
+_pca_cache = {"history": None, "prev_weights": None}
+
+
+@app.get("/exposure/pca")
+def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: float = 0.004,
+                     components: int = 3, hedge_components: int = 2, lookback: int = 250):
+    """Statistical factor exposure, and the ETF hedge that WOULD be placed. Read-only.
+
+    PCA of a fixed ETF universe (pca_hedge.FACTOR_UNIVERSE); every holding regressed on the
+    factor returns; a factor is shaved only when its contribution to the book's daily vol
+    (share of NAV) passes `trigger`. Knows nothing about the strategies. The first call of a
+    day pulls a year of daily bars per symbol from IB and can take a minute or two."""
+    nav = float((_last_equity.get("totals") or {}).get("nav") or 0.0)
+    if nav <= 0:
+        raise HTTPException(status_code=503,
+                            detail="no NAV sample yet — the equity sampler has not run")
+    try:
+        policy = hedger.BucketPolicy(trigger=trigger, target=target, release=release)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    marks = dict((_last_equity.get("marks") or {}))
+    positions = {sid: dict(pos) for sid, pos in executor.ledger.strategy_positions.items()}
+    values, unpriced = pca_hedge.position_values(positions, marks,
+                                                 dict(executor.ledger.multipliers))
+    current = {sym: qty for sym, qty in (positions.get(hedger.HEDGE_STRATEGY_ID) or {}).items()
+               if abs(qty) > 1e-9}
+
+    if _pca_cache["history"] is None:
+        _pca_cache["history"] = pca_hedge.DailyHistoryCache(
+            executor.fetch_daily_closes, path=DB_DIR / "price_history.json")
+    closes = _pca_cache["history"].get(set(pca_hedge.FACTOR_UNIVERSE) | set(values))
+    rets = pca_hedge.daily_returns(closes, lookback=lookback)
+
+    universe = [s for s in pca_hedge.FACTOR_UNIVERSE if s in rets.columns]
+    try:
+        model = pca_hedge.fit_factors(rets[universe], n_components=components,
+                                      prev_weights=_pca_cache["prev_weights"])
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=f"cannot fit factors: {e}")
+    _pca_cache["prev_weights"] = model.weights    # pins next fit's signs to this one
+    held = [s for s in values if s in rets.columns]
+    loads, short = pca_hedge.loadings(rets[held], model.returns)
+
+    etf_px = {s: marks.get(s) for s in model.universe if (marks.get(s) or 0) > 0}
+    need = [s for s in model.universe if s not in etf_px]
+    if need:
+        etf_px.update({s: px for s, px in executor.get_marks(need).items() if px})
+
+    no_history = {s: values[s] for s in values if s not in rets.columns or s in short}
+    p = pca_hedge.plan(model, values, loads, nav, etf_px, policy=policy,
+                       hedge_components=hedge_components, current_hedge=current,
+                       unmeasured=no_history)
+    return {
+        "nav": nav,
+        "factors": [{"factor": n, "explained": float(model.explained[i]),
+                     "daily_vol": float(model.sigma[i]),
+                     "weights": dict(sorted(zip(model.universe,
+                                                (float(w) for w in model.weights[i])),
+                                            key=lambda kv: -abs(kv[1])))}
+                    for i, n in enumerate(model.names)],
+        "pc1_explains_60pct": bool(model.explained[0] >= 0.60),
+        "exposures": [{"factor": d.factor, "exposure": d.exposure, "fraction": d.fraction,
+                       "vol_contribution": d.vol_contribution,
+                       "hedge_notional": d.hedge_notional, "reason": d.reason,
+                       "top_contributors": d.top_contributors} for d in p.decisions],
+        "legs": p.legs,
+        "book": p.book,
+        "coverage": {**p.coverage, "unpriced_symbols": sorted(unpriced)},
+        "history_days": int(len(model.returns)),
+        "policy": {"trigger": trigger, "target": target, "release": release,
+                   "hedge_components": hedge_components},
     }
 
 

@@ -266,6 +266,11 @@ class CentralExecutor(EClient, EWrapper):
         """IB API error / warning callback. Logs everything; order-specific
         errors (reqId matches an open order) are tagged so they stand out.
         Code 321 (read-only) triggers a background retry of the order."""
+        hist_ev = getattr(self, "_hist_events", {}).get(reqId)
+        if hist_ev is not None and errorCode not in (2104, 2106, 2158):
+            # A historical request IB refused (162 no data, 200 no such contract) never gets
+            # historicalDataEnd — release the waiter now instead of letting it time out.
+            hist_ev.set()
         if reqId in self.order_status:
             sym = self.order_status[reqId].get("symbol", "?")
             self.order_status[reqId]["last_error"] = {
@@ -877,6 +882,36 @@ class CentralExecutor(EClient, EWrapper):
 
         except Exception as e:
             logger.warning("ATR fetch error for %s: %s", symbol, e)
+            return None
+        finally:
+            self._hist_data.pop(req_id, None)
+            self._hist_events.pop(req_id, None)
+
+    def fetch_daily_closes(self, symbol: str, duration: str = "1 Y",
+                           timeout: float = 20.0) -> Optional[Dict[str, float]]:
+        """{'YYYYMMDD': close} of split/dividend-adjusted daily closes, or None on failure.
+        Used by the PCA hedge report; futures are priced off the same contract as their mark."""
+        contract = self._mark_contract(symbol) or self.get_stock_contract(symbol)
+        # ADJUSTED_LAST is stock-only; a futures contract has no corporate actions to adjust
+        what = "TRADES" if contract.secType == "FUT" else "ADJUSTED_LAST"
+        with self._order_id_lock:
+            self._hist_req_id += 1
+            req_id = self._hist_req_id
+        event = threading.Event()
+        self._hist_data[req_id] = []
+        self._hist_events[req_id] = event
+        try:
+            self.reqHistoricalData(req_id, contract, "", duration, "1 day", what,
+                                   1, 1, False, [])
+            if not event.wait(timeout=timeout):
+                logger.warning("daily history for %s timed out", symbol)
+                return None
+            bars = self._hist_data.get(req_id, [])
+            if not bars:
+                return None
+            return {str(b.date)[:8]: float(b.close) for b in bars if b.close and b.close > 0}
+        except Exception as e:
+            logger.warning("daily history fetch error for %s: %s", symbol, e)
             return None
         finally:
             self._hist_data.pop(req_id, None)
