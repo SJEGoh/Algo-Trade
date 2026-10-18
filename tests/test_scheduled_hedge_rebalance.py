@@ -286,3 +286,29 @@ def test_the_book_fits_inside_the_allocation_cap():
     from config import CONFIG
     worst_case = len(TEST_UNIVERSE) * _IntradayBarStrategy("x").lot_dollars
     assert worst_case <= CONFIG["halt_test_macd"]["capital_allocation"]
+
+
+@pytest.mark.parametrize("argv, plans", [([], False), (["--dry-run"], False),
+                                         (["--dry-run", "--any-time"], True)])
+def test_a_closed_market_only_plans_with_any_time(monkeypatch, argv, plans):
+    import run_hedge
+    asked = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        def preflight(self): return {"market_open": False}
+        def _request(self, method, path, **kw):
+            asked.append(path)
+            return {"nav": 1e6, "exposures": [], "hedge": [], "book": [],
+                    "coverage": {"unpriced_symbols": []}, "unhedgeable": {}}
+        def submit_book(self, *a, **kw): raise AssertionError("must not submit")
+
+    monkeypatch.setattr(run_hedge, "ExecutorClient", FakeClient)
+    assert run_hedge.main(argv) == run_hedge.EXIT_OK
+    assert asked == (["/exposure"] if plans else [])
+
+
+def test_any_time_refuses_to_trade_live():
+    import run_hedge
+    with pytest.raises(SystemExit):
+        run_hedge.main(["--any-time"])

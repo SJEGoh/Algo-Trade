@@ -2,6 +2,7 @@
 """run_hedge.py — put the portfolio hedge on, once, from the scheduler.
 
     python3 run_hedge.py --dry-run     # print the plan, submit nothing
+    python3 run_hedge.py --dry-run --any-time   # ...even with the market closed
     python3 run_hedge.py               # submit it
 
 Asks the executor for `GET /exposure`, which buckets every holding and decides which buckets
@@ -46,12 +47,17 @@ EXIT_OK, EXIT_REFUSED, EXIT_UNREACHABLE, EXIT_NOT_ACKED = 0, 1, 2, 3
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true", help="print the plan, submit nothing")
+    ap.add_argument("--any-time", action="store_true",
+                    help="with --dry-run: plan even when the market is closed (marks are "
+                         "the last prices IB has, so treat sizes as approximate)")
     ap.add_argument("--trigger", type=float, default=0.30)
     ap.add_argument("--target", type=float, default=0.25)
     ap.add_argument("--release", type=float, default=0.20)
     ap.add_argument("--ack-timeout", type=float, default=60.0)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    if args.any_time and not args.dry_run:
+        ap.error("--any-time only works with --dry-run — a live hedge never trades a closed market")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -59,8 +65,10 @@ def main(argv=None) -> int:
     client = ExecutorClient(strategy_id=HEDGE_STRATEGY_ID)
     health = client.preflight()
     if not health.get("market_open"):
-        log.info("market closed — no hedge cycle")
-        return EXIT_OK
+        if not args.any_time:
+            log.info("market closed — no hedge cycle")
+            return EXIT_OK
+        log.warning("market closed — planning anyway (--any-time); prices are stale")
 
     view = client._request("GET", "/exposure", params={
         "trigger": args.trigger, "target": args.target, "release": args.release})
