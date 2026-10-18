@@ -159,6 +159,81 @@ def shrunk_covariance(returns: pd.DataFrame, annualise: bool = True,
 # ---------------------------------------------------------------------------
 # Weight schemes
 # ---------------------------------------------------------------------------
+def shrink_means(returns: pd.DataFrame, periods_per_year: float = TRADING_DAYS) -> tuple:
+    """Each strategy's mean return pulled toward the cross-strategy average, by as much as
+    the data cannot tell them apart. Empirical Bayes (the James-Stein idea, defined for any
+    number of strategies):
+
+        noise    v = average over strategies of var(r_i) / n_i   — error in each mean
+        spread   d = variance of the means across strategies
+        signal   tau^2 = max(0, d - v)                             — real differences
+        B = v / (v + tau^2)        mu_i' = grand + (1 - B) * (mu_i - grand)
+
+    When the means differ by no more than their own estimation error, B = 1 and every
+    strategy gets the same expected return, so max-Sharpe falls back to sizing by risk. As
+    history accumulates v shrinks and genuine differences come through. This fixes the input
+    that actually breaks max-Sharpe — the means — where shrinking the covariance cannot.
+
+    Returns (annualised shrunk means, info dict)."""
+    r = returns.dropna(how="all")
+    m = r.mean()
+    n = r.notna().sum().clip(lower=1)
+    v = float((r.var(ddof=1) / n).mean())
+    grand = float(m.mean())
+    if len(m) < 2 or not np.isfinite(v):
+        return m * periods_per_year, {"intensity": None, "grand_mean": grand * periods_per_year}
+    spread = float(m.var(ddof=1))
+    tau2 = max(0.0, spread - v)
+    b = 1.0 if tau2 <= 0 else v / (v + tau2)
+    shrunk = grand + (1.0 - b) * (m - grand)
+    return shrunk * periods_per_year, {"intensity": round(b, 4),
+                                       "grand_mean": round(grand * periods_per_year, 6)}
+
+
+def britten_jones(returns: pd.DataFrame, alpha: float = 0.05) -> dict:
+    """Max-Sharpe as a regression (Britten-Jones 1999): regress 1 on the strategy returns,
+    no intercept; the coefficients are proportional to the tangency weights, and OLS gives
+    them standard errors.
+
+    The useful output is the F-test of "the tangency portfolio IS equal weight". Until it
+    rejects, the data has not shown that any strategy deserves more than its equal share —
+    a better-founded answer to "can the means be trusted yet" than a fixed day count.
+    Diagnostic only: the weights are unconstrained (they can be negative) and are reported,
+    never used."""
+    r = returns.dropna()
+    t, n = r.shape
+    if n < 2 or t <= n + 1:
+        return {"observations": int(t), "p_value": None, "rejects_equal_weight": None,
+                "reason": f"need more than {n + 1} complete periods for {n} strategies"}
+    X = r.values
+    y = np.ones(t)
+    b, *_ = np.linalg.lstsq(X, y, rcond=None)
+    ssr_u = float(((y - X @ b) ** 2).sum())
+    xeq = X.mean(axis=1)                                   # the equal-weight portfolio
+    c = float(xeq @ y / max(xeq @ xeq, _EPS))
+    ssr_r = float(((y - c * xeq) ** 2).sum())
+    dof = t - n
+    s2 = ssr_u / dof
+    try:
+        se = np.sqrt(np.clip(np.diag(s2 * np.linalg.inv(X.T @ X)), 0, None))
+    except np.linalg.LinAlgError:
+        se = np.full(n, np.nan)
+    f_stat = ((ssr_r - ssr_u) / (n - 1)) / max(s2, _EPS)
+    from scipy.stats import f as f_dist
+    p = float(f_dist.sf(f_stat, n - 1, dof))
+    total = float(b.sum())
+    return {
+        "observations": int(t),
+        "weights": ({k: round(float(v / total), 4) for k, v in zip(r.columns, b)}
+                    if abs(total) > _EPS else None),
+        "t_stats": {k: round(float(v / e), 2) if e > 0 else None
+                    for k, v, e in zip(r.columns, b, se)},
+        "f_stat": round(float(f_stat), 3),
+        "p_value": round(p, 4),
+        "rejects_equal_weight": bool(p < alpha),
+    }
+
+
 def equal_weights(names) -> pd.Series:
     names = list(names)
     return pd.Series(1.0 / len(names), index=names)
@@ -301,7 +376,8 @@ def recommend(returns: pd.DataFrame, current_weights: Dict[str, float] = None,
               exclude: set = None, min_history_days: float = 14.0, max_weight: float = 0.40,
               l2_lambda: float = 0.5, min_days_for_means: float = 90.0,
               min_days_for_cov: float = 20.0, min_coverage: float = 0.5,
-              periods_per_year: float = TRADING_DAYS) -> Allocation:
+              periods_per_year: float = TRADING_DAYS,
+              shrink_expected_returns: bool = True) -> Allocation:
     """Pick weights, holding young strategies out of the optimisation entirely.
 
     Exemption (`min_history_days`, two weeks by default)
@@ -431,6 +507,10 @@ def recommend(returns: pd.DataFrame, current_weights: Dict[str, float] = None,
 
     cov, shrinkage = shrunk_covariance(span[seasoned],
                                        periods_per_year=periods_per_year)
+    try:
+        diagnostics["britten_jones"] = britten_jones(span[seasoned])
+    except Exception as e:                  # a diagnostic must never block an allocation
+        diagnostics["britten_jones"] = {"reason": f"failed: {e}"}
 
     if days < min_days_for_means:
         return Allocation(
@@ -440,12 +520,20 @@ def recommend(returns: pd.DataFrame, current_weights: Dict[str, float] = None,
                     f"(need {min_days_for_means:.0f}) — sizing by risk only{note}"),
             shrinkage=shrinkage, days=days, diagnostics=diagnostics)
 
-    mu = span[seasoned].mean() * periods_per_year
+    raw_mu = span[seasoned].mean() * periods_per_year
+    diagnostics["annualised_mean"] = {k: round(float(v), 4) for k, v in raw_mu.items()}
+    mu = raw_mu
+    mean_note = ""
+    if shrink_expected_returns:
+        mu, info = shrink_means(span[seasoned], periods_per_year=periods_per_year)
+        diagnostics["mean_shrinkage"] = info
+        diagnostics["annualised_mean_shrunk"] = {k: round(float(v), 4) for k, v in mu.items()}
+        if info.get("intensity") is not None:
+            mean_note = f", means shrunk {info['intensity']:.0%} toward the average"
     weights = max_sharpe_weights(mu, cov, max_weight=effective_cap,
                                  l2_lambda=l2_lambda)
-    diagnostics["annualised_mean"] = {k: round(float(v), 4) for k, v in mu.items()}
     return Allocation(
         scaled(weights), "max_sharpe", exempt=exempt, reserved=reserved,
         reason=(f"{days:.1f} days of history, cap {max_weight:.0%}, "
-                f"L2 pull {l2_lambda}{note}"),
+                f"L2 pull {l2_lambda}{mean_note}{note}"),
         shrinkage=shrinkage, days=days, diagnostics=diagnostics)

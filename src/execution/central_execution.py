@@ -179,6 +179,11 @@ class CentralExecutor(EClient, EWrapper):
 
         self._mark_cache: Dict[str, float] = {}   # symbol -> last good mark
         self._mark_ts: Dict[str, float] = {}       # symbol -> time.time() of last good mark (staleness guard)
+        # ONE gate for every caller (sampler, exits, endpoints run concurrently): IB's line
+        # limit is per connection, not per call
+        self._mark_gate = threading.BoundedSemaphore(max(1, int(GLOBAL.get("mark_max_concurrent", 40))))
+        self.price_history = None                  # DailyHistoryCache, attached by the server
+        self.marks_from_close: set = set()         # last get_marks: valued at a stale close
         self._mark_lock = threading.Lock()
         self._conn = {"host": "127.0.0.1", "port": 4002, "client_id": 5}  # remembered for auto-reconnect
         self._reconnecting = False
@@ -919,20 +924,33 @@ class CentralExecutor(EClient, EWrapper):
 
     def get_marks(self, symbols, timeout: float = 3.0) -> Dict[str, Optional[float]]:
         """{symbol: mark_price}, snapshot-backed with carry-forward.
-        A failed fetch reuses the last good mark; never-marked -> None."""
+        A failed fetch reuses the last good mark; never-marked -> the last daily close from
+        the price-history cache, if it has one; otherwise None.
+
+        At most GLOBAL['mark_max_concurrent'] snapshots are in flight. Every symbol used to be
+        requested at once, and past IB's market-data line limit (100 by default) the excess
+        came back empty — a different handful each cycle, each one silently unmeasured, its
+        unrealized drawdown check skipped.
+
+        A close-price fallback is NEVER fresh: it sets no _mark_ts, so mark_is_fresh() stays
+        False and neither drawdown checks nor exits act on it. It only stops the name being
+        valued at nothing."""
         symbols = list(dict.fromkeys(symbols))
         results: Dict[str, Optional[float]] = {}
+        cap = max(1, int(GLOBAL.get("mark_max_concurrent", 40)))
+        gate = getattr(self, "_mark_gate", None) or threading.BoundedSemaphore(cap)
 
         def _one(sym):
             px = None
-            try:
-                contract = self._mark_contract(sym)
-                if contract is None:
-                    px = self.fetch_price(sym, timeout=timeout)   # concurrent, unique reqIds
-                else:
-                    px = self.fetch_price(sym, timeout=timeout, contract=contract)
-            except Exception as e:
-                logger.warning("mark fetch failed for %s: %s", sym, e)
+            with gate:
+                try:
+                    contract = self._mark_contract(sym)
+                    if contract is None:
+                        px = self.fetch_price(sym, timeout=timeout)   # unique reqIds
+                    else:
+                        px = self.fetch_price(sym, timeout=timeout, contract=contract)
+                except Exception as e:
+                    logger.warning("mark fetch failed for %s: %s", sym, e)
             with self._mark_lock:
                 if px is not None and px > 0:
                     self._mark_cache[sym] = px
@@ -941,7 +959,24 @@ class CentralExecutor(EClient, EWrapper):
 
         threads = [threading.Thread(target=_one, args=(s,), daemon=True) for s in symbols]
         for t in threads: t.start()
-        for t in threads: t.join(timeout=timeout + 1.0)
+        deadline = time.monotonic() + (timeout + 1.0) * math.ceil(len(symbols) / cap)
+        for t in threads: t.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        history = getattr(self, "price_history", None)
+        from_close, missing = [], []
+        for sym in symbols:
+            if results.get(sym) is None:
+                close = history.last_close(sym) if history is not None else None
+                if close:
+                    results[sym] = close
+                    from_close.append(sym)
+                else:
+                    missing.append(sym)
+        self.marks_from_close = set(from_close)
+        if missing and history is not None:
+            history.warm_async(missing)        # so the next cycle has a close to fall back on
+        if from_close:
+            logger.info("no live mark for %s — valued at last daily close (stale)", from_close)
         return results
 
     def _mark_contract(self, symbol: str) -> Optional[Contract]:

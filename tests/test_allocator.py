@@ -331,3 +331,97 @@ def test_a_book_of_nothing_but_non_allocatables_is_refused():
     df = pd.DataFrame({HEDGE_STRATEGY_ID: np.zeros(50), "__net__": np.zeros(50)}, index=idx)
     with pytest.raises(ValueError, match="every strategy is non-allocatable"):
         recommend(df)
+
+
+# ---------------------------------------------------------------------------
+# Mean shrinkage + the Britten-Jones test
+# ---------------------------------------------------------------------------
+from portfolio.allocator import britten_jones, shrink_means
+
+
+def _streams(means, n=250, vol=0.01, seed=11):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2025-06-02", periods=n)
+    return pd.DataFrame({f"s{i}": rng.normal(m, vol, n) for i, m in enumerate(means)},
+                        index=idx)
+
+
+def test_identical_strategies_are_shrunk_all_the_way():
+    """Same true mean: every gap between sample means is noise, so B = 1 and max-Sharpe
+    gets no ranking to chase."""
+    mu, info = shrink_means(_streams([0.0005] * 4, n=60))
+    assert info["intensity"] == 1.0
+    assert mu.max() - mu.min() < 1e-12
+
+
+def test_real_differences_survive_shrinkage():
+    mu, info = shrink_means(_streams([0.0, 0.002, 0.004], n=1000))
+    assert info["intensity"] < 0.2                      # little shrinkage: signal >> noise
+    assert list(mu.sort_values().index) == ["s0", "s1", "s2"]
+
+
+def test_shrinkage_weakens_as_history_grows():
+    short = shrink_means(_streams([0.0, 0.001, 0.002], n=60))[1]["intensity"]
+    long = shrink_means(_streams([0.0, 0.001, 0.002], n=2000))[1]["intensity"]
+    assert long < short
+
+
+def test_britten_jones_cannot_reject_equal_weight_on_noise():
+    bj = britten_jones(_streams([0.0005] * 4, n=60))
+    assert bj["rejects_equal_weight"] is False and bj["p_value"] > 0.05
+
+
+def test_britten_jones_rejects_when_one_strategy_is_clearly_better():
+    bj = britten_jones(_streams([0.0, 0.0, 0.003], n=500))
+    assert bj["rejects_equal_weight"] is True
+    assert max(bj["t_stats"], key=lambda k: bj["t_stats"][k]) == "s2"
+
+
+def test_britten_jones_needs_more_periods_than_strategies():
+    assert britten_jones(_streams([0.0] * 5, n=5))["p_value"] is None
+
+
+def test_max_sharpe_uses_shrunk_means_and_reports_both():
+    r = _streams([0.0005] * 3, n=200)
+    a = recommend(r, min_history_days=0, min_days_for_cov=0, min_days_for_means=0)
+    assert a.method == "max_sharpe"
+    d = a.diagnostics
+    assert d["mean_shrinkage"]["intensity"] == 1.0 and "annualised_mean_shrunk" in d
+    assert "britten_jones" in d
+    # fully shrunk means + near-identical vols -> close to equal weight, not a lucky pick
+    assert a.weights.max() - a.weights.min() < 0.15
+
+
+def test_preview_refuses_to_apply():
+    import run_rebalance
+    with pytest.raises(SystemExit):
+        run_rebalance.main(["--preview", "--apply"])
+
+
+def test_preview_reports_without_moving_capital(monkeypatch, caplog):
+    import logging
+    import run_rebalance
+
+    r = _streams([0.0005, 0.001, 0.0], n=40)
+    rows = [{"ts": ts.isoformat(), "strategy_id": sid, "nav": float(100_000 * (1 + r[sid][:i + 1]).prod())}
+            for i, ts in enumerate(r.index.tz_localize("UTC")) for sid in r.columns]
+    posted = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        def preflight(self): return {}
+        def _request(self, method, path, **kw):
+            if method == "POST":
+                posted.append(path)
+            if path == "/pnl/history":
+                return {"history": rows}
+            if path == "/strategies":
+                return {"strategies": [{"strategy_id": s, "capital_allocation": 100_000.0}
+                                       for s in r.columns]}
+            raise RuntimeError("not needed")
+
+    monkeypatch.setattr(run_rebalance, "ExecutorClient", FakeClient)
+    with caplog.at_level(logging.INFO, logger="run-rebalance"):
+        assert run_rebalance.main(["--preview"]) == run_rebalance.EXIT_OK
+    assert "PREVIEW" in caplog.text and "Britten-Jones" in caplog.text
+    assert posted == []

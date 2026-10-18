@@ -160,6 +160,16 @@ def build_events(o, c):
     #             the guard that stops a short lucky run winning capital — which is why the
     #             rebalance stays REPORT-ONLY here. Do not add --apply on these settings.
     HEDGE_TRIGGER, HEDGE_TARGET, HEDGE_RELEASE = "0.03", "0.02", "0.015"
+    # HEDGE_MODEL=minvar spends the overlay's allocation on the ETF hedge that removes the
+    # most variance (no thresholds). HEDGE_MODEL=pca uses the statistical factor hedge. Its
+    # thresholds are daily-vol shares of NAV, not exposure shares — run_hedge.py's PCA
+    # defaults (0.6% / 0.5% / 0.4%) unless HEDGE_PCA_* override them. Only ONE model may
+    # run: both write the same absolute hedge_overlay book and would undo each other.
+    HEDGE_MODEL = os.environ.get("HEDGE_MODEL", "buckets").strip().lower()
+    PCA_LEVELS = [a for flag, env in (("--trigger", "HEDGE_PCA_TRIGGER"),
+                                      ("--target", "HEDGE_PCA_TARGET"),
+                                      ("--release", "HEDGE_PCA_RELEASE"))
+                  if os.environ.get(env) for a in (flag, os.environ[env])]
     REBAL_ARGS = ["--freq", "15min", "--periods-per-year", "6552",
                   "--min-history-days", "0.2", "--min-days-cov", "0.2",
                   "--min-days-means", "0.25"]
@@ -169,10 +179,24 @@ def build_events(o, c):
         # (early close) still hedges half way through it rather than 20 minutes before
         # the bell. By now the open has settled and the ORB book has taken shape, so the
         # exposure being measured is the one the day will actually carry.
-        ev.append((o + (c - o) / 2,
-                   "portfolio hedge (shave buckets past their trigger)", "run",
-                   [R("run_hedge.py"), "--trigger", HEDGE_TRIGGER,
-                    "--target", HEDGE_TARGET, "--release", HEDGE_RELEASE]))
+        mid = o + (c - o) / 2
+        if HEDGE_MODEL in ("pca", "minvar"):
+            extra = PCA_LEVELS if HEDGE_MODEL == "pca" else []
+            # Warm-up an hour earlier: the day's first PCA call pulls a year of daily bars
+            # per holding from IB, which can approach the 300s subprocess limit on its own.
+            # The dry run fills the cache (and logs what the hedge will see).
+            ev.append((mid - timedelta(minutes=60),
+                       f"portfolio hedge warm-up ({HEDGE_MODEL} dry run, fills price "
+                       f"history)", "run",
+                       [R("run_hedge.py"), "--model", HEDGE_MODEL, "--dry-run", *extra]))
+            ev.append((mid, ("portfolio hedge (PCA factor risk past its trigger)"
+                             if HEDGE_MODEL == "pca" else
+                             "portfolio hedge (min-variance, sized by the overlay's allocation)"),
+                       "run", [R("run_hedge.py"), "--model", HEDGE_MODEL, *extra]))
+        else:
+            ev.append((mid, "portfolio hedge (shave buckets past their trigger)", "run",
+                       [R("run_hedge.py"), "--trigger", HEDGE_TRIGGER,
+                        "--target", HEDGE_TARGET, "--release", HEDGE_RELEASE]))
     if ENABLE["rebalance"]:
         # Report-only by default — it prints the recommendation and changes nothing. Add
         # --apply here only once the weights have been watched for a few weeks: applying

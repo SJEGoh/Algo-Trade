@@ -15,10 +15,13 @@ from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
 from config import CONFIG, GLOBAL, is_funded, validate_config
-from portfolio import hedger, pca_hedge
+from portfolio import hedger, minvar_hedge, pca_hedge, risk_budget
 from risk.exit_rules import ExitManager, ExitSpecError, parse_exits
 
 import threading
+
+import numpy as np
+import pandas as pd
 import time
 from datetime import datetime, timedelta, timezone
 import logging
@@ -89,6 +92,7 @@ async def _startup(app: FastAPI):
     executor.coordinator = NettingCoordinator(executor, CONFIG, state_path=str(DB_DIR / "netting.json"))
     executor.exit_manager = ExitManager(executor, alert=_alert,
                                         max_mark_age=GLOBAL.get("exit_mark_max_age_sec"))
+    _price_history()   # before the sampler, so its first marks can fall back to a close
     threading.Thread(target=_equity_sampler, args=(60.0,), daemon=True).start()
     threading.Thread(target=_equity_compactor, daemon=True, name="equity-compactor").start()
     threading.Thread(target=_exit_sampler, args=(float(GLOBAL.get("exit_check_sec", 30.0)),),
@@ -688,7 +692,18 @@ def get_exposure(trigger: float = 0.30, target: float = 0.25, release: float = 0
     }
 
 
-_pca_cache = {"history": None, "prev_weights": None}
+_pca_cache = {"prev_weights": None}
+
+
+def _price_history() -> "pca_hedge.DailyHistoryCache":
+    """The executor's daily-close cache — shared by the PCA report, book risk, and the
+    close-price fallback in get_marks. Created on first use."""
+    h = getattr(executor, "price_history", None)
+    if h is None:
+        h = pca_hedge.DailyHistoryCache(executor.fetch_daily_closes,
+                                        path=DB_DIR / "price_history.json")
+        executor.price_history = h
+    return h
 
 
 @app.get("/exposure/pca")
@@ -725,10 +740,7 @@ def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: flo
     values, unpriced = pca_hedge.position_values(what_if, marks,
                                                  dict(executor.ledger.multipliers))
 
-    if _pca_cache["history"] is None:
-        _pca_cache["history"] = pca_hedge.DailyHistoryCache(
-            executor.fetch_daily_closes, path=DB_DIR / "price_history.json")
-    closes = _pca_cache["history"].get(set(pca_hedge.FACTOR_UNIVERSE) | set(values))
+    closes = _price_history().get(set(pca_hedge.FACTOR_UNIVERSE) | set(values))
     rets = pca_hedge.daily_returns(closes, lookback=lookback)
 
     universe = [s for s in pca_hedge.FACTOR_UNIVERSE if s in rets.columns]
@@ -741,8 +753,12 @@ def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: flo
     held = [s for s in values if s in rets.columns]
     loads, short = pca_hedge.loadings(rets[held], model.returns)
 
-    etf_px = {s: marks.get(s) for s in model.universe if (marks.get(s) or 0) > 0}
-    need = [s for s in model.universe if s not in etf_px]
+    # price the universe AND anything the overlay holds outside it (a bucket-model hedge
+    # like SMH): the plan states every held name at zero, and an unpriced one is left out
+    # of the book — so a hedge from the old model would never be unwound
+    to_price = list(model.universe) + [s for s in current if s not in model.universe]
+    etf_px = {s: marks.get(s) for s in to_price if (marks.get(s) or 0) > 0}
+    need = [s for s in to_price if s not in etf_px]
     if need:
         etf_px.update({s: px for s, px in executor.get_marks(need).items() if px})
 
@@ -761,16 +777,112 @@ def get_exposure_pca(trigger: float = 0.006, target: float = 0.005, release: flo
         "pc1_explains_60pct": bool(model.explained[0] >= 0.60),
         "exposures": [{"factor": d.factor, "exposure": d.exposure, "fraction": d.fraction,
                        "vol_contribution": d.vol_contribution,
-                       "hedge_notional": d.hedge_notional, "reason": d.reason,
+                       "hedge_notional": d.hedge_notional, "held": d.held, "reason": d.reason,
                        "top_contributors": d.top_contributors} for d in p.decisions],
         "legs": p.legs,
         "book": p.book,
-        "coverage": {**p.coverage, "unpriced_symbols": sorted(unpriced)},
+        "coverage": {**p.coverage, "unpriced_symbols": sorted(unpriced),
+                     "priced_from_close": sorted(set(values) & _marks_from_close())},
+        "book_risk": risk_budget.book_risk(values, rets, nav),
         "history_days": int(len(model.returns)),
         "excluded": {"symbols": sorted(drop_syms), "strategies": sorted(drop_sids)},
         "policy": {"trigger": trigger, "target": target, "release": release,
                    "hedge_components": hedge_components},
     }
+
+
+@app.get("/exposure/minvar")
+def get_exposure_minvar(utilization: float = 0.95, budget: Optional[float] = None,
+                        min_improvement: float = 0.05, lookback: int = 250):
+    """The ETF hedge that removes the most variance from the book for the overlay's
+    capital. Read-only. Budget = the overlay's live capital_allocation x `utilization` (the
+    headroom absorbs price moves between planning and the executor's allocation check);
+    `budget` overrides it, for a what-if."""
+    nav = float((_last_equity.get("totals") or {}).get("nav") or 0.0)
+    if nav <= 0:
+        raise HTTPException(status_code=503,
+                            detail="no NAV sample yet — the equity sampler has not run")
+    if not 0 < utilization <= 1:
+        raise HTTPException(status_code=422, detail="utilization must be in (0, 1]")
+    alloc = float((CONFIG.get(hedger.HEDGE_STRATEGY_ID) or {}).get("capital_allocation") or 0.0)
+    spend = float(budget) if budget is not None else alloc * utilization
+    if budget is not None and budget > alloc:
+        raise HTTPException(status_code=422,
+                            detail=f"budget {budget:,.0f} exceeds the overlay's allocation "
+                                   f"{alloc:,.0f} — the executor would reject the hedge")
+
+    marks = dict((_last_equity.get("marks") or {}))
+    positions = {sid: dict(pos) for sid, pos in executor.ledger.strategy_positions.items()}
+    values, unpriced = pca_hedge.position_values(positions, marks,
+                                                 dict(executor.ledger.multipliers))
+    current = {sym: qty for sym, qty in (positions.get(hedger.HEDGE_STRATEGY_ID) or {}).items()
+               if abs(qty) > 1e-9}
+    universe = list(pca_hedge.FACTOR_UNIVERSE)
+    rets = pca_hedge.daily_returns(_price_history().get(set(universe) | set(values)),
+                                   lookback=lookback)
+    risk = risk_budget.book_risk(values, rets, nav)
+    measured = [s for s in values if s not in set(risk["unmeasured_symbols"])]
+    if not measured:
+        raise HTTPException(status_code=503, detail="no holding has usable history")
+    r = rets[measured]
+    r = r[r.notna().any(axis=1)].fillna(0.0)
+    book_pnl = pd.Series(r.values @ np.array([values[s] for s in measured]), index=r.index)
+
+    to_price = universe + [s for s in current if s not in universe]
+    px = {s: marks.get(s) for s in to_price if (marks.get(s) or 0) > 0}
+    need = [s for s in to_price if s not in px]
+    if need:
+        px.update({s: v for s, v in executor.get_marks(need).items() if v})
+
+    etfs = [s for s in universe if s in rets.columns]
+    try:
+        p = minvar_hedge.plan(book_pnl, rets[etfs], spend, nav, px, current_hedge=current,
+                              min_improvement=min_improvement)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=f"cannot size the hedge: {e}")
+    return {
+        "nav": nav, "allocation": alloc, "budget": spend, "binding": p.binding,
+        "held_kept": p.held_kept, "reason": p.reason, "days": p.days,
+        "vol_before": p.vol_before, "vol_after": p.vol_after,
+        "vol_with_held": p.vol_with_held, "variance_removed": p.variance_removed,
+        "gross": p.gross, "dollars": p.dollars, "legs": p.legs, "book": p.book,
+        "coverage": {"measured_notional": risk["measured_notional"],
+                     "unmeasured_notional": risk["unmeasured_notional"],
+                     "unmeasured_symbols": risk["unmeasured_symbols"],
+                     "unpriced_symbols": sorted(unpriced),
+                     "priced_from_close": sorted(set(values) & _marks_from_close())},
+    }
+
+
+def _marks_from_close() -> set:
+    return set(getattr(executor, "marks_from_close", None) or ())
+
+
+@app.get("/risk/book")
+def get_book_risk(target_vol: float = 0.10, min_scale: float = 0.5, max_scale: float = 2.0,
+                  max_step: float = 0.25, lookback: int = 250):
+    """Whole-book risk by replaying TODAY's positions over the last year of each holding's
+    returns, and the allocation scale that would bring it to `target_vol` (annualised).
+    Read-only — a recommendation; nothing is reallocated."""
+    nav = float((_last_equity.get("totals") or {}).get("nav") or 0.0)
+    if nav <= 0:
+        raise HTTPException(status_code=503,
+                            detail="no NAV sample yet — the equity sampler has not run")
+    marks = dict((_last_equity.get("marks") or {}))
+    positions = {sid: dict(pos) for sid, pos in executor.ledger.strategy_positions.items()}
+    values, unpriced = pca_hedge.position_values(positions, marks,
+                                                 dict(executor.ledger.multipliers),
+                                                 exclude=frozenset())   # hedge included: real risk
+    rets = pca_hedge.daily_returns(_price_history().get(set(values)), lookback=lookback)
+    risk = risk_budget.book_risk(values, rets, nav)
+    try:
+        scale = risk_budget.recommend_scale(risk["annual_vol"], target_vol, min_scale,
+                                            max_scale, max_step)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {**risk, "unpriced_symbols": sorted(unpriced),
+            "priced_from_close": sorted(set(values) & _marks_from_close()),
+            "target_vol": target_vol, "scale": scale}
 
 
 @app.get("/pending")

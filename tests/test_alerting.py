@@ -173,8 +173,11 @@ def _have_telegram_creds():
         "TELEGRAM_THREAD_ERRORS", "TELEGRAM_THREAD_ORDERS",
     ])
 
-live = pytest.mark.skipif(not _have_telegram_creds(),
-                          reason="TELEGRAM_* env vars not set")
+def live(fn):
+    """Opt-in only (`pytest -m live`): these post real messages to the Telegram group.
+    They used to be gated on credentials alone, so every local run with a .env sent four."""
+    return pytest.mark.live(pytest.mark.skipif(not _have_telegram_creds(),
+                                               reason="TELEGRAM_* env vars not set")(fn))
 
 
 @live

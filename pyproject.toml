@@ -15,3 +15,6 @@ where = ["src"]
 # matches pytest's `test_*.py` collection pattern. Pinning testpaths keeps a bare `pytest`
 # from importing it (and from importing yfinance at collection time).
 testpaths = ["tests"]
+# `live` tests post real Telegram messages — excluded unless asked for: pytest -m live
+markers = ["live: hits a real external service (Telegram); run with -m live"]
+addopts = "-m 'not live'"

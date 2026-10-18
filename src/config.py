@@ -149,6 +149,9 @@ GLOBAL = {
     # Unrealized-drawdown data-quality guard: a mark older than this (or missing) makes the
     # total-equity drawdown check SKIP that strategy for the cycle (realized fast path still runs).
     "mark_staleness_sec": 120.0,
+    # Market-data snapshots in flight at once when marking the book. IB's default is 100
+    # simultaneous lines; past it the excess return nothing.
+    "mark_max_concurrent": 40,
 
     # Stop-loss / take-profit / trailing-stop checks (risk/exit_rules.py): how often every name
     # with an armed exit is re-priced from IB, and the oldest mark an exit may act on. The age

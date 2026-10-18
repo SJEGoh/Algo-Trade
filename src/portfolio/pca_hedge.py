@@ -111,6 +111,33 @@ class DailyHistoryCache:
                     out[s] = ser.sort_index()
         return out
 
+    def last_close(self, symbol: str) -> Optional[float]:
+        """The most recent cached close, WITHOUT touching IB — cheap enough for the mark path."""
+        with self._lock:
+            closes = (self._data.get(symbol) or {}).get("closes") or {}
+        if not closes:
+            return None
+        return float(closes[max(closes)])
+
+    def warm_async(self, symbols) -> None:
+        """Fetch history for `symbols` in the background, one batch at a time. Lets the mark
+        path ask for a close-price fallback without ever blocking on IB itself."""
+        with self._lock:
+            if getattr(self, "_warming", False):
+                return
+            todo = [s for s in set(symbols) if s not in self._data]
+            if not todo:
+                return
+            self._warming = True
+
+        def run():
+            try:
+                self.get(todo)
+            finally:
+                with self._lock:
+                    self._warming = False
+        threading.Thread(target=run, daemon=True, name="history-warm").start()
+
     def _fetch_one(self, symbol):
         try:
             return self._fetch(symbol)
@@ -214,9 +241,10 @@ class FactorDecision:
     exposure: float               # signed $ of the unit-gross factor portfolio
     fraction: float               # exposure / NAV
     vol_contribution: float       # |exposure| * sigma / NAV — what the gate compares
-    hedge_notional: float         # signed $ of the factor portfolio to add (opposite sign)
+    hedge_notional: float         # signed $ of the factor portfolio WANTED in total (absolute)
     reason: str
     top_contributors: Dict[str, float] = field(default_factory=dict)
+    held: float = 0.0             # signed $ of this factor the overlay already carries
 
 
 @dataclass
@@ -257,10 +285,19 @@ def plan(model: FactorModel, position_values: Dict[str, float],
          holding_loadings: Dict[str, tuple], nav: float, prices: Dict[str, float],
          policy: BucketPolicy = DEFAULT_POLICY, hedge_components: int = 2,
          current_hedge: Dict[str, float] = None, min_hedge_notional: float = 1_000.0,
-         unmeasured: Dict[str, float] = None) -> PCAPlan:
+         unmeasured: Dict[str, float] = None,
+         min_trade_notional: float = 2_500.0) -> PCAPlan:
     """Decide the overlay for the book. `position_values` is signed $ per symbol over every
     strategy EXCEPT the overlay (the hedge must never measure itself). Only the first
-    `hedge_components` factors may act; the rest are reported."""
+    `hedge_components` factors may act; the rest are reported.
+
+    No-trade band, per factor. What the overlay already holds is projected onto each factor
+    (exact within the basis: $h of ETFs carries (h . w_k) / |w_k|^2 of factor k). A held
+    factor hedge is kept while the book's risk NET of it stays between `release` and
+    `trigger`, and only resized to `target` outside that band. The held amount is then
+    re-expressed in this week's factor weights, and any leg whose change is under
+    `min_trade_notional` keeps its current quantity — so slow drift in the weights does not
+    trade 16 tiny legs. A leg going to zero always trades."""
     if nav <= 0:
         raise ValueError(f"NAV must be positive (got {nav})")
     current_hedge = {s: q for s, q in (current_hedge or {}).items() if abs(q) > 1e-9}
@@ -281,33 +318,55 @@ def plan(model: FactorModel, position_values: Dict[str, float],
         exposure += contrib[sym]
         weights_used[sym] = value
 
-    # Hysteresis state is read off the overlay's own holdings, as in the bucket hedger: a
-    # factor counts as hedged if the overlay holds anything at all in the factor universe.
-    hedged = any(s in model.universe for s in current_hedge)
+    # Hysteresis state is read off the overlay's own holdings, as in the bucket hedger —
+    # now per factor: what the held ETFs amount to in each factor's direction.
+    held_dollars = np.array([current_hedge.get(sym, 0.0) * (prices.get(sym) or 0.0)
+                             for sym in model.universe])
+    held_factor = np.array([float(held_dollars @ w / max(float(w @ w), 1e-18))
+                            for w in model.weights])
+    noise = max(min_hedge_notional, 1e-6 * nav)
 
     decisions, dollars = [], np.zeros(len(model.universe))
     for i in range(k):
         name = model.names[i]
         e, sig = exposure[i], model.sigma[i]
         vol = abs(e) * sig / nav
+        held = held_factor[i] if i < hedge_components else 0.0
         top = dict(sorted(((s, float(c[i])) for s, c in contrib.items()),
                           key=lambda kv: -abs(kv[1]))[:5])
         base = dict(factor=name, exposure=float(e), fraction=float(e / nav),
-                    vol_contribution=float(vol), top_contributors=top)
+                    vol_contribution=float(vol), top_contributors=top, held=float(held))
         if i >= hedge_components:
             decisions.append(FactorDecision(**base, hedge_notional=0.0,
                                             reason="reported only — beyond the hedged factors"))
             continue
+        hedged = abs(held) > noise
         threshold = policy.release if hedged else policy.trigger
         label = "release" if hedged else "trigger"
         if vol <= threshold:
             decisions.append(FactorDecision(**base, hedge_notional=0.0,
                                             reason=f"{vol:.2%}/day at or below {label} {threshold:.2%}"))
             continue
-        # shave to target: keep |E| * sigma = target * NAV
+        side = math.copysign(1.0, e)
+        if hedged:
+            net = (e + held) * side * sig / nav      # negative: the hedge overshot zero
+            if policy.release <= net <= policy.trigger:
+                dollars += held * model.weights[i]
+                decisions.append(FactorDecision(
+                    **base, hedge_notional=float(held),
+                    reason=f"{vol:.2%}/day gross, {net:.2%} net of the hedge — inside the "
+                           f"{policy.release:.2%}-{policy.trigger:.2%} band, holding"))
+                continue
+        # shave to target: keep |E| * sigma = target * NAV. Never negative — below target
+        # there is nothing to shave (copysign used to drop that sign and GROW the hedge).
         keep = policy.target * nav / sig
-        h = -math.copysign(abs(e) - keep, e)
-        if abs(h) < min_hedge_notional:
+        h = -side * max(0.0, abs(e) - keep)
+        if hedged and h == 0.0:
+            decisions.append(FactorDecision(**base, hedge_notional=0.0,
+                                            reason=f"{vol:.2%}/day is under target "
+                                                   f"{policy.target:.2%} — unwinding"))
+            continue
+        if not hedged and abs(h) < min_hedge_notional:
             decisions.append(FactorDecision(**base, hedge_notional=0.0,
                                             reason=f"excess {abs(h):,.0f} below the {min_hedge_notional:,.0f} floor"))
             continue
@@ -319,12 +378,17 @@ def plan(model: FactorModel, position_values: Dict[str, float],
     legs = {}
     for j, sym in enumerate(model.universe):
         px = prices.get(sym)
+        now = float(current_hedge.get(sym, 0.0))
         if abs(dollars[j]) < 1e-9:
             continue
         if not px or not math.isfinite(px) or px <= 0:
             logger.error("no price for factor ETF %s — its %+,.0f leg is dropped", sym, dollars[j])
+            if now:
+                legs[sym] = now        # cannot size it, so do not move it either
             continue
         q = math.copysign(math.floor(abs(dollars[j]) / px), dollars[j])
+        if now and abs(q) >= 1 and abs(q - now) * px < min_trade_notional:
+            q = now                    # drift, not a decision — leave the leg where it is
         if abs(q) >= 1:
             legs[sym] = q
 

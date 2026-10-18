@@ -252,13 +252,21 @@ def plan(exposures: Dict[str, Exposure], nav: float, prices: Dict[str, float],
          hedge_instruments: Dict[str, str] = None,
          current_hedge: Dict[str, float] = None,
          min_hedge_notional: float = 1_000.0,
-         unpriced: Dict[str, float] = None) -> HedgePlan:
+         unpriced: Dict[str, float] = None,
+         min_trade_notional: float = 2_500.0) -> HedgePlan:
     """Decide the hedge book for the exposures given.
 
     `current_hedge` is the overlay's existing positions (symbol -> quantity) and supplies the
     hysteresis state: a bucket already carrying a hedge is judged against `release`, an
     unhedged one against `trigger`. Reading the state off the positions means there is no
     separate store to fall out of sync with reality after a restart.
+
+    No-trade band. A held hedge is LEFT ALONE while the exposure net of it stays between
+    `release` and `trigger`; it is only resized back to `target` when the net exposure
+    leaves that band, and a resize smaller than `min_trade_notional` is skipped. The book is
+    absolute, so without this every cycle re-targeted the hedge exactly — a $270 trade to go
+    from -130 to -133 shares, every hedged bucket, every day. Unwinds to zero are never
+    held back by the minimum: a stale hedge is a naked short.
     """
     policies = policies or {}
     default_policy = default_policy or BucketPolicy()
@@ -284,20 +292,17 @@ def plan(exposures: Dict[str, Exposure], nav: float, prices: Dict[str, float],
         held = float(current_hedge.get(symbol, 0.0))
         currently_hedged = abs(held) > 1e-9
         threshold = policy.release if currently_hedged else policy.trigger
+        label = "release" if currently_hedged else "trigger"
         magnitude = abs(exposure.fraction)
+        side = math.copysign(1.0, exposure.fraction)
+        price = prices.get(symbol)
 
         if magnitude <= threshold:
-            reason = (f"{magnitude:.1%} at or below "
-                      f"{'release' if currently_hedged else 'trigger'} {threshold:.0%}")
+            reason = f"{magnitude:.1%} at or below {label} {threshold:.1%}"
             decisions.append(HedgeDecision(bucket, exposure.fraction, symbol, 0.0, 0.0,
-                                           prices.get(symbol), reason))
+                                           price, reason))
             continue
 
-        # Shave the excess over `target`, keeping the exposure the strategies intended.
-        excess_fraction = magnitude - policy.target
-        hedge_notional = -math.copysign(excess_fraction * nav, exposure.fraction)
-
-        price = prices.get(symbol)
         if price is None or not math.isfinite(price) or price <= 0:
             # Fail closed and loudly: an unpriceable hedge cannot be sized, and guessing
             # would put on a position of unknown size against a known exposure.
@@ -306,23 +311,56 @@ def plan(exposures: Dict[str, Exposure], nav: float, prices: Dict[str, float],
             unhedgeable[bucket] = exposure.notional
             continue
 
-        if abs(hedge_notional) < min_hedge_notional:
+        if currently_hedged:
+            # Exposure net of the hedge we hold, measured on the exposure's own side: a
+            # negative value means the hedge has overshot through zero.
+            net = (exposure.notional + held * price) / nav * side
+            if policy.release <= net <= policy.trigger:
+                decisions.append(HedgeDecision(
+                    bucket, exposure.fraction, symbol, held * price, held, price,
+                    f"{magnitude:.1%} gross, {net:.1%} net of the hedge — inside the "
+                    f"{policy.release:.1%}-{policy.trigger:.1%} band, holding"))
+                continue
+
+        # Shave the excess over `target`, keeping the exposure the strategies intended.
+        # Never negative: below target there is nothing to shave. (It used to go through
+        # copysign, which dropped the sign — between release and target the hedge GREW as
+        # the exposure fell.)
+        excess_fraction = max(0.0, magnitude - policy.target)
+        hedge_notional = -side * excess_fraction * nav
+
+        if currently_hedged and excess_fraction == 0.0:
+            decisions.append(HedgeDecision(
+                bucket, exposure.fraction, symbol, 0.0, 0.0, price,
+                f"{magnitude:.1%} is under target {policy.target:.1%} — the hedge is no "
+                f"longer needed, unwinding"))
+            continue
+
+        if not currently_hedged and abs(hedge_notional) < min_hedge_notional:
             decisions.append(HedgeDecision(
                 bucket, exposure.fraction, symbol, 0.0, 0.0, price,
                 f"excess {abs(hedge_notional):,.0f} below the {min_hedge_notional:,.0f} floor"))
             continue
 
         quantity = math.copysign(math.floor(abs(hedge_notional) / price), hedge_notional)
-        if abs(quantity) < 1:
+        if abs(quantity) < 1 and not currently_hedged:
             decisions.append(HedgeDecision(
                 bucket, exposure.fraction, symbol, 0.0, 0.0, price,
                 f"excess {abs(hedge_notional):,.0f} is under one share of {symbol}"))
             continue
 
+        if currently_hedged and abs(quantity) >= 1 \
+                and abs(quantity - held) * price < min_trade_notional:
+            decisions.append(HedgeDecision(
+                bucket, exposure.fraction, symbol, held * price, held, price,
+                f"resize to {quantity:+,.0f} is a {abs(quantity - held) * price:,.0f} trade, "
+                f"under the {min_trade_notional:,.0f} minimum — holding"))
+            continue
+
         decisions.append(HedgeDecision(
             bucket, exposure.fraction, symbol, quantity * price, quantity, price,
-            f"{magnitude:.1%} over {'release' if currently_hedged else 'trigger'} "
-            f"{threshold:.0%} — shaving to target {policy.target:.0%}"))
+            f"{magnitude:.1%} over {label} {threshold:.1%} — shaving to target "
+            f"{policy.target:.1%}"))
 
     # Anything the overlay holds for a bucket that has since vanished must be unwound, or a
     # stale hedge outlives the exposure it was taken against.

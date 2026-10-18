@@ -241,3 +241,48 @@ def test_exposure_endpoint_prices_a_hedge_instrument_nobody_holds(monkeypatch):
     assert r["book"] == [{"instrument": {"symbol": "SMH", "asset_class": "equity",
                                          "sec_type": "STK", "exchange": "SMART"},
                           "target_quantity": -80.0, "expected_price": 250.0}]   # 20k / 250
+
+
+# ------------------------------------------------------------------ no-trade band
+BAND = BucketPolicy(trigger=0.03, target=0.02, release=0.015)
+
+
+def _energy(frac, held):
+    p = plan(exposures_for({"energy": frac}), NAV, PRICES, default_policy=BAND,
+             current_hedge={"XLE": held} if held else {})
+    return next(d for d in p.decisions if d.bucket == "energy")
+
+
+@pytest.mark.parametrize("frac", [0.031, 0.032])
+def test_a_held_hedge_inside_the_band_is_not_retraded(frac):
+    """-130 XLE ($11.7k) against 3.1-3.2% gross leaves ~2% net: inside release..trigger.
+    Re-targeting exactly used to place a few-hundred-dollar trade every cycle."""
+    d = _energy(frac, -130.0)
+    assert d.quantity == -130.0 and "band" in d.reason
+
+
+def test_net_exposure_past_the_trigger_resizes_to_target():
+    d = _energy(0.045, -130.0)                  # 4.5% gross, 3.3% net: out of the band
+    assert d.quantity == -(0.025 * NAV // 90.0)
+
+
+def test_an_overhedged_book_shrinks_the_hedge():
+    d = _energy(0.025, -130.0)                  # 1.3% net: the hedge is too big
+    assert -130.0 < d.quantity < 0
+
+
+@pytest.mark.parametrize("frac", [0.019, 0.017, 0.016])
+def test_below_target_the_hedge_unwinds_never_grows(frac):
+    """The copysign bug: between release and target the hedge GREW as exposure fell
+    (-11, -33, -44 shares at 1.9%, 1.7%, 1.6%)."""
+    assert _energy(frac, -130.0).quantity == 0.0
+
+
+def test_a_resize_under_the_minimum_trade_is_skipped():
+    # a tight band: 4.3% gross - 2.16% held = 2.14% net, just past a 2.1% trigger.
+    # wanted (4.3% - 2%) * 1M / 90 = -255; held -240 -> a $1,350 trade, under $2,500
+    p = plan(exposures_for({"energy": 0.043}), NAV, PRICES,
+             default_policy=BucketPolicy(trigger=0.021, target=0.02, release=0.015),
+             current_hedge={"XLE": -240.0})
+    d = next(x for x in p.decisions if x.bucket == "energy")
+    assert d.quantity == -240.0 and "minimum" in d.reason
