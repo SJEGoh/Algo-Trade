@@ -76,3 +76,52 @@ def test_a_broken_history_never_breaks_the_endpoint(client):
     server.executor.logger_db.get_equity_history = boom
     card = api.get("/strategies").json()["strategies"][0]
     assert card["sharpe"] is None and card["capital_allocation"] == 100_000.0
+
+
+def spy_closes(nav, seed=7):
+    """Independent random SPY closes on the weekdays of `nav`."""
+    rng = np.random.default_rng(seed)
+    days = nav.index.tz_localize(None).normalize()
+    weekdays = days[days.dayofweek < 5]
+    rets = pd.Series(rng.normal(0.0005, 0.012, len(weekdays)), index=weekdays)
+    return 400 * (1 + rets).cumprod()
+
+
+def use_spy(monkeypatch, closes):
+    cache = SimpleNamespace(get=lambda syms: {"SPY": closes} if closes is not None else {})
+    monkeypatch.setattr(server, "_price_history", lambda: cache)
+
+
+def test_beta_is_ols_of_weekday_returns_on_spy(client, monkeypatch):
+    rows, nav = history(60)
+    spy = spy_closes(nav)
+    use_spy(monkeypatch, spy)
+    card = client(rows).get("/strategies").json()["strategies"][0]
+    daily = nav.pct_change().dropna()
+    daily = daily[daily.index.dayofweek < 5]
+    daily.index = daily.index.tz_localize(None).normalize()
+    both = pd.concat([daily, spy.pct_change().dropna()], axis=1, join="inner").dropna()
+    expected = both.iloc[:, 0].cov(both.iloc[:, 1]) / both.iloc[:, 1].var()
+    assert card["beta"] == pytest.approx(expected, rel=1e-6)
+    assert card["beta_days"] == len(both)
+
+
+def test_beta_recovers_a_known_exposure(client, monkeypatch):
+    idx = pd.bdate_range("2026-08-03", periods=80)
+    rng = np.random.default_rng(3)
+    spy_r = pd.Series(rng.normal(0, 0.01, len(idx)), index=idx)
+    strat_r = 0.6 * spy_r + rng.normal(0, 0.0005, len(idx))
+    nav = 100_000 * (1 + strat_r).cumprod()
+    rows = [{"ts": (ts.tz_localize("UTC") + pd.Timedelta(hours=21)).isoformat(),
+             "strategy_id": "alpha", "nav": float(v)} for ts, v in nav.items()]
+    use_spy(monkeypatch, 400 * (1 + spy_r).cumprod())
+    card = client(rows).get("/strategies").json()["strategies"][0]
+    assert card["beta"] == pytest.approx(0.6, abs=0.02)
+
+
+def test_no_spy_history_leaves_sharpe_alone(client, monkeypatch):
+    rows, _ = history(60)
+    use_spy(monkeypatch, None)
+    card = client(rows).get("/strategies").json()["strategies"][0]
+    assert card["beta"] is None and card["beta_days"] == 0
+    assert card["sharpe"] is not None

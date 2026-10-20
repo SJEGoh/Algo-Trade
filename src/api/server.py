@@ -1559,6 +1559,33 @@ _SHARPE_MIN_DAYS = 10
 _sharpe_cache = {"at": None, "by_strategy": {}}
 
 
+def _spy_returns():
+    """SPY daily returns indexed by naive date, or None if its history is unavailable."""
+    try:
+        closes = _price_history().get(["SPY"]).get("SPY")
+    except Exception as e:
+        logger.warning("SPY history unavailable for beta: %s", e)
+        return None
+    if closes is None or closes.empty:
+        return None
+    return closes.sort_index().pct_change(fill_method=None).dropna()
+
+
+def _spy_beta(r, spy) -> dict:
+    """{"beta", "beta_days"} of daily strategy returns `r` on SPY returns `spy`."""
+    if spy is None:
+        return {"beta": None, "beta_days": 0}
+    r = r.copy()
+    r.index = r.index.tz_localize(None).normalize() if r.index.tz else r.index.normalize()
+    both = pd.concat([r, spy], axis=1, join="inner").dropna()
+    n = len(both)
+    var = float(both.iloc[:, 1].var(ddof=1)) if n > 1 else 0.0
+    if n < _SHARPE_MIN_DAYS or var <= 0:
+        return {"beta": None, "beta_days": n}
+    cov = float(both.iloc[:, 0].cov(both.iloc[:, 1], ddof=1))
+    return {"beta": cov / var, "beta_days": n}
+
+
 def _sharpe_ratios() -> dict:
     """{strategy_id: {"sharpe", "days"}} — annualised Sharpe of each strategy's DAILY NAV
     returns, risk-free 0 (the ledger's cash earns nothing either). Cached: the dashboard
@@ -1568,7 +1595,13 @@ def _sharpe_ratios() -> dict:
     information. Weekend days are dropped after differencing — NAV barely moves on them,
     and counting their ~zero returns against a 252-day year would misstate the ratio; the
     weekend's move lands in Monday's return instead. Under _SHARPE_MIN_DAYS a ratio is
-    noise, so it is reported as None with its day count."""
+    noise, so it is reported as None with its day count.
+
+    Each entry also carries "beta" / "beta_days": the OLS beta of those same weekday returns
+    on SPY's daily returns, over the days both have. Strategy days are UTC-day buckets of the
+    last snapshot, which lands after the US close, so day D lines up with SPY's close on D.
+    SPY comes from the shared daily-close cache; if it is unavailable, beta is None and the
+    Sharpe is unaffected."""
     now = time.monotonic()
     if _sharpe_cache["at"] is not None and now - _sharpe_cache["at"] < _SHARPE_TTL_SEC:
         return _sharpe_cache["by_strategy"]
@@ -1577,12 +1610,14 @@ def _sharpe_ratios() -> dict:
         rets = allocator.strategy_returns(executor.logger_db, freq="1D")
         if not rets.empty:
             rets = rets[rets.index.dayofweek < 5]
+        spy = _spy_returns() if not rets.empty else None
         for sid in rets.columns:
             r = rets[sid].dropna()
             sd = float(r.std(ddof=1)) if len(r) > 1 else 0.0
             ok = len(r) >= _SHARPE_MIN_DAYS and sd > 0
             out[sid] = {"sharpe": (float(r.mean()) / sd * math.sqrt(allocator.TRADING_DAYS)
-                                   if ok else None), "days": int(len(r))}
+                                   if ok else None), "days": int(len(r)),
+                        **_spy_beta(r, spy)}
     except Exception as e:
         logger.warning("sharpe ratios unavailable: %s", e)
         return _sharpe_cache["by_strategy"]          # keep the last good answer
@@ -1602,6 +1637,8 @@ def list_strategies():
             "funded": is_funded(sid, cfg),
             "sharpe": (sharpe.get(sid) or {}).get("sharpe"),
             "sharpe_days": (sharpe.get(sid) or {}).get("days", 0),
+            "beta": (sharpe.get(sid) or {}).get("beta"),
+            "beta_days": (sharpe.get(sid) or {}).get("beta_days", 0),
         }
         for sid, cfg in CONFIG.items()
     ]}
