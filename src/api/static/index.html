@@ -227,6 +227,9 @@ function renderStrategies() {
         <div class="row"><span>realized P&amp;L</span><span class="${signClass(p)}">${money(p)}</span></div>
         <div class="row"><span>allocation</span><span>${money(s.capital_allocation)}</span></div>
         <div class="row"><span>max drawdown</span><span>${(s.max_drawdown * 100).toFixed(0)}%</span></div>
+        <div class="row" title="Annualised Sharpe of daily NAV returns (risk-free 0, weekdays only). Under 10 trading days it is noise, so it is not shown."><span>Sharpe (ann.)</span>${s.sharpe == null
+          ? `<span class="dim">— (${s.sharpe_days ?? 0}d)</span>`
+          : `<span class="${signClass(s.sharpe)}">${s.sharpe.toFixed(2)} <span class="dim">(${s.sharpe_days}d)</span></span>`}</div>
         <div class="row"><span>holdings</span><span class="dim">${held.length === 0 ? "cash only" : held.length + " name" + (held.length > 1 ? "s" : "")}</span></div>
         ${holdingsHtml}
       </div>`;

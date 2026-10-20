@@ -15,9 +15,10 @@ from execution.netting import NettingCoordinator
 from monitoring.alerter import Alerter, AlertingHandler
 from monitoring.logging_config import setup_logging
 from config import CONFIG, GLOBAL, is_funded, validate_config
-from portfolio import hedger, minvar_hedge, pca_hedge, risk_budget
+from portfolio import allocator, hedger, minvar_hedge, pca_hedge, risk_budget
 from risk.exit_rules import ExitManager, ExitSpecError, parse_exits
 
+import math
 import threading
 
 import numpy as np
@@ -1553,8 +1554,45 @@ def remove_strategy(strategy_id: str):
     return {"strategy_id": strategy_id, "removed": True}
 
 
+_SHARPE_TTL_SEC = 300.0
+_SHARPE_MIN_DAYS = 10
+_sharpe_cache = {"at": None, "by_strategy": {}}
+
+
+def _sharpe_ratios() -> dict:
+    """{strategy_id: {"sharpe", "days"}} — annualised Sharpe of each strategy's DAILY NAV
+    returns, risk-free 0 (the ledger's cash earns nothing either). Cached: the dashboard
+    polls every 3s and this reads the whole equity history.
+
+    Daily, not per snapshot: minute samples would inflate the sample size without adding
+    information. Weekend days are dropped after differencing — NAV barely moves on them,
+    and counting their ~zero returns against a 252-day year would misstate the ratio; the
+    weekend's move lands in Monday's return instead. Under _SHARPE_MIN_DAYS a ratio is
+    noise, so it is reported as None with its day count."""
+    now = time.monotonic()
+    if _sharpe_cache["at"] is not None and now - _sharpe_cache["at"] < _SHARPE_TTL_SEC:
+        return _sharpe_cache["by_strategy"]
+    out = {}
+    try:
+        rets = allocator.strategy_returns(executor.logger_db, freq="1D")
+        if not rets.empty:
+            rets = rets[rets.index.dayofweek < 5]
+        for sid in rets.columns:
+            r = rets[sid].dropna()
+            sd = float(r.std(ddof=1)) if len(r) > 1 else 0.0
+            ok = len(r) >= _SHARPE_MIN_DAYS and sd > 0
+            out[sid] = {"sharpe": (float(r.mean()) / sd * math.sqrt(allocator.TRADING_DAYS)
+                                   if ok else None), "days": int(len(r))}
+    except Exception as e:
+        logger.warning("sharpe ratios unavailable: %s", e)
+        return _sharpe_cache["by_strategy"]          # keep the last good answer
+    _sharpe_cache.update({"at": now, "by_strategy": out})
+    return out
+
+
 @app.get("/strategies")
 def list_strategies():
+    sharpe = _sharpe_ratios()
     return {"strategies": [
         {
             "strategy_id": sid,
@@ -1562,6 +1600,8 @@ def list_strategies():
             "max_drawdown": cfg["max_drawdown"],
             "active": executor.risk_manager.is_active(sid),
             "funded": is_funded(sid, cfg),
+            "sharpe": (sharpe.get(sid) or {}).get("sharpe"),
+            "sharpe_days": (sharpe.get(sid) or {}).get("days", 0),
         }
         for sid, cfg in CONFIG.items()
     ]}
